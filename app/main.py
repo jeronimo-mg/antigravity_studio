@@ -2,7 +2,7 @@ import os
 from typing import Any, Dict, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -21,6 +21,7 @@ from .interactions_client import (
     build_create_payload,
     cancel_interaction,
     create_interaction,
+    download_environment_snapshot,
     extract_texts_from_interaction,
     format_session_as_markdown,
     get_interaction,
@@ -41,6 +42,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+init_db()
 
 
 @app.on_event("startup")
@@ -503,6 +507,71 @@ def api_export_markdown(session_id: str) -> PlainTextResponse:
         content=md,
         headers={
             "Content-Disposition": f'attachment; filename="{session_id}.md"'
+        },
+    )
+
+
+@app.get("/api/sessions/{session_id}/environment/download")
+async def api_download_session_environment(
+    session_id: str,
+    path: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Response:
+    """Baixa o snapshot (.tar.gz) do sandbox associado a esta sessão, tal como no AI Studio."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada.")
+    env_id = (session.get("environment_id") or "").strip()
+    if not env_id or env_id == "remote":
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhum ambiente remoto ativo nesta sessão. Envie uma mensagem primeiro para provisionar um environment_id.",
+        )
+    try:
+        content, filename, content_type = await download_environment_snapshot(
+            environment_id=env_id,
+            path=path,
+            api_key=api_key,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
+
+
+@app.get("/api/environments/{environment_id}/download")
+async def api_download_environment_by_id(
+    environment_id: str,
+    path: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Response:
+    """Baixa o snapshot (.tar.gz) diretamente pelo environment_id."""
+    clean_id = environment_id.strip()
+    if not clean_id or clean_id == "remote":
+        raise HTTPException(
+            status_code=400,
+            detail="Informe um environment_id válido (ex: env_... ou UUID).",
+        )
+    try:
+        content, filename, content_type = await download_environment_snapshot(
+            environment_id=clean_id,
+            path=path,
+            api_key=api_key,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
         },
     )
 

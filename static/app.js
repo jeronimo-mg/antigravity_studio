@@ -867,6 +867,65 @@ function exportCurrentSessionMarkdown() {
   window.open(`/api/sessions/${currentSession.id}/export/markdown`, "_blank");
 }
 
+async function downloadActiveEnvironmentSnapshot() {
+  const envInputVal = (document.getElementById("environmentIdInput").value || "").trim();
+  const sessionEnvVal = currentSession ? (currentSession.environment_id || "").trim() : "";
+  const targetEnv = envInputVal || sessionEnvVal;
+
+  if (!targetEnv || targetEnv === "remote") {
+    alert(
+      "⚠️ Nenhum ambiente remoto ativo nesta sessão ainda.\n\n" +
+      "Envie uma mensagem primeiro para que o Antigravity execute e crie o container sandbox ('environment_id'). " +
+      "Assim que o ambiente for provisionado, o botão Download baixará o snapshot compactado (.tar.gz) com todos os arquivos criados pelo agente (assim como no Google AI Studio)."
+    );
+    return;
+  }
+
+  const btnSidebar = document.getElementById("sidebarDownloadEnvBtn");
+  const btnHeader = document.getElementById("headerDownloadEnvBtn");
+  const originalSidebarText = btnSidebar ? btnSidebar.innerHTML : "";
+  const originalHeaderText = btnHeader ? btnHeader.innerHTML : "";
+
+  if (btnSidebar) btnSidebar.innerHTML = '<span>⏳</span><span>Baixando snapshot...</span>';
+  if (btnHeader) btnHeader.innerHTML = '<span>⏳</span><span>Baixando...</span>';
+
+  try {
+    const url = (currentSession && currentSession.id && currentSession.environment_id === targetEnv)
+      ? `/api/sessions/${currentSession.id}/environment/download`
+      : `/api/environments/${encodeURIComponent(targetEnv)}/download`;
+
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: "Erro desconhecido ao baixar snapshot." }));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+
+    const blob = await resp.blob();
+    const disposition = resp.headers.get("content-disposition");
+    let filename = `environment_snapshot_${targetEnv}.tar.gz`;
+    if (disposition && disposition.includes("filename=")) {
+      const match = disposition.match(/filename=["']?([^"';]+)["']?/);
+      if (match && match[1]) {
+        filename = match[1].trim();
+      }
+    }
+
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = downloadUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(downloadUrl);
+  } catch (err) {
+    alert(`❌ Falha ao baixar snapshot do ambiente:\n${err.message}`);
+  } finally {
+    if (btnSidebar) btnSidebar.innerHTML = originalSidebarText;
+    if (btnHeader) btnHeader.innerHTML = originalHeaderText;
+  }
+}
+
 function copyActivePrevId() {
   const val = document.getElementById("prevInteractionIdInput").value.trim();
   if (!val) return;

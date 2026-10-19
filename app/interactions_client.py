@@ -11,6 +11,8 @@ for _proxy_var in ("NO_PROXY", "no_proxy"):
         os.environ[_proxy_var] = os.environ[_proxy_var].replace(",[::1]", "").replace("[::1]", "")
 
 INTERACTIONS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+ENVIRONMENTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/environments"
+FILES_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/files"
 
 
 def resolve_api_key(explicit_key: Optional[str] = None) -> str:
@@ -264,3 +266,49 @@ def format_session_as_markdown(session: Dict[str, Any]) -> str:
         lines.append("---\n")
 
     return "\n".join(lines)
+
+
+async def download_environment_snapshot(
+    environment_id: str,
+    path: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Tuple[bytes, str, str]:
+    """
+    Baixa o snapshot do ambiente remoto sandbox (container Linux) como arquivo compactado .tar.gz
+    ou um arquivo/diretório específico. Idêntico à funcionalidade do botão Download no AI Studio.
+    """
+    clean_id = environment_id.strip()
+    if clean_id.startswith("environments/"):
+        clean_id = clean_id.replace("environments/", "")
+
+    headers = build_headers(api_key)
+    headers.pop("Content-Type", None)
+
+    # 1. Tenta o endpoint de snapshot completo do ambiente (como no AI Studio)
+    if not path:
+        snapshot_url = f"{FILES_BASE_URL}/environment-{clean_id}:download?alt=media"
+        async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as client:
+            try:
+                resp = await client.get(snapshot_url, headers=headers)
+                if resp.status_code == 200 and resp.content:
+                    ctype = resp.headers.get("content-type", "application/x-tar")
+                    return resp.content, f"environment_snapshot_{clean_id}.tar.gz", ctype
+            except Exception:
+                pass
+
+    # 2. Tenta o endpoint de arquivos do Environments API
+    target_path = (path or "").strip().lstrip("/")
+    path_url = (
+        f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{target_path}?alt=media"
+        if target_path
+        else f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files?alt=media"
+    )
+    async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as client:
+        resp = await client.get(path_url, headers=headers)
+        if resp.status_code == 200 and resp.content:
+            ctype = resp.headers.get("content-type", "application/x-tar")
+            fname = f"environment_{clean_id}_{target_path or 'root'}.tar.gz"
+            return resp.content, fname, ctype
+        raise ValueError(
+            f"Erro ao baixar snapshot do ambiente '{clean_id}' (HTTP {resp.status_code}): {resp.text}"
+        )

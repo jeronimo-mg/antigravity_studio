@@ -125,6 +125,7 @@
           <span class="text-gray-400">environment:</span>
           <code id="headerEnvId" class="font-mono text-purple-300 max-w-[140px] truncate">remote (novo)</code>
           <button onclick="copyActiveEnvId()" class="text-gray-400 hover:text-white ml-1" title="Copiar Environment ID atual">📋</button>
+          <button onclick="downloadActiveEnvironmentSnapshot()" class="text-purple-300 hover:text-purple-100 ml-1" title="Baixar snapshot deste ambiente (.tar.gz)">⬇️</button>
         </div>
       </div>
     </div>
@@ -146,6 +147,16 @@
       >
         <span>&lt;/&gt;</span>
         <span>Get code</span>
+      </button>
+
+      <button
+        onclick="downloadActiveEnvironmentSnapshot()"
+        id="headerDownloadEnvBtn"
+        class="flex items-center gap-1.5 bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/40 px-3 py-1.5 rounded-lg text-xs font-medium transition"
+        title="Baixar snapshot completo do container Linux (Environment Snapshot)"
+      >
+        <span>📦</span>
+        <span>Download Snapshot</span>
       </button>
 
       <button
@@ -343,7 +354,7 @@
         </div>
 
         <!-- ENVIRONMENT CONFIGURATION: environment_id -->
-        <div id="envConfigGroup" class="space-y-1.5">
+        <div id="envConfigGroup" class="space-y-2">
           <div class="flex items-center justify-between">
             <label class="text-purple-300 font-semibold">🐧 Ambiente Sandbox (`environment`)</label>
             <button
@@ -361,8 +372,18 @@
             onchange="saveSessionSettings()"
             class="w-full bg-studio-bg border border-purple-500/40 rounded-lg px-2.5 py-2 font-mono text-[11px] text-purple-200 placeholder-gray-600 focus:outline-none focus:border-purple-400"
           />
+          <!-- Botão de Download do Snapshot (tal qual o AI Studio Playground) -->
+          <button
+            id="sidebarDownloadEnvBtn"
+            onclick="downloadActiveEnvironmentSnapshot()"
+            class="w-full flex items-center justify-center gap-2 bg-purple-600/20 hover:bg-purple-600/30 text-purple-200 border border-purple-500/40 font-medium py-2 px-3 rounded-lg text-xs transition shadow-sm"
+            title="Baixar snapshot do ambiente sandbox (.tar.gz)"
+          >
+            <span>⬇️</span>
+            <span>Download Environment Snapshot (.tar.gz)</span>
+          </button>
           <p class="text-[11px] text-gray-400 leading-relaxed">
-            Mantém os mesmos arquivos e pacotes Linux entre turnos (`env_...`). Se vazio, provisiona um sandbox `"remote"` novo.
+            Mantém os mesmos arquivos e pacotes Linux entre turnos (`env_...`). O botão <strong>Download</strong> baixa o snapshot do ambiente compactado em <code>.tar.gz</code> (idêntico ao Google AI Studio).
           </p>
         </div>
 

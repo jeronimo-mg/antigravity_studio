@@ -18,6 +18,8 @@ Interface visual inspirada no **Google AI Studio Playground**, projetada especif
    - Se o agente atingir o orçamento de tokens (`max_total_tokens`) e retornar `status: "incomplete"`, um botão **"▶️ Continuar de onde parou"** envia automaticamente `input="continue"` encadeado no mesmo `previous_interaction_id` e `environment_id`.
 5. **Exportação para Markdown e Gerador de Código (`Get code`):**
    - Exporte qualquer sessão com 1 clique para `.md` ou gere o snippet atualizado em Python (`google-genai`) e `cURL` já preenchido com o `previous_interaction_id` e `environment_id` ativos.
+6. **Download do Snapshot do Ambiente Sandbox (`Download Snapshot`):**
+   - Assim como no **Google AI Studio Playground** (onde existe o botão **Download** nas configurações de ambiente para baixar o snapshot do container), a interface inclui o botão **"📦 Download Snapshot"** na barra superior e **"⬇️ Download Environment Snapshot (.tar.gz)"** no painel lateral *Ambiente Sandbox*. Permite baixar com 1 clique o arquivo `.tar.gz` completo de todos os arquivos e artefatos criados pelo agente.
 
 ---
 
