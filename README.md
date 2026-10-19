@@ -20,6 +20,9 @@ Interface visual inspirada no **Google AI Studio Playground**, projetada especif
    - Exporte qualquer sessão com 1 clique para `.md` ou gere o snippet atualizado em Python (`google-genai`) e `cURL` já preenchido com o `previous_interaction_id` e `environment_id` ativos.
 6. **Download do Snapshot do Ambiente Sandbox (`Download Snapshot`):**
    - Assim como no **Google AI Studio Playground** (onde existe o botão **Download** nas configurações de ambiente para baixar o snapshot do container), a interface inclui o botão **"📦 Download Snapshot"** na barra superior e **"⬇️ Download Environment Snapshot (.tar.gz)"** no painel lateral *Ambiente Sandbox*. Permite baixar com 1 clique o arquivo `.tar.gz` completo de todos os arquivos e artefatos criados pelo agente.
+7. **Montagem de Fontes e Repositórios GitHub (`sources`):**
+   - Assim como no **Google AI Studio Playground**, permite vincular fontes antes do primeiro turno através do botão **"＋ Adicionar Fonte"** no painel *Run Settings*.
+   - Suporta clonagem de repositórios Git públicos (ex: GitHub), pastas do Google Cloud Storage (GCS) ou arquivos de texto direto (inline) montados no contêiner Linux (ex: `/workspace/meu-repo`). O backend estrutura automaticamente o parâmetro `environment: {"type": "remote", "sources": [...]}` na chamada inicial à Interactions API.
 
 ---
 

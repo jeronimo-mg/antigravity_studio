@@ -174,6 +174,7 @@ function syncInputsFromSession() {
     currentSession.system_instruction || "";
 
   updateModeUI(currentSession.mode || "agent");
+  renderSourcesList();
   updateHeaderAndComposerBadges();
 }
 
@@ -187,6 +188,7 @@ function updateModeUI(mode) {
   const modelBtn = document.getElementById("modeModelBtn");
   const agentGroup = document.getElementById("agentConfigGroup");
   const envGroup = document.getElementById("envConfigGroup");
+  const sourcesGroup = document.getElementById("sourcesConfigGroup");
   const budgetGroup = document.getElementById("budgetConfigGroup");
   const sysGroup = document.getElementById("sysInstructionGroup");
   const modelLabel = document.getElementById("modelSelectLabel");
@@ -198,6 +200,7 @@ function updateModeUI(mode) {
       "py-1.5 rounded-md font-medium transition text-gray-400 hover:text-white";
     agentGroup.classList.remove("hidden");
     envGroup.classList.remove("hidden");
+    if (sourcesGroup) sourcesGroup.classList.remove("hidden");
     budgetGroup.classList.remove("hidden");
     sysGroup.classList.add("hidden");
     modelLabel.textContent = "Modelo Subjacente (agent_config.model)";
@@ -208,6 +211,7 @@ function updateModeUI(mode) {
       "py-1.5 rounded-md font-medium transition text-gray-400 hover:text-white";
     agentGroup.classList.add("hidden");
     envGroup.classList.add("hidden");
+    if (sourcesGroup) sourcesGroup.classList.add("hidden");
     budgetGroup.classList.add("hidden");
     sysGroup.classList.remove("hidden");
     modelLabel.textContent = "Modelo Gemini (model)";
@@ -258,6 +262,7 @@ async function saveSessionSettings(overrideMode = null) {
     environment_id: document.getElementById("environmentIdInput").value.trim(),
     max_total_tokens: parseInt(document.getElementById("maxTokensInput").value || "0", 10),
     system_instruction: document.getElementById("sysInstructionInput").value,
+    sources: currentSession ? (currentSession.sources || []) : [],
   };
 
   try {
@@ -583,6 +588,7 @@ async function sendPrompt(overridePrompt = null) {
     max_total_tokens: parseInt(document.getElementById("maxTokensInput").value || "0", 10),
     system_instruction: document.getElementById("sysInstructionInput").value,
     background: document.getElementById("backgroundToggle").checked,
+    sources: currentSession ? (currentSession.sources || []) : [],
   };
 
   try {
@@ -774,6 +780,15 @@ function openCodeModal() {
   let pyCode = "";
   let curlCode = "";
 
+  const sources = currentSession ? (currentSession.sources || []) : [];
+  let pyEnvStr = `"${envId}"`;
+  let curlEnvStr = `"${envId}"`;
+
+  if (!prevId && (envId === "remote" || !envId) && sources.length > 0) {
+    pyEnvStr = JSON.stringify({ type: "remote", sources: sources }, null, 4).replace(/\n/g, "\n    ");
+    curlEnvStr = JSON.stringify({ type: "remote", sources: sources }, null, 4).replace(/\n/g, "\n    ");
+  }
+
   if (mode === "agent") {
     pyCode = `from google import genai
 
@@ -782,7 +797,7 @@ client = genai.Client()
 interaction = client.interactions.create(
     agent="${agent}",
     input="Sua próxima instrução aqui...",${prevId ? `\n    previous_interaction_id="${prevId}",` : ""}
-    environment="${envId}",
+    environment=${pyEnvStr},
     agent_config={
         "type": "antigravity",
         "model": "${model}",
@@ -799,7 +814,7 @@ print(interaction.output_text)`;
   -d '{
     "agent": "${agent}",
     "input": "Sua próxima instrução aqui...",${prevId ? `\n    "previous_interaction_id": "${prevId}",` : ""}
-    "environment": "${envId}",
+    "environment": ${curlEnvStr},
     "agent_config": {
       "type": "antigravity",
       "model": "${model}"
@@ -947,3 +962,174 @@ function escapeHtml(str) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
 }
+
+// GERENCIAMENTO DE SOURCES (REPOSITÓRIOS GITHUB / GCS / INLINE)
+function renderSourcesList() {
+  const container = document.getElementById("sourcesList");
+  if (!container) return;
+  const sources = (currentSession && currentSession.sources) ? currentSession.sources : [];
+
+  if (sources.length === 0) {
+    container.innerHTML = `
+      <div id="sourcesEmptyState" class="text-[11px] text-gray-500 italic py-2 text-center bg-studio-bg/60 rounded-lg border border-dashed border-studio-border">
+        Nenhuma fonte configurada. Clique em "＋ Adicionar Fonte" para clonar um repositório GitHub.
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = sources
+    .map((s, idx) => {
+      let icon = "📦";
+      let title = s.source || "Fonte";
+      if (s.type === "gcs") {
+        icon = "☁️";
+      } else if (s.type === "inline") {
+        icon = "📝";
+        title = `Inline: ${s.target || "arquivo"}`;
+      }
+
+      return `
+        <div class="flex items-center justify-between gap-2 bg-studio-bg p-2 rounded-lg border border-studio-border text-xs group hover:border-emerald-500/40 transition">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="text-sm shrink-0">${icon}</span>
+            <div class="min-w-0">
+              <div class="font-medium text-emerald-300 truncate text-[11px]" title="${escapeHtml(title)}">
+                ${escapeHtml(title)}
+              </div>
+              <div class="font-mono text-[10px] text-gray-400 truncate">
+                ➜ ${escapeHtml(s.target || "/workspace")}
+              </div>
+            </div>
+          </div>
+          <button
+            onclick="removeSource(${idx})"
+            class="text-gray-500 hover:text-red-400 p-1 rounded transition shrink-0"
+            title="Remover esta fonte"
+          >
+            ✕
+          </button>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function openAddSourceModal() {
+  document.getElementById("sourceTypeSelect").value = "repository";
+  document.getElementById("sourceUrlInput").value = "";
+  document.getElementById("sourceContentInput").value = "";
+  document.getElementById("sourceTargetInput").value = "/workspace";
+  document.getElementById("addSourceErrorBox").classList.add("hidden");
+  onSourceTypeChanged();
+
+  const modal = document.getElementById("addSourceModal");
+  modal.classList.remove("hidden");
+  modal.classList.add("flex");
+  document.getElementById("sourceUrlInput").focus();
+}
+
+function closeAddSourceModal() {
+  const modal = document.getElementById("addSourceModal");
+  modal.classList.add("hidden");
+  modal.classList.remove("flex");
+}
+
+function onSourceTypeChanged() {
+  const type = document.getElementById("sourceTypeSelect").value;
+  const urlGroup = document.getElementById("sourceUrlFieldGroup");
+  const contentGroup = document.getElementById("sourceContentFieldGroup");
+  const urlLabel = document.getElementById("sourceUrlLabel");
+  const urlInput = document.getElementById("sourceUrlInput");
+
+  if (type === "repository") {
+    urlGroup.classList.remove("hidden");
+    contentGroup.classList.add("hidden");
+    urlLabel.textContent = "URL do Repositório Git *";
+    urlInput.placeholder = "https://github.com/usuario/meu-projeto";
+  } else if (type === "gcs") {
+    urlGroup.classList.remove("hidden");
+    contentGroup.classList.add("hidden");
+    urlLabel.textContent = "Caminho Google Cloud Storage (GCS) *";
+    urlInput.placeholder = "gs://cloud-samples-data/bigquery/us-states/";
+  } else if (type === "inline") {
+    urlGroup.classList.add("hidden");
+    contentGroup.classList.remove("hidden");
+    document.getElementById("sourceTargetInput").placeholder = "/workspace/notes.txt";
+  }
+}
+
+function onSourceUrlInput(val) {
+  const type = document.getElementById("sourceTypeSelect").value;
+  if (type !== "repository") return;
+  const targetEl = document.getElementById("sourceTargetInput");
+  const trimmed = (val || "").trim();
+  if (!trimmed) return;
+
+  const cleanUrl = trimmed.replace(/\.git$/i, "").replace(/\/+$/, "");
+  const parts = cleanUrl.split("/");
+  if (parts.length >= 2) {
+    const repoName = parts[parts.length - 1];
+    if (repoName && !repoName.startsWith("http")) {
+      targetEl.value = `/workspace/${repoName}`;
+    }
+  }
+}
+
+async function submitAddSource() {
+  const errBox = document.getElementById("addSourceErrorBox");
+  errBox.classList.add("hidden");
+
+  const type = document.getElementById("sourceTypeSelect").value;
+  const target = document.getElementById("sourceTargetInput").value.trim();
+
+  if (!target) {
+    errBox.textContent = "O caminho de destino (target) no contêiner é obrigatório.";
+    errBox.classList.remove("hidden");
+    return;
+  }
+  if (!target.startsWith("/")) {
+    errBox.textContent = "O target deve ser um caminho absoluto (ex: /workspace/meu-projeto).";
+    errBox.classList.remove("hidden");
+    return;
+  }
+  if (target === "/" || target === "") {
+    errBox.textContent = "Não é permitido montar diretamente na raiz '/'. Especifique um subdiretório como /workspace/projeto.";
+    errBox.classList.remove("hidden");
+    return;
+  }
+
+  let sourceObj = { type, target };
+
+  if (type === "repository" || type === "gcs") {
+    const url = document.getElementById("sourceUrlInput").value.trim();
+    if (!url) {
+      errBox.textContent = type === "repository"
+        ? "Informe a URL do repositório Git (ex: https://github.com/octocat/Spoon-Knife)."
+        : "Informe a URI do Cloud Storage (ex: gs://bucket/path).";
+      errBox.classList.remove("hidden");
+      return;
+    }
+    sourceObj.source = url;
+  } else if (type === "inline") {
+    const content = document.getElementById("sourceContentInput").value;
+    sourceObj.content = content;
+  }
+
+  if (!currentSession.sources) {
+    currentSession.sources = [];
+  }
+  currentSession.sources.push(sourceObj);
+
+  closeAddSourceModal();
+  renderSourcesList();
+  await saveSessionSettings();
+}
+
+async function removeSource(index) {
+  if (!currentSession || !currentSession.sources) return;
+  currentSession.sources.splice(index, 1);
+  renderSourcesList();
+  await saveSessionSettings();
+}
+

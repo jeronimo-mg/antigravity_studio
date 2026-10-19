@@ -29,11 +29,16 @@ def init_db() -> None:
                 last_interaction_id TEXT DEFAULT '',
                 max_total_tokens INTEGER DEFAULT 0,
                 system_instruction TEXT DEFAULT '',
+                sources_json TEXT DEFAULT '[]',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN sources_json TEXT DEFAULT '[]'")
+        except Exception:
+            pass
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS turns (
@@ -95,9 +100,11 @@ def create_session(
     last_interaction_id: str = "",
     max_total_tokens: int = 0,
     system_instruction: str = "",
+    sources: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     session_id = f"sess_{uuid.uuid4().hex[:12]}"
     ts = now_iso()
+    sources_data = json.dumps(sources or [])
     conn = get_connection()
     with conn:
         conn.execute(
@@ -105,8 +112,8 @@ def create_session(
             INSERT INTO sessions (
                 id, title, mode, agent_name, model_name,
                 environment_id, last_interaction_id, max_total_tokens,
-                system_instruction, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                system_instruction, sources_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -118,6 +125,7 @@ def create_session(
                 last_interaction_id,
                 max_total_tokens,
                 system_instruction,
+                sources_data,
                 ts,
                 ts,
             ),
@@ -136,7 +144,12 @@ def update_session(session_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
         "last_interaction_id",
         "max_total_tokens",
         "system_instruction",
+        "sources",
+        "sources_json",
     }
+    if "sources" in kwargs and kwargs["sources"] is not None:
+        kwargs["sources_json"] = json.dumps(kwargs.pop("sources"))
+
     fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not fields:
         return get_session(session_id)
@@ -163,7 +176,12 @@ def list_sessions() -> List[Dict[str, Any]]:
         """
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    results = []
+    for r in rows:
+        d = dict(r)
+        d["sources"] = json.loads(d.pop("sources_json", None) or "[]")
+        results.append(d)
+    return results
 
 
 def get_session(session_id: str) -> Optional[Dict[str, Any]]:
@@ -173,6 +191,7 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         conn.close()
         return None
     session_dict = dict(row)
+    session_dict["sources"] = json.loads(session_dict.pop("sources_json", None) or "[]")
     turns_rows = conn.execute(
         "SELECT * FROM turns WHERE session_id = ? ORDER BY turn_index ASC",
         (session_id,),

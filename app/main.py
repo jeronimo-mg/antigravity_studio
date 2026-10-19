@@ -65,6 +65,7 @@ class SessionCreateRequest(BaseModel):
     last_interaction_id: Optional[str] = ""
     max_total_tokens: Optional[int] = 0
     system_instruction: Optional[str] = ""
+    sources: Optional[list] = None
 
 
 class SessionUpdateRequest(BaseModel):
@@ -76,6 +77,7 @@ class SessionUpdateRequest(BaseModel):
     last_interaction_id: Optional[str] = None
     max_total_tokens: Optional[int] = None
     system_instruction: Optional[str] = None
+    sources: Optional[list] = None
 
 
 class ImportChainRequest(BaseModel):
@@ -105,6 +107,7 @@ class SendMessageRequest(BaseModel):
     system_instruction: Optional[str] = None
     background: bool = False
     api_key: Optional[str] = None
+    sources: Optional[list] = None
 
 
 @app.get("/api/health")
@@ -153,6 +156,7 @@ def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
         last_interaction_id=body.last_interaction_id or "",
         max_total_tokens=body.max_total_tokens or 0,
         system_instruction=body.system_instruction or "",
+        sources=body.sources or [],
     )
     return session
 
@@ -369,6 +373,12 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         else session.get("system_instruction", "")
     )
 
+    sources = (
+        body.sources
+        if body.sources is not None
+        else session.get("sources", [])
+    )
+
     payload = build_create_payload(
         prompt=prompt,
         mode=mode,
@@ -379,6 +389,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         max_total_tokens=max_tokens,
         system_instruction=sys_inst,
         background=body.background,
+        sources=sources,
     )
 
     try:

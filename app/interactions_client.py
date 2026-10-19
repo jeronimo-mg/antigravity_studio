@@ -143,6 +143,7 @@ def build_create_payload(
     max_total_tokens: int = 0,
     system_instruction: Optional[str] = None,
     background: bool = False,
+    sources: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "input": prompt,
@@ -158,7 +159,39 @@ def build_create_payload(
     if mode == "agent":
         payload["agent"] = agent_name or "antigravity-preview-09-2026"
         env_val = (environment_id or "").strip()
-        payload["environment"] = env_val if env_val else "remote"
+
+        # Se for um novo ambiente (sem environment_id prévio) e houver sources configuradas (ex: repositório GitHub)
+        if (not env_val or env_val == "remote") and sources:
+            clean_sources = []
+            for s in sources:
+                stype = s.get("type", "repository")
+                if stype == "repository" and s.get("source"):
+                    clean_sources.append({
+                        "type": "repository",
+                        "source": s["source"].strip(),
+                        "target": (s.get("target") or "/workspace").strip(),
+                    })
+                elif stype == "gcs" and s.get("source"):
+                    clean_sources.append({
+                        "type": "gcs",
+                        "source": s["source"].strip(),
+                        "target": (s.get("target") or "/workspace").strip(),
+                    })
+                elif stype == "inline" and s.get("target"):
+                    clean_sources.append({
+                        "type": "inline",
+                        "content": s.get("content", ""),
+                        "target": s["target"].strip(),
+                    })
+            if clean_sources:
+                payload["environment"] = {
+                    "type": "remote",
+                    "sources": clean_sources,
+                }
+            else:
+                payload["environment"] = "remote"
+        else:
+            payload["environment"] = env_val if env_val else "remote"
 
         if "antigravity" in payload["agent"]:
             agent_cfg: Dict[str, Any] = {
