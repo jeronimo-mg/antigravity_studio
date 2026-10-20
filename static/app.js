@@ -2,6 +2,19 @@ let currentSession = null;
 let sessionsList = [];
 let activePollTimer = null;
 
+async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fetch(url, options);
+    } catch (err) {
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   await checkApiKeyStatus();
   await loadSessionsList();
@@ -594,11 +607,11 @@ async function sendPrompt(overridePrompt = null) {
   };
 
   try {
-    const res = await fetch(`/api/sessions/${currentSession.id}/messages`, {
+    const res = await fetchWithRetry(`/api/sessions/${currentSession.id}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
+    }, 3);
     const data = await res.json();
     if (!res.ok) {
       throw new Error(data.detail || "Erro ao executar interação.");
@@ -674,7 +687,7 @@ function stopPolling() {
 
 async function pollTurnOnce(sessionId, interactionId) {
   try {
-    const res = await fetch(`/api/sessions/${sessionId}/turns/${interactionId}/poll`);
+    const res = await fetchWithRetry(`/api/sessions/${sessionId}/turns/${interactionId}/poll`, {}, 2);
     if (!res.ok) return;
     const data = await res.json();
     currentSession = data.session;

@@ -120,6 +120,17 @@ class SendMessageRequest(BaseModel):
     sources: Optional[list] = None
 
 
+@app.middleware("http")
+async def disable_static_cache_middleware(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path in ("/", "/index.html", "/app.js") or path.endswith(".js") or path.endswith(".html"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 @app.get("/health")
 @app.get("/api/health")
 def health_check() -> Dict[str, Any]:
@@ -129,6 +140,47 @@ def health_check() -> Dict[str, Any]:
         "has_api_key": bool(key),
         "masked_key": f"{key[:4]}...{key[-4:]}" if len(key) > 8 else ("configurada" if key else ""),
     }
+
+
+@app.get("/v1/models")
+@app.get("/api/v1/models")
+def list_models_compat() -> Dict[str, Any]:
+    """
+    Endpoint de compatibilidade para evitar 404 Not Found e resets de conexão TCP (WinError 64)
+    causados por extensões ou monitores locais que sondam 127.0.0.1:8000/v1/models.
+    """
+    return {
+        "object": "list",
+        "data": [
+            {"id": "antigravity-preview-09-2026", "object": "model", "owned_by": "google"},
+            {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google"},
+        ],
+    }
+
+
+def _find_uploaded_files_for_environment(environment_id: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Procura no banco SQLite se alguma sessão anterior já realizou uploads para o mesmo environment_id,
+    permitindo herdar automaticamente o registro de pacotes/arquivos enviados quando o usuário
+    informa um environment_id existente em uma nova sessão.
+    """
+    clean_env = clean_environment_id(environment_id or "")
+    if not clean_env or clean_env == "remote":
+        return []
+    merged: List[Dict[str, Any]] = []
+    seen_keys = set()
+    for s in list_sessions():
+        s_env = clean_environment_id(s.get("environment_id") or "")
+        for uf in s.get("uploaded_files") or []:
+            if not isinstance(uf, dict):
+                continue
+            uf_env = clean_environment_id(uf.get("environment_id") or s_env)
+            if uf_env == clean_env:
+                key = (uf.get("target_path", ""), uf.get("label", ""), uf.get("uploaded_at", ""))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    merged.append(uf)
+    return merged
 
 
 @app.get("/api/settings")
@@ -158,6 +210,9 @@ def api_list_sessions() -> Dict[str, Any]:
 
 @app.post("/api/sessions")
 def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
+    inherited_uploads = body.uploaded_files
+    if not inherited_uploads and body.environment_id:
+        inherited_uploads = _find_uploaded_files_for_environment(body.environment_id)
     session = create_session(
         title=body.title or "Nova Conversa Antigravity",
         mode=body.mode or "agent",
@@ -168,6 +223,7 @@ def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
         max_total_tokens=body.max_total_tokens or 0,
         system_instruction=body.system_instruction or "",
         sources=body.sources or [],
+        uploaded_files=inherited_uploads or [],
     )
     return session
 
@@ -185,7 +241,13 @@ def api_update_session(session_id: str, body: SessionUpdateRequest) -> Dict[str,
     existing = get_session(session_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
-    updated = update_session(session_id, **body.model_dump(exclude_unset=True))
+    patch_data = body.model_dump(exclude_unset=True)
+    new_env = patch_data.get("environment_id")
+    if new_env and not existing.get("uploaded_files") and "uploaded_files" not in patch_data:
+        inherited = _find_uploaded_files_for_environment(new_env)
+        if inherited:
+            patch_data["uploaded_files"] = inherited
+    updated = update_session(session_id, **patch_data)
     return updated  # type: ignore
 
 
@@ -390,7 +452,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         else session.get("sources", [])
     )
 
-    uploaded_files = session.get("uploaded_files", [])
+    uploaded_files = session.get("uploaded_files", []) or _find_uploaded_files_for_environment(env_id)
     turns = session.get("turns", [])
 
     # Monta resumo de histórico para fallback caso previous_interaction_id falhe com HTTP 500
@@ -428,6 +490,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
 
     new_interaction_id = interaction_resp.get("id", "")
     returned_env_id = clean_environment_id(interaction_resp.get("environment_id") or env_id or "")
+    effective_prev_id = "" if interaction_resp.get("_dropped_previous_interaction_id") else (prev_id or "")
     _, out_text = extract_texts_from_interaction(interaction_resp, fallback_user_input=prompt)
     u_text = prompt
     turn_status = interaction_resp.get("status", "completed")
@@ -443,7 +506,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         session_id=session_id,
         interaction_id=new_interaction_id,
         turn_index=next_index,
-        previous_interaction_id=prev_id or "",
+        previous_interaction_id=effective_prev_id,
         environment_id=returned_env_id,
         user_input_text=u_text,
         output_text=out_text,

@@ -295,14 +295,16 @@ async def create_interaction(
     fallback_history_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Cria uma interação na Interactions API com proteção resiliente contra erros HTTP 500/502/503/504:
+    Cria uma interação na Interactions API com proteção resiliente contra erros HTTP 400/500/502/503/504:
     1. Se uma chamada síncrona (`background=False`) para um agente demorar demais ou falhar com HTTP 500/502/503/504/Timeout,
        ativa automaticamente `background=True` para evitar timeout no gateway HTTP da Google.
-    2. Se `previous_interaction_id` estiver causando HTTP 500 (ex: turno anterior falho ou corrompido no servidor),
-       faz fallback mantendo o mesmo `environment` (container Linux com os arquivos) e injetando o histórico textual.
+    2. Se `previous_interaction_id` for proveniente de uma sessão/turno que deu erro (HTTP 400 ou HTTP 500),
+       desvincula automaticamente o `previous_interaction_id` defeituoso mas PRESERVA o `environment`
+       (container Linux com todos os arquivos enviados), permitindo continuar no mesmo sandbox sem erro.
     """
     current_payload = dict(payload)
     is_agent = bool(current_payload.get("agent"))
+    dropped_prev_id: Optional[str] = None
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         for attempt in range(4):
@@ -312,19 +314,34 @@ async def create_interaction(
                     json=current_payload,
                     headers=build_headers(api_key),
                 )
-            except httpx.TimeoutException:
+            except (httpx.TimeoutException, httpx.TransportError):
                 if is_agent and not current_payload.get("background") and attempt < 3:
                     current_payload["background"] = True
                     continue
                 if attempt < 3:
-                    await asyncio.sleep(2.0 * (attempt + 1))
+                    await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 raise ValueError(
-                    "Timeout ao aguardar resposta da Interactions API. Ative 'Execução em Background' para tarefas longas."
+                    "Timeout ou falha de transporte ao aguardar resposta da Interactions API. Ative 'Execução em Background' para tarefas longas."
                 )
 
             if resp.status_code < 400:
-                return resp.json()
+                data = resp.json()
+                if isinstance(data, dict) and dropped_prev_id:
+                    data["_dropped_previous_interaction_id"] = dropped_prev_id
+                return data
+
+            # Se previous_interaction_id veio de uma interação que falhou/deu erro (HTTP 400 ou 404 referenciando previous_interaction_id),
+            # remove o previous_interaction_id mantendo o mesmo environment (sandbox) imediatamente!
+            if resp.status_code in (400, 404) and current_payload.get("previous_interaction_id") and attempt < 3:
+                dropped_prev_id = str(current_payload.pop("previous_interaction_id", ""))
+                if fallback_history_text:
+                    current_payload["input"] = (
+                        f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history_text}\n\n"
+                        f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{current_payload.get('input', '')}"
+                    )
+                await asyncio.sleep(0.8)
+                continue
 
             # Tratamento resiliente para HTTP 500 / 502 / 503 / 504
             if resp.status_code in (500, 502, 503, 504) and attempt < 3:
@@ -334,19 +351,19 @@ async def create_interaction(
                     await asyncio.sleep(1.0)
                     continue
 
-                # Passo 2: Se tinha previous_interaction_id e ainda deu 500 na tentativa 2+,
-                # desvincula o previous_interaction_id corrompido mantendo o mesmo environment_id
-                if attempt >= 1 and current_payload.get("previous_interaction_id"):
-                    current_payload.pop("previous_interaction_id", None)
+                # Passo 2: Se tinha previous_interaction_id (ex: turno anterior deu erro HTTP 500),
+                # desvincula o previous_interaction_id corrompido já na próxima tentativa mantendo o mesmo environment_id!
+                if current_payload.get("previous_interaction_id"):
+                    dropped_prev_id = str(current_payload.pop("previous_interaction_id", ""))
                     if fallback_history_text:
                         current_payload["input"] = (
                             f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history_text}\n\n"
                             f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{current_payload.get('input', '')}"
                         )
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(1.0)
                     continue
 
-                await asyncio.sleep(2.0 * (attempt + 1))
+                await asyncio.sleep(1.5 * (attempt + 1))
                 continue
 
             raise ValueError(
