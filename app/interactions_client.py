@@ -1011,22 +1011,110 @@ async def list_environment_files(
         return resp.json()
 
 
+def _normalize_env_target_path(raw_path: Optional[str], clean_id: str) -> str:
+    if not raw_path:
+        return ""
+    p = raw_path.strip().replace("\\", "/")
+    marker = f"environments/{clean_id}/files/"
+    if marker in p:
+        p = p.split(marker, 1)[1]
+    elif "/files/" in p and p.startswith("environments/"):
+        p = p.split("/files/", 1)[1]
+    return p.lstrip("/")
+
+
+def _extract_target_from_tar_bytes(
+    tar_bytes: bytes,
+    target_path: str,
+) -> Optional[Tuple[bytes, str, str]]:
+    """
+    Se a API retornar um arquivo .tar / .tar.gz (seja do endpoint de arquivo ou do snapshot completo),
+    procura o arquivo `target_path` dentro do pacote tar e devolve os bytes exatos do arquivo individual
+    com seu nome e MIME type originais (ou um sub-tar.gz se for um diretório).
+    """
+    clean_target = target_path.strip("/")
+    base_name = os.path.basename(clean_target) or "arquivo"
+    wants_raw_tar = base_name.lower().endswith((".tar", ".tar.gz", ".tgz"))
+    if wants_raw_tar:
+        return None
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tar:
+            members = tar.getmembers()
+            file_members = [m for m in members if m.isfile()]
+
+            # 1. Se o tar contém apenas 1 arquivo regular e o usuário pediu um arquivo específico
+            if len(file_members) == 1 and "." in base_name:
+                m = file_members[0]
+                extracted = tar.extractfile(m)
+                if extracted is not None:
+                    data = extracted.read()
+                    mime = mimetypes.guess_type(base_name)[0] or "application/octet-stream"
+                    return data, base_name, mime
+
+            # 2. Procura correspondência exata ou pelo sufixo do caminho no tar
+            candidates = [
+                clean_target,
+                clean_target.removeprefix("workspace/"),
+                f"workspace/{clean_target}",
+            ]
+            for m in file_members:
+                m_name = m.name.lstrip("./").lstrip("/")
+                if m_name in candidates or m_name.endswith(f"/{clean_target}") or m_name == base_name:
+                    extracted = tar.extractfile(m)
+                    if extracted is not None:
+                        data = extracted.read()
+                        fname = os.path.basename(m_name) or base_name
+                        mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+                        return data, fname, mime
+
+            # 3. Se for um diretório contendo múltiplos arquivos dentro do snapshot, re-empacota apenas a pasta
+            dir_prefix_candidates = [f"{c.rstrip('/')}/" for c in candidates if c]
+            matching_dir_members = [
+                m for m in members
+                if any(m.name.lstrip("./").lstrip("/").startswith(pref) for pref in dir_prefix_candidates)
+            ]
+            if matching_dir_members:
+                out_buf = io.BytesIO()
+                with tarfile.open(fileobj=out_buf, mode="w:gz") as out_tar:
+                    for m in matching_dir_members:
+                        if m.isfile():
+                            fobj = tar.extractfile(m)
+                            if fobj is not None:
+                                data = fobj.read()
+                                info = tarfile.TarInfo(name=m.name.lstrip("./").lstrip("/"))
+                                info.size = len(data)
+                                info.mode = m.mode or 0o644
+                                out_tar.addfile(info, io.BytesIO(data))
+                out_buf.seek(0)
+                return out_buf.read(), f"{base_name or 'folder'}.tar.gz", "application/gzip"
+    except Exception:
+        return None
+
+    return None
+
+
 async def download_environment_snapshot(
     environment_id: str,
     path: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Tuple[bytes, str, str]:
     """
-    Baixa o snapshot do ambiente remoto sandbox (container Linux) como arquivo compactado .tar.gz
-    ou um arquivo/diretório específico. Idêntico à funcionalidade do botão Download no AI Studio.
+    Baixa o snapshot completo do ambiente remoto sandbox (.tar.gz) OU um arquivo/diretório específico
+    selecionado na lista de arquivos do ambiente.
+    - Quando `path` aponta para um arquivo individual (ex: `/workspace/ID/relatorio.pdf`), baixa os bytes
+      do arquivo e entrega com seu nome original (`relatorio.pdf`) e MIME type correspondente.
     """
-    clean_id = clean_environment_id(environment_id)
+    import urllib.parse
 
+    clean_id = clean_environment_id(environment_id)
     headers = build_headers(api_key)
     headers.pop("Content-Type", None)
 
-    # 1. Tenta o endpoint de snapshot completo do ambiente (como no AI Studio)
-    if not path:
+    target_path = _normalize_env_target_path(path, clean_id)
+
+    # Caso 1: Download do Snapshot Completo (sem path específico)
+    if not target_path:
         snapshot_url = f"{FILES_BASE_URL}/environment-{clean_id}:download?alt=media"
         async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as client:
             try:
@@ -1037,20 +1125,88 @@ async def download_environment_snapshot(
             except Exception:
                 pass
 
-    # 2. Tenta o endpoint de arquivos do Environments API
-    target_path = (path or "").strip().lstrip("/")
-    path_url = (
-        f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{target_path}?alt=media"
-        if target_path
-        else f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files?alt=media"
-    )
+            root_url = f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files?alt=media"
+            resp = await client.get(root_url, headers=headers)
+            if resp.status_code == 200 and resp.content:
+                ctype = resp.headers.get("content-type", "application/x-tar")
+                return resp.content, f"environment_snapshot_{clean_id}.tar.gz", ctype
+            raise ValueError(
+                f"Erro ao baixar snapshot do ambiente '{clean_id}' (HTTP {resp.status_code}): {resp.text}"
+            )
+
+    # Caso 2: Download de um Arquivo ou Diretório específico (target_path informado)
+    encoded_path = urllib.parse.quote(target_path, safe="/")
+    base_name = os.path.basename(target_path.rstrip("/")) or "arquivo"
+    guessed_mime = mimetypes.guess_type(base_name)[0] or "application/octet-stream"
+
+    candidate_urls = [
+        f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{encoded_path}?alt=media",
+        f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{encoded_path}:download?alt=media",
+        f"https://generativelanguage.googleapis.com/download/v1beta/environments/{clean_id}/files/{encoded_path}?alt=media",
+    ]
+
+    last_status = 0
+    last_text = ""
+
     async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as client:
-        resp = await client.get(path_url, headers=headers)
-        if resp.status_code == 200 and resp.content:
-            ctype = resp.headers.get("content-type", "application/x-tar")
-            fname = f"environment_{clean_id}_{target_path or 'root'}.tar.gz"
-            return resp.content, fname, ctype
-        raise ValueError(
-            f"Erro ao baixar snapshot do ambiente '{clean_id}' (HTTP {resp.status_code}): {resp.text}"
-        )
+        for url in candidate_urls:
+            try:
+                resp = await client.get(url, headers=headers)
+            except Exception as exc:
+                last_text = str(exc)
+                continue
+
+            last_status = resp.status_code
+            last_text = resp.text if resp.status_code >= 400 else ""
+
+            if resp.status_code == 200 and resp.content:
+                resp_ctype = (resp.headers.get("content-type") or "").lower()
+
+                # Se a API retornou JSON (ex: metadados com content/data em base64 ou listagem de diretório)
+                if "application/json" in resp_ctype and not base_name.lower().endswith(".json"):
+                    try:
+                        jdata = resp.json()
+                        if isinstance(jdata, dict):
+                            if "content" in jdata or "data" in jdata:
+                                raw_val = jdata.get("content") or jdata.get("data") or ""
+                                try:
+                                    decoded = base64.b64decode(raw_val)
+                                    return decoded, base_name, guessed_mime
+                                except Exception:
+                                    return str(raw_val).encode("utf-8"), base_name, guessed_mime
+                            # Se retornou listagem de arquivos (é um diretório), tenta o próximo método/snapshot
+                            if "files" in jdata or "entries" in jdata:
+                                continue
+                    except Exception:
+                        pass
+
+                # Verifica se a resposta veio encapsulada em um pacote .tar / .tar.gz
+                extracted = _extract_target_from_tar_bytes(resp.content, target_path)
+                if extracted is not None:
+                    return extracted
+
+                # Se o content-type for tar/gzip mas não extraímos um único arquivo (ex: era diretório)
+                if ("tar" in resp_ctype or "gzip" in resp_ctype) and not base_name.lower().endswith((".tar", ".tar.gz", ".tgz")):
+                    return resp.content, f"{base_name}.tar.gz", resp_ctype
+
+                final_mime = guessed_mime if guessed_mime != "application/octet-stream" else (resp_ctype or "application/octet-stream")
+                return resp.content, base_name, final_mime
+
+        # Fallback automático: baixa o snapshot do ambiente e extrai o arquivo solicitado em memória
+        for snap_url in (
+            f"{FILES_BASE_URL}/environment-{clean_id}:download?alt=media",
+            f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files?alt=media",
+        ):
+            try:
+                snap_resp = await client.get(snap_url, headers=headers)
+                if snap_resp.status_code == 200 and snap_resp.content:
+                    extracted = _extract_target_from_tar_bytes(snap_resp.content, target_path)
+                    if extracted is not None:
+                        return extracted
+            except Exception:
+                pass
+
+    raise ValueError(
+        f"Erro ao baixar '{target_path}' do ambiente '{clean_id}' (HTTP {last_status}): {last_text}"
+    )
 

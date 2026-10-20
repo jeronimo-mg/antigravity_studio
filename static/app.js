@@ -1267,13 +1267,22 @@ function renderUploadedFilesList() {
               </div>
             </div>
           </div>
-          <button
-            onclick="removeUploadedFileRecord(${idx})"
-            class="text-gray-500 hover:text-red-400 p-1 rounded transition shrink-0"
-            title="Remover registro da lista"
-          >
-            ✕
-          </button>
+          <div class="flex items-center gap-1 shrink-0">
+            <button
+              onclick='downloadSpecificEnvFile(${JSON.stringify(targetPath)}, this)'
+              class="text-blue-300 hover:text-white bg-blue-500/15 hover:bg-blue-500/30 border border-blue-500/30 px-1.5 py-0.5 rounded text-[10px] transition"
+              title="Baixar este arquivo/pasta do ambiente"
+            >
+              ⬇️
+            </button>
+            <button
+              onclick="removeUploadedFileRecord(${idx})"
+              class="text-gray-500 hover:text-red-400 p-1 rounded transition"
+              title="Remover registro da lista"
+            >
+              ✕
+            </button>
+          </div>
         </div>
       `;
     })
@@ -1633,12 +1642,15 @@ async function submitUploadToEnvironment() {
 
 // ============================================================================
 // MODAL EXPLORADOR DE ARQUIVOS DO AMBIENTE (GET /v1beta/environments/{id}/files)
+// COM DOWNLOAD INDIVIDUAL DE ARQUIVOS E PASTAS
 // ============================================================================
 
 async function openEnvFilesModal() {
   const modal = document.getElementById("envFilesModal");
   modal.classList.remove("hidden");
   modal.classList.add("flex");
+  const filterEl = document.getElementById("envFilesFilterInput");
+  if (filterEl) filterEl.value = "";
   await refreshEnvFilesList();
 }
 
@@ -1648,12 +1660,202 @@ function closeEnvFilesModal() {
   modal.classList.remove("flex");
 }
 
+function normalizeEnvEntry(item, queriedPath) {
+  const base = (queriedPath || "workspace").replace(/^\/+|\/+$/g, "");
+  if (typeof item === "string") {
+    let clean = item.trim();
+    if (clean.includes("/files/")) {
+      clean = clean.split("/files/")[1];
+    }
+    const isDir = clean.endsWith("/");
+    return {
+      fullPath: clean.replace(/^\/+/, ""),
+      displayName: clean,
+      isDir,
+      sizeStr: "",
+    };
+  }
+  if (!item || typeof item !== "object") {
+    return {
+      fullPath: String(item),
+      displayName: String(item),
+      isDir: false,
+      sizeStr: "",
+    };
+  }
+
+  let rawPath = item.path || item.name || item.file_path || "";
+  if (rawPath.includes("/files/")) {
+    rawPath = rawPath.split("/files/")[1];
+  }
+  let cleanPath = rawPath.replace(/^\/+/, "");
+  if (cleanPath && base && !cleanPath.startsWith(base + "/") && cleanPath !== base && !rawPath.startsWith("/")) {
+    cleanPath = `${base}/${cleanPath}`;
+  }
+
+  const rawType = String(item.type || item.file_type || "").toLowerCase();
+  const rawMime = String(item.mimeType || item.mime_type || "").toLowerCase();
+  const isDir =
+    rawType === "directory" ||
+    rawType === "dir" ||
+    rawType === "folder" ||
+    item.is_dir === true ||
+    item.isDirectory === true ||
+    rawMime === "inode/directory" ||
+    rawPath.endsWith("/");
+
+  const rawSize = item.size !== undefined ? item.size : (item.size_bytes !== undefined ? item.size_bytes : item.sizeBytes);
+  const sizeStr = rawSize !== undefined && rawSize !== null && !isDir ? formatBytesSize(rawSize) : "";
+
+  return {
+    fullPath: cleanPath || base,
+    displayName: cleanPath || rawPath || JSON.stringify(item),
+    isDir,
+    sizeStr,
+  };
+}
+
+function navigateEnvFolder(folderPath) {
+  const input = document.getElementById("envFilesPathInput");
+  if (!input) return;
+  input.value = (folderPath || "workspace").replace(/^\/+|\/+$/g, "") || "workspace";
+  refreshEnvFilesList();
+}
+
+function navigateEnvParentFolder() {
+  const input = document.getElementById("envFilesPathInput");
+  if (!input) return;
+  const current = (input.value || "workspace").replace(/^\/+|\/+$/g, "");
+  if (!current || !current.includes("/")) {
+    input.value = "workspace";
+  } else {
+    const parts = current.split("/");
+    parts.pop();
+    input.value = parts.join("/") || "workspace";
+  }
+  refreshEnvFilesList();
+}
+
+function filterEnvFilesRenderedList() {
+  const query = (document.getElementById("envFilesFilterInput")?.value || "").trim().toLowerCase();
+  const rows = document.querySelectorAll("#envFilesListContainer .env-file-row");
+  let visibleCount = 0;
+  rows.forEach((row) => {
+    const pathAttr = (row.getAttribute("data-filepath") || "").toLowerCase();
+    if (!query || pathAttr.includes(query)) {
+      row.classList.remove("hidden");
+      row.classList.add("flex");
+      visibleCount++;
+    } else {
+      row.classList.add("hidden");
+      row.classList.remove("flex");
+    }
+  });
+  const countEl = document.getElementById("envFilesVisibleCount");
+  if (countEl) {
+    countEl.textContent = `${visibleCount} item(ns)`;
+  }
+}
+
+async function copyEnvFilePath(filePath, btnEl) {
+  const formatted = filePath.startsWith("/") ? filePath : `/${filePath}`;
+  try {
+    await navigator.clipboard.writeText(formatted);
+    if (btnEl) {
+      const orig = btnEl.innerHTML;
+      btnEl.innerHTML = "✅ Copiado";
+      setTimeout(() => {
+        btnEl.innerHTML = orig;
+      }, 1500);
+    }
+  } catch (err) {
+    console.error("Erro ao copiar caminho:", err);
+  }
+}
+
+function downloadCurrentEnvFolder() {
+  const pathVal = (document.getElementById("envFilesPathInput")?.value || "workspace").trim();
+  downloadSpecificEnvFile(pathVal, null);
+}
+
+async function downloadSpecificEnvFile(filePath, btnEl = null) {
+  const envInput = document.getElementById("environmentIdInput");
+  const targetEnv = (envInput?.value || (currentSession && currentSession.environment_id) || "").trim();
+
+  if (!targetEnv || targetEnv === "remote") {
+    alert("⚠️ Nenhum environment_id ativo nesta sessão para baixar arquivos.");
+    return;
+  }
+
+  const cleanPath = (filePath || "").trim().replace(/^\/+/, "");
+  const origHtml = btnEl ? btnEl.innerHTML : "";
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.innerHTML = "⏳ Baixando...";
+  }
+
+  try {
+    const qs = cleanPath ? `?${new URLSearchParams({ path: cleanPath }).toString()}` : "";
+    const url = (currentSession && currentSession.id && currentSession.environment_id === targetEnv)
+      ? `/api/sessions/${currentSession.id}/environment/download${qs}`
+      : `/api/environments/${encodeURIComponent(targetEnv)}/download${qs}`;
+
+    const resp = await fetchWithRetry(url, {}, 2);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: "Erro desconhecido ao baixar arquivo." }));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+
+    const blob = await resp.blob();
+    const disposition = resp.headers.get("content-disposition") || "";
+    let filename = cleanPath ? cleanPath.split("/").filter(Boolean).pop() : `environment_${targetEnv}.tar.gz`;
+
+    // Suporta RFC 5987 filename*=UTF-8''... e filename="..."
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match && utf8Match[1]) {
+      try {
+        filename = decodeURIComponent(utf8Match[1].trim());
+      } catch (_) {}
+    } else if (disposition.includes("filename=")) {
+      const match = disposition.match(/filename=["']?([^"';]+)["']?/i);
+      if (match && match[1]) {
+        filename = match[1].trim();
+      }
+    }
+
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = downloadUrl;
+    a.download = filename || "arquivo";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(downloadUrl);
+
+    if (btnEl) {
+      btnEl.innerHTML = "✅ Baixado!";
+      setTimeout(() => {
+        btnEl.disabled = false;
+        btnEl.innerHTML = origHtml;
+      }, 1800);
+      return;
+    }
+  } catch (err) {
+    alert(`❌ Falha ao baixar '${cleanPath || targetEnv}':\n${err.message}`);
+  }
+
+  if (btnEl) {
+    btnEl.disabled = false;
+    btnEl.innerHTML = origHtml;
+  }
+}
+
 async function refreshEnvFilesList() {
   const container = document.getElementById("envFilesListContainer");
   if (!container) return;
 
   const envId = (document.getElementById("environmentIdInput").value || "").trim();
-  const pathVal = (document.getElementById("envFilesPathInput")?.value || "/workspace").trim();
+  const pathVal = (document.getElementById("envFilesPathInput")?.value || "workspace").trim();
   const recursive = document.getElementById("envFilesRecursiveCheckbox")?.checked ?? true;
 
   if (!envId || envId === "remote") {
@@ -1678,30 +1880,97 @@ async function refreshEnvFilesList() {
       ? `/api/sessions/${currentSession.id}/environment/files?${qs}`
       : `/api/environments/${encodeURIComponent(envId)}/files?${qs}`;
 
-    const res = await fetch(url);
+    const res = await fetchWithRetry(url, {}, 2);
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       throw new Error(data.detail || `HTTP ${res.status}`);
     }
 
     const apiData = data.data || {};
-    const filesArr = Array.isArray(apiData.files)
-      ? apiData.files
-      : (Array.isArray(apiData.entries) ? apiData.entries : null);
+    let filesArr = null;
+    if (Array.isArray(apiData)) {
+      filesArr = apiData;
+    } else if (Array.isArray(apiData.files)) {
+      filesArr = apiData.files;
+    } else if (Array.isArray(apiData.entries)) {
+      filesArr = apiData.entries;
+    } else if (Array.isArray(apiData.items)) {
+      filesArr = apiData.items;
+    }
 
     let html = "";
     if (filesArr && filesArr.length > 0) {
-      html += `<div class="space-y-1">`;
-      for (const item of filesArr) {
-        const name = typeof item === "string" ? item : (item.path || item.name || JSON.stringify(item));
-        const isDir = typeof item === "object" && (item.type === "directory" || item.is_dir || item.mimeType === "inode/directory");
-        const size = typeof item === "object" && item.size !== undefined ? formatBytesSize(item.size) : "";
-        html += `
-          <div class="flex items-center justify-between px-3 py-1.5 rounded bg-studio-card border border-studio-border text-xs font-mono">
-            <span class="text-gray-200 truncate">${isDir ? "📁" : "📄"} ${escapeHtml(name)}</span>
-            <span class="text-gray-500 text-[11px] shrink-0">${escapeHtml(size)}</span>
-          </div>
-        `;
+      const entries = filesArr.map((item) => normalizeEnvEntry(item, pathVal));
+      html += `
+        <div class="flex items-center justify-between text-[11px] text-gray-400 pb-1.5 mb-1.5 border-b border-studio-border">
+          <span>Caminho consultado: <code class="text-purple-300">/${escapeHtml(pathVal.replace(/^\/+/, ""))}</code></span>
+          <span id="envFilesVisibleCount">${entries.length} item(ns)</span>
+        </div>
+        <div class="space-y-1.5">
+      `;
+      for (const entry of entries) {
+        const safePathJson = JSON.stringify(entry.fullPath);
+        if (entry.isDir) {
+          html += `
+            <div data-filepath="${escapeHtml(entry.fullPath)}" class="env-file-row flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-studio-card hover:bg-gray-800/80 border border-studio-border text-xs font-mono transition">
+              <button
+                type="button"
+                onclick='navigateEnvFolder(${safePathJson})'
+                class="flex items-center gap-2 text-left text-amber-200 hover:text-amber-100 truncate min-w-0 flex-1"
+                title="Clique para abrir esta pasta"
+              >
+                <span class="shrink-0">📁</span>
+                <span class="truncate">${escapeHtml(entry.displayName)}</span>
+              </button>
+              <div class="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onclick='navigateEnvFolder(${safePathJson})'
+                  class="px-2 py-1 rounded bg-purple-600/20 hover:bg-purple-600/35 text-purple-200 border border-purple-500/30 text-[10px]"
+                  title="Abrir pasta"
+                >
+                  📂 Abrir
+                </button>
+                <button
+                  type="button"
+                  onclick='downloadSpecificEnvFile(${safePathJson}, this)'
+                  class="px-2 py-1 rounded bg-blue-600/20 hover:bg-blue-600/35 text-blue-200 border border-blue-500/30 text-[10px]"
+                  title="Baixar pasta como .tar.gz"
+                >
+                  ⬇️ .tar.gz
+                </button>
+              </div>
+            </div>
+          `;
+        } else {
+          html += `
+            <div data-filepath="${escapeHtml(entry.fullPath)}" class="env-file-row flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-studio-card hover:bg-gray-800/80 border border-studio-border text-xs font-mono transition">
+              <div class="flex items-center gap-2 min-w-0 flex-1">
+                <span class="shrink-0">📄</span>
+                <span class="text-gray-100 truncate" title="/${escapeHtml(entry.fullPath)}">${escapeHtml(entry.displayName)}</span>
+                ${entry.sizeStr ? `<span class="text-gray-500 text-[10px] shrink-0">(${escapeHtml(entry.sizeStr)})</span>` : ""}
+              </div>
+              <div class="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onclick='copyEnvFilePath(${safePathJson}, this)'
+                  class="px-2 py-1 rounded bg-studio-bg hover:bg-gray-700 text-gray-300 border border-studio-border text-[10px]"
+                  title="Copiar caminho completo do arquivo no sandbox"
+                >
+                  📋 Caminho
+                </button>
+                <button
+                  type="button"
+                  onclick='downloadSpecificEnvFile(${safePathJson}, this)'
+                  class="px-2.5 py-1 rounded bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 font-semibold text-[10px] transition"
+                  title="Baixar este arquivo para o seu computador"
+                >
+                  ⬇️ Baixar
+                </button>
+              </div>
+            </div>
+          `;
+        }
       }
       html += `</div>`;
     } else {
@@ -1709,6 +1978,7 @@ async function refreshEnvFilesList() {
     }
 
     container.innerHTML = html;
+    filterEnvFilesRenderedList();
   } catch (err) {
     const uploaded = (currentSession && Array.isArray(currentSession.uploaded_files))
       ? currentSession.uploaded_files
@@ -1719,7 +1989,18 @@ async function refreshEnvFilesList() {
         ${uploaded.length > 0 ? `
           <div class="pt-2 border-t border-red-500/20 text-gray-300">
             <div class="font-semibold text-blue-300 mb-1">Histórico de Uploads registrados nesta sessão:</div>
-            ${uploaded.map(u => `<div class="font-mono text-[11px]">• ${escapeHtml(u.target_path)} (${formatBytesSize(u.size_bytes || 0)})</div>`).join("")}
+            ${uploaded.map(u => `
+              <div class="flex items-center justify-between py-1 font-mono text-[11px]">
+                <span>• ${escapeHtml(u.target_path)} (${formatBytesSize(u.size_bytes || 0)})</span>
+                <button
+                  type="button"
+                  onclick='downloadSpecificEnvFile(${JSON.stringify(u.target_path)}, this)'
+                  class="px-2 py-0.5 rounded bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 text-[10px]"
+                >
+                  ⬇️ Baixar
+                </button>
+              </div>
+            `).join("")}
           </div>
         ` : ""}
       </div>

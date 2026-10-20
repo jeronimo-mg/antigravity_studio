@@ -626,13 +626,29 @@ def api_export_markdown(session_id: str) -> PlainTextResponse:
     )
 
 
+def _build_content_disposition(filename: str) -> str:
+    import urllib.parse
+    import unicodedata
+
+    clean_name = (filename or "download").replace('"', "").replace("\r", "").replace("\n", "")
+    ascii_fallback = (
+        unicodedata.normalize("NFKD", clean_name)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .strip()
+        or "arquivo"
+    )
+    utf8_quoted = urllib.parse.quote(clean_name, safe="")
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8''{utf8_quoted}'
+
+
 @app.get("/api/sessions/{session_id}/environment/download")
 async def api_download_session_environment(
     session_id: str,
     path: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Response:
-    """Baixa o snapshot (.tar.gz) do sandbox associado a esta sessão, tal como no AI Studio."""
+    """Baixa o snapshot (.tar.gz) do sandbox ou um arquivo específico associado a esta sessão."""
     session = get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
@@ -655,7 +671,7 @@ async def api_download_session_environment(
         content=content,
         media_type=content_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
+            "Content-Disposition": _build_content_disposition(filename)
         },
     )
 
@@ -666,7 +682,7 @@ async def api_download_environment_by_id(
     path: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Response:
-    """Baixa o snapshot (.tar.gz) diretamente pelo environment_id."""
+    """Baixa o snapshot (.tar.gz) ou um arquivo específico diretamente pelo environment_id."""
     clean_id = environment_id.strip()
     if not clean_id or clean_id == "remote":
         raise HTTPException(
@@ -686,7 +702,7 @@ async def api_download_environment_by_id(
         content=content,
         media_type=content_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
+            "Content-Disposition": _build_content_disposition(filename)
         },
     )
 
