@@ -120,6 +120,7 @@ class SendMessageRequest(BaseModel):
     sources: Optional[list] = None
 
 
+@app.get("/health")
 @app.get("/api/health")
 def health_check() -> Dict[str, Any]:
     key = resolve_api_key()
@@ -389,6 +390,19 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         else session.get("sources", [])
     )
 
+    uploaded_files = session.get("uploaded_files", [])
+    turns = session.get("turns", [])
+
+    # Monta resumo de histórico para fallback caso previous_interaction_id falhe com HTTP 500
+    history_lines: List[str] = []
+    for t in turns[-6:]:
+        if t.get("status") in ("completed", "incomplete"):
+            ut = (t.get("user_input_text") or "").strip()
+            ot = (t.get("output_text") or "").strip()
+            if ut or ot:
+                history_lines.append(f"Usuário: {ut[:600]}\nAgente: {ot[:1200]}")
+    fallback_history_text = "\n---\n".join(history_lines) if history_lines else None
+
     payload = build_create_payload(
         prompt=prompt,
         mode=mode,
@@ -400,18 +414,24 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         system_instruction=sys_inst,
         background=body.background,
         sources=sources,
+        uploaded_files=uploaded_files,
     )
 
     try:
-        interaction_resp = await create_interaction(payload, api_key=body.api_key)
+        interaction_resp = await create_interaction(
+            payload,
+            api_key=body.api_key,
+            fallback_history_text=fallback_history_text,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
     new_interaction_id = interaction_resp.get("id", "")
-    returned_env_id = interaction_resp.get("environment_id") or env_id or ""
-    u_text, out_text = extract_texts_from_interaction(interaction_resp, fallback_user_input=prompt)
+    returned_env_id = clean_environment_id(interaction_resp.get("environment_id") or env_id or "")
+    _, out_text = extract_texts_from_interaction(interaction_resp, fallback_user_input=prompt)
+    u_text = prompt
+    turn_status = interaction_resp.get("status", "completed")
 
-    turns = session.get("turns", [])
     next_index = len(turns) + 1
 
     # Atualiza título automático se for o primeiro turno de uma sessão com título padrão
@@ -427,12 +447,14 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         environment_id=returned_env_id,
         user_input_text=u_text,
         output_text=out_text,
-        status=interaction_resp.get("status", "completed"),
+        status=turn_status,
         steps=interaction_resp.get("steps", []) or [],
         usage=interaction_resp.get("usage", {}) or {},
         raw=interaction_resp,
         created_at=interaction_resp.get("created"),
     )
+
+    next_last_id = new_interaction_id if turn_status not in ("failed", "cancelled") else (prev_id or "")
 
     update_session(
         session_id,
@@ -441,7 +463,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         agent_name=agent_name,
         model_name=model_name,
         environment_id=returned_env_id,
-        last_interaction_id=new_interaction_id,
+        last_interaction_id=next_last_id,
         max_total_tokens=max_tokens,
         system_instruction=sys_inst,
     )
@@ -494,8 +516,17 @@ async def api_poll_turn(
         created_at=interaction_resp.get("created"),
     )
 
-    if returned_env_id:
-        update_session(session_id, environment_id=returned_env_id, last_interaction_id=interaction_id)
+    turn_status = interaction_resp.get("status", "completed")
+    if turn_status in ("failed", "cancelled"):
+        # Se a execução em background falhou ou foi cancelada, restaura o último ID válido da sessão
+        valid_prev = ""
+        for t in reversed(session.get("turns", [])):
+            if t.get("interaction_id") != interaction_id and t.get("status") in ("completed", "incomplete"):
+                valid_prev = t.get("interaction_id", "")
+                break
+        update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id=valid_prev)
+    elif returned_env_id:
+        update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id=interaction_id)
 
     return {
         "session": get_session(session_id),

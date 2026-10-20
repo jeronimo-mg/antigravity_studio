@@ -2,7 +2,10 @@ import asyncio
 import io
 import mimetypes
 import os
+import re
 import tarfile
+import xml.etree.ElementTree as ET
+import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
@@ -75,6 +78,11 @@ def extract_texts_from_interaction(
         output_texts.append(data["output_text"])
 
     user_input_str = "\n".join(t for t in user_texts if t).strip() or fallback_user_input
+    marker = "\n\n---\n[NOTA TÉCNICA DO AMBIENTE SANDBOX"
+    if marker in user_input_str:
+        user_input_str = user_input_str.split(marker, 1)[0].strip()
+    if "[NOVA INSTRUÇÃO DO USUÁRIO]:\n" in user_input_str:
+        user_input_str = user_input_str.split("[NOVA INSTRUÇÃO DO USUÁRIO]:\n", 1)[1].strip()
     output_str = "\n\n".join(t for t in output_texts if t).strip()
     return user_input_str, output_str
 
@@ -86,16 +94,31 @@ async def get_interaction(
 ) -> Dict[str, Any]:
     params = {"include_input": "true"} if include_input else {}
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(
-            f"{INTERACTIONS_BASE_URL}/{interaction_id}",
-            params=params,
-            headers=build_headers(api_key),
-        )
-        if resp.status_code >= 400:
-            raise ValueError(
-                f"Erro ao buscar interação '{interaction_id}' (HTTP {resp.status_code}): {resp.text}"
-            )
-        return resp.json()
+        for attempt in range(3):
+            try:
+                resp = await client.get(
+                    f"{INTERACTIONS_BASE_URL}/{interaction_id}",
+                    params=params,
+                    headers=build_headers(api_key),
+                )
+            except httpx.TimeoutException:
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+                raise ValueError(f"Timeout ao consultar interação '{interaction_id}'.")
+
+            if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+                if include_input and attempt == 1:
+                    params = {}
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+
+            if resp.status_code >= 400:
+                raise ValueError(
+                    f"Erro ao buscar interação '{interaction_id}' (HTTP {resp.status_code}): {resp.text}"
+                )
+            return resp.json()
+        raise ValueError(f"Erro inesperado ao buscar interação '{interaction_id}'.")
 
 
 async def recover_conversation_chain(
@@ -138,6 +161,52 @@ async def recover_conversation_chain(
     return chain
 
 
+def enrich_agent_prompt_for_sandbox(
+    prompt: str,
+    uploaded_files: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    Adiciona instruções técnicas transparentes para o agente Antigravity quando há arquivos
+    enviados via Environments API ou quando o prompt menciona arquivos .pdf, .odt, .odp, .docx, etc.
+    Isso evita que o agente chame `view_file` diretamente em binários (.odt/.odp) ou PDFs grandes,
+    o que causa `HTTP 500: Internal error encountered` na Interactions API (que suporta apenas Text/Image).
+    """
+    if prompt.strip().lower() == "continue":
+        return prompt
+
+    has_doc_ext = bool(
+        re.search(r"\.(pdf|odt|odp|ods|docx|pptx|xlsx)\b", prompt, flags=re.IGNORECASE)
+    )
+    has_uploads = bool(uploaded_files)
+    if not has_doc_ext and not has_uploads:
+        return prompt
+
+    notes: List[str] = [
+        "\n\n---",
+        "[NOTA TÉCNICA DO AMBIENTE SANDBOX (ANTIGRAVITY STUDIO)]:",
+    ]
+    if uploaded_files:
+        paths = []
+        for uf in uploaded_files:
+            tp = uf.get("target_path")
+            if tp and tp not in paths:
+                paths.append(tp)
+        if paths:
+            formatted_paths = ", ".join(f"`{p}`" for p in paths)
+            notes.append(
+                f"- Arquivos/pastas enviados via Environments API estão localizados em: {formatted_paths} (use `find_by_name` ou `execute_bash` com `ls -la` para listar os nomes exatos)."
+            )
+
+    notes.extend([
+        "- REGRA CRÍTICA (PREVENÇÃO DE ERRO HTTP 500 NA API): NUNCA use a ferramenta `view_file` diretamente em arquivos `.pdf`, `.odt`, `.odp`, `.ods`, `.docx`, `.pptx` ou `.xlsx`. A ferramenta `view_file` injeta o binário completo no histórico multimodal, o que falha para formatos OpenDocument (`.odt`/`.odp`) e PDFs grandes com erro `HTTP 500: Internal error encountered`.",
+        "- COMO LER ESSES DOCUMENTOS COM SEGURANÇA:",
+        "  1. Verifique primeiro se já existem arquivos `.extracted.txt` gerados automaticamente ao lado dos documentos (ex: `<nome_do_arquivo>.extracted.txt`) ou o script `_extract_docs_helper.py` no diretório de upload.",
+        "  2. Caso precise extrair texto de `.odt` ou `.odp` (OpenDocument XML), use `execute_bash` com `python3` lendo `content.xml` via `zipfile.ZipFile` e `xml.etree.ElementTree` (bibliotecas nativas do Python 3.12).",
+        "  3. Caso precise extrair texto de `.pdf`, use `execute_bash` com `python3` (`pypdf`, `pymupdf`/`fitz` ou `pdfplumber`, instalando via `pip install --break-system-packages pypdf pymupdf` se necessário) ou `pdftotext`, salvando o texto em `/tmp/*.txt` e inspecionando por partes/seções.",
+    ])
+    return prompt + "\n".join(notes)
+
+
 def build_create_payload(
     prompt: str,
     mode: str = "agent",
@@ -149,9 +218,15 @@ def build_create_payload(
     system_instruction: Optional[str] = None,
     background: bool = False,
     sources: Optional[List[Dict[str, Any]]] = None,
+    uploaded_files: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    effective_prompt = (
+        enrich_agent_prompt_for_sandbox(prompt, uploaded_files=uploaded_files)
+        if mode == "agent"
+        else prompt
+    )
     payload: Dict[str, Any] = {
-        "input": prompt,
+        "input": effective_prompt,
         "store": True,
     }
 
@@ -163,7 +238,7 @@ def build_create_payload(
 
     if mode == "agent":
         payload["agent"] = agent_name or "antigravity-preview-09-2026"
-        env_val = (environment_id or "").strip()
+        env_val = clean_environment_id(environment_id or "")
 
         # Se for um novo ambiente (sem environment_id prévio) e houver sources configuradas (ex: repositório GitHub)
         if (not env_val or env_val == "remote") and sources:
@@ -217,22 +292,66 @@ def build_create_payload(
 async def create_interaction(
     payload: Dict[str, Any],
     api_key: Optional[str] = None,
+    fallback_history_text: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Cria uma interação na Interactions API com proteção resiliente contra erros HTTP 500/502/503/504:
+    1. Se uma chamada síncrona (`background=False`) para um agente demorar demais ou falhar com HTTP 500/502/503/504/Timeout,
+       ativa automaticamente `background=True` para evitar timeout no gateway HTTP da Google.
+    2. Se `previous_interaction_id` estiver causando HTTP 500 (ex: turno anterior falho ou corrompido no servidor),
+       faz fallback mantendo o mesmo `environment` (container Linux com os arquivos) e injetando o histórico textual.
+    """
+    current_payload = dict(payload)
+    is_agent = bool(current_payload.get("agent"))
+
     async with httpx.AsyncClient(timeout=300.0) as client:
-        for attempt in range(3):
-            resp = await client.post(
-                INTERACTIONS_BASE_URL,
-                json=payload,
-                headers=build_headers(api_key),
-            )
-            if resp.status_code == 503 and attempt < 2:
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
-            if resp.status_code >= 400:
-                raise ValueError(
-                    f"Erro na Interactions API (HTTP {resp.status_code}): {resp.text}"
+        for attempt in range(4):
+            try:
+                resp = await client.post(
+                    INTERACTIONS_BASE_URL,
+                    json=current_payload,
+                    headers=build_headers(api_key),
                 )
-            return resp.json()
+            except httpx.TimeoutException:
+                if is_agent and not current_payload.get("background") and attempt < 3:
+                    current_payload["background"] = True
+                    continue
+                if attempt < 3:
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                    continue
+                raise ValueError(
+                    "Timeout ao aguardar resposta da Interactions API. Ative 'Execução em Background' para tarefas longas."
+                )
+
+            if resp.status_code < 400:
+                return resp.json()
+
+            # Tratamento resiliente para HTTP 500 / 502 / 503 / 504
+            if resp.status_code in (500, 502, 503, 504) and attempt < 3:
+                # Passo 1: Se for agente rodando síncrono (background=False), muda para background=True imediatamente
+                if is_agent and not current_payload.get("background"):
+                    current_payload["background"] = True
+                    await asyncio.sleep(1.0)
+                    continue
+
+                # Passo 2: Se tinha previous_interaction_id e ainda deu 500 na tentativa 2+,
+                # desvincula o previous_interaction_id corrompido mantendo o mesmo environment_id
+                if attempt >= 1 and current_payload.get("previous_interaction_id"):
+                    current_payload.pop("previous_interaction_id", None)
+                    if fallback_history_text:
+                        current_payload["input"] = (
+                            f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history_text}\n\n"
+                            f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{current_payload.get('input', '')}"
+                        )
+                    await asyncio.sleep(1.5)
+                    continue
+
+                await asyncio.sleep(2.0 * (attempt + 1))
+                continue
+
+            raise ValueError(
+                f"Erro na Interactions API (HTTP {resp.status_code}): {resp.text}"
+            )
         raise ValueError("Erro inesperado ao criar interação.")
 
 
@@ -376,12 +495,137 @@ async def create_remote_environment(
         return data
 
 
+def extract_text_from_document_bytes(filename: str, content: bytes) -> Optional[str]:
+    """
+    Extrai texto puro em memória a partir de arquivos OpenDocument (.odt, .odp, .ods),
+    Office XML (.docx, .pptx, .xlsx) ou PDF (.pdf, se pypdf/pymupdf estiver instalado).
+    Isso permite disponibilizar versões .extracted.txt já prontas no sandbox, evitando que o
+    agente use `view_file` em arquivos binários (o que gera HTTP 500 na Interactions API).
+    """
+    lower_name = (filename or "").lower()
+    try:
+        if lower_name.endswith((".odt", ".odp", ".ods")):
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                if "content.xml" not in zf.namelist():
+                    return None
+                xml_bytes = zf.read("content.xml")
+                root = ET.fromstring(xml_bytes)
+                paragraphs: List[str] = []
+                for elem in root.iter():
+                    tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                    if tag in ("p", "h", "list-item", "table-cell"):
+                        txt = "".join(elem.itertext()).strip()
+                        if txt:
+                            paragraphs.append(txt)
+                if not paragraphs:
+                    raw_txt = " ".join(t.strip() for t in root.itertext() if t and t.strip())
+                    return raw_txt if raw_txt else None
+                return "\n".join(paragraphs)
+
+        if lower_name.endswith(".docx"):
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                if "word/document.xml" not in zf.namelist():
+                    return None
+                root = ET.fromstring(zf.read("word/document.xml"))
+                lines = ["".join(el.itertext()).strip() for el in root.iter() if el.tag.endswith("}p")]
+                return "\n".join(l for l in lines if l)
+
+        if lower_name.endswith(".pptx"):
+            with zipfile.ZipFile(io.BytesIO(content)) as zf:
+                slide_files = sorted(
+                    n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+                )
+                slides_out: List[str] = []
+                for idx, sf in enumerate(slide_files, start=1):
+                    root = ET.fromstring(zf.read(sf))
+                    txt = " ".join(t.strip() for t in root.itertext() if t and t.strip())
+                    if txt:
+                        slides_out.append(f"--- Slide {idx} ---\n{txt}")
+                return "\n\n".join(slides_out) if slides_out else None
+
+        if lower_name.endswith(".pdf"):
+            try:
+                import pypdf  # type: ignore
+                reader = pypdf.PdfReader(io.BytesIO(content))
+                pages_out: List[str] = []
+                for idx, page in enumerate(reader.pages, start=1):
+                    ptxt = (page.extract_text() or "").strip()
+                    if ptxt:
+                        pages_out.append(f"=== Página {idx} ===\n{ptxt}")
+                if pages_out:
+                    return "\n\n".join(pages_out)
+            except Exception:
+                pass
+            try:
+                import fitz  # type: ignore
+                doc = fitz.open(stream=content, filetype="pdf")
+                pages_out = []
+                for idx, page in enumerate(doc, start=1):
+                    ptxt = (page.get_text("text") or "").strip()
+                    if ptxt:
+                        pages_out.append(f"=== Página {idx} ===\n{ptxt}")
+                if pages_out:
+                    return "\n\n".join(pages_out)
+            except Exception:
+                pass
+    except Exception:
+        return None
+    return None
+
+
+SANDBOX_DOC_EXTRACTOR_SCRIPT = '''#!/usr/bin/env python3
+"""
+Script utilitário no sandbox para extrair texto de arquivos .pdf, .odt, .odp, .docx e .pptx
+sem usar view_file em binários (evitando erro HTTP 500 na Interactions API).
+Uso: python3 _extract_docs_helper.py <caminho_arquivo_ou_pasta>
+"""
+import os, sys, zipfile, xml.etree.ElementTree as ET
+
+def extract_odf(path):
+    with zipfile.ZipFile(path) as zf:
+        root = ET.fromstring(zf.read("content.xml"))
+        return "\n".join("".join(el.itertext()).strip() for el in root.iter() if el.tag.split("}")[-1] in ("p", "h") and "".join(el.itertext()).strip())
+
+def extract_pdf(path):
+    try:
+        import pypdf
+    except ImportError:
+        os.system("pip install -q --break-system-packages pypdf")
+        import pypdf
+    reader = pypdf.PdfReader(path)
+    return "\n\n".join(f"=== Página {i+1} ===\n" + (p.extract_text() or "") for i, p in enumerate(reader.pages))
+
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "."
+    paths = [target] if os.path.isfile(target) else [
+        os.path.join(r, f) for r, _, fs in os.walk(target) for f in fs
+    ]
+    for p in paths:
+        low = p.lower()
+        out_p = p + ".extracted.txt"
+        try:
+            if low.endswith((".odt", ".odp", ".ods")) and not os.path.exists(out_p):
+                txt = extract_odf(p)
+                open(out_p, "w", encoding="utf-8").write(txt)
+                print(f"Extraído: {out_p} ({len(txt)} chars)")
+            elif low.endswith(".pdf") and not os.path.exists(out_p):
+                txt = extract_pdf(p)
+                open(out_p, "w", encoding="utf-8").write(txt)
+                print(f"Extraído: {out_p} ({len(txt)} chars)")
+        except Exception as e:
+            print(f"Erro em {p}: {e}")
+'''
+
+
 def pack_files_as_tar_gz(files_list: List[Tuple[str, bytes]]) -> bytes:
     """
     Compacta em memória uma lista de arquivos (caminho_relativo, conteudo_bytes) em formato .tar.gz.
     Usado para enviar uma pasta local inteira ou múltiplos arquivos de uma só vez com extract=True.
+    Para documentos (.odt, .odp, .docx, .pptx, .pdf), também inclui automaticamente a versão
+    `.extracted.txt` e o script `_extract_docs_helper.py` para leitura segura pelo agente no sandbox.
     """
     buf = io.BytesIO()
+    has_complex_docs = False
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for rel_path, content in files_list:
             clean_rel = (rel_path or "arquivo").replace("\\", "/").lstrip("/")
@@ -391,6 +635,25 @@ def pack_files_as_tar_gz(files_list: List[Tuple[str, bytes]]) -> bytes:
             info.size = len(content)
             info.mode = 0o644
             tar.addfile(info, io.BytesIO(content))
+
+            if clean_rel.lower().endswith((".pdf", ".odt", ".odp", ".ods", ".docx", ".pptx")):
+                has_complex_docs = True
+                extracted_text = extract_text_from_document_bytes(clean_rel, content)
+                if extracted_text:
+                    txt_bytes = extracted_text.encode("utf-8")
+                    txt_rel = f"{clean_rel}.extracted.txt"
+                    txt_info = tarfile.TarInfo(name=txt_rel)
+                    txt_info.size = len(txt_bytes)
+                    txt_info.mode = 0o644
+                    tar.addfile(txt_info, io.BytesIO(txt_bytes))
+
+        if has_complex_docs:
+            helper_bytes = SANDBOX_DOC_EXTRACTOR_SCRIPT.encode("utf-8")
+            helper_info = tarfile.TarInfo(name="_extract_docs_helper.py")
+            helper_info.size = len(helper_bytes)
+            helper_info.mode = 0o755
+            tar.addfile(helper_info, io.BytesIO(helper_bytes))
+
     buf.seek(0)
     return buf.read()
 
