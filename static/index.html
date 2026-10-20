@@ -125,6 +125,7 @@
           <span class="text-gray-400">environment:</span>
           <code id="headerEnvId" class="font-mono text-purple-300 max-w-[140px] truncate">remote (novo)</code>
           <button onclick="copyActiveEnvId()" class="text-gray-400 hover:text-white ml-1" title="Copiar Environment ID atual">📋</button>
+          <button onclick="openUploadEnvModal()" class="text-emerald-300 hover:text-emerald-100 ml-1" title="Upload direto de arquivo/pasta para este ambiente (Environments API)">⬆️</button>
           <button onclick="downloadActiveEnvironmentSnapshot()" class="text-purple-300 hover:text-purple-100 ml-1" title="Baixar snapshot deste ambiente (.tar.gz)">⬇️</button>
         </div>
       </div>
@@ -143,10 +144,20 @@
       <button
         onclick="openCodeModal()"
         class="flex items-center gap-1.5 bg-studio-card hover:bg-gray-800 text-gray-200 border border-studio-border px-3 py-1.5 rounded-lg text-xs font-medium transition"
-        title="Ver código Python e cURL com previous_interaction_id"
+        title="Ver código Python e cURL com previous_interaction_id e Environments API"
       >
         <span>&lt;/&gt;</span>
         <span>Get code</span>
+      </button>
+
+      <button
+        onclick="openUploadEnvModal()"
+        id="headerUploadEnvBtn"
+        class="flex items-center gap-1.5 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 px-3 py-1.5 rounded-lg text-xs font-medium transition"
+        title="Enviar arquivos locais ou pastas (.tar.gz) diretamente para o sandbox via Environments API"
+      >
+        <span>⬆️</span>
+        <span>Upload Ambiente</span>
       </button>
 
       <button
@@ -233,12 +244,21 @@
                 environment: remote
               </span>
             </div>
-            <button
-              onclick="focusPrevIdInput()"
-              class="text-blue-400 hover:underline text-[11px]"
-            >
-              Alterar ID manualmente →
-            </button>
+            <div class="flex items-center gap-3">
+              <button
+                onclick="openUploadEnvModal()"
+                class="text-emerald-400 hover:underline text-[11px] flex items-center gap-1"
+                title="Enviar arquivos locais ou pastas para o ambiente via Environments API"
+              >
+                <span>⬆️ Upload Arquivo/Pasta</span>
+              </button>
+              <button
+                onclick="focusPrevIdInput()"
+                class="text-blue-400 hover:underline text-[11px]"
+              >
+                Alterar ID manualmente →
+              </button>
+            </div>
           </div>
 
           <!-- Prompt Input Box -->
@@ -357,13 +377,23 @@
         <div id="envConfigGroup" class="space-y-2">
           <div class="flex items-center justify-between">
             <label class="text-purple-300 font-semibold">🐧 Ambiente Sandbox (`environment`)</label>
-            <button
-              onclick="resetEnvironmentId()"
-              class="text-[11px] text-gray-400 hover:text-purple-300"
-              title="Voltar para 'remote' (criar novo sandbox limpo)"
-            >
-              Usar "remote"
-            </button>
+            <div class="flex items-center gap-2">
+              <button
+                onclick="provisionSessionEnvironmentNow()"
+                id="provisionEnvBtn"
+                class="text-[11px] text-emerald-300 hover:text-emerald-200"
+                title="Provisionar um novo environment_id agora via POST /v1beta/environments"
+              >
+                ⚡ Provisionar
+              </button>
+              <button
+                onclick="resetEnvironmentId()"
+                class="text-[11px] text-gray-400 hover:text-purple-300"
+                title="Voltar para 'remote' (criar novo sandbox limpo)"
+              >
+                Usar "remote"
+              </button>
+            </div>
           </div>
           <input
             id="environmentIdInput"
@@ -372,19 +402,51 @@
             onchange="saveSessionSettings()"
             class="w-full bg-studio-bg border border-purple-500/40 rounded-lg px-2.5 py-2 font-mono text-[11px] text-purple-200 placeholder-gray-600 focus:outline-none focus:border-purple-400"
           />
-          <!-- Botão de Download do Snapshot (tal qual o AI Studio Playground) -->
+
+          <!-- Botão de Upload Direto via Environments API -->
           <button
-            id="sidebarDownloadEnvBtn"
-            onclick="downloadActiveEnvironmentSnapshot()"
-            class="w-full flex items-center justify-center gap-2 bg-purple-600/20 hover:bg-purple-600/30 text-purple-200 border border-purple-500/40 font-medium py-2 px-3 rounded-lg text-xs transition shadow-sm"
-            title="Baixar snapshot do ambiente sandbox (.tar.gz)"
+            id="sidebarUploadEnvBtn"
+            onclick="openUploadEnvModal()"
+            class="w-full flex items-center justify-center gap-2 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-200 border border-emerald-500/40 font-medium py-2 px-3 rounded-lg text-xs transition shadow-sm"
+            title="Enviar arquivos locais, pastas ou pacotes .tar.gz diretamente para o ambiente via Environments API"
           >
-            <span>⬇️</span>
-            <span>Download Environment Snapshot (.tar.gz)</span>
+            <span>⬆️</span>
+            <span>Upload Direto ao Ambiente (Environments API)</span>
           </button>
+
+          <!-- Botão de Download do Snapshot (tal qual o AI Studio Playground) -->
+          <div class="grid grid-cols-3 gap-1.5">
+            <button
+              id="sidebarDownloadEnvBtn"
+              onclick="downloadActiveEnvironmentSnapshot()"
+              class="col-span-2 flex items-center justify-center gap-1.5 bg-purple-600/20 hover:bg-purple-600/30 text-purple-200 border border-purple-500/40 font-medium py-2 px-2.5 rounded-lg text-[11px] transition shadow-sm"
+              title="Baixar snapshot do ambiente sandbox (.tar.gz)"
+            >
+              <span>⬇️</span>
+              <span>Download Snapshot (.tar.gz)</span>
+            </button>
+            <button
+              onclick="openEnvFilesModal()"
+              class="col-span-1 flex items-center justify-center gap-1 bg-studio-card hover:bg-gray-800 text-gray-200 border border-studio-border font-medium py-2 px-2 rounded-lg text-[11px] transition"
+              title="Listar arquivos presentes no ambiente via Environments API"
+            >
+              <span>📂</span>
+              <span>Arquivos</span>
+            </button>
+          </div>
+
           <p class="text-[11px] text-gray-400 leading-relaxed">
-            Mantém os mesmos arquivos e pacotes Linux entre turnos (`env_...`). O botão <strong>Download</strong> baixa o snapshot do ambiente compactado em <code>.tar.gz</code> (idêntico ao Google AI Studio).
+            Mantém os mesmos arquivos e pacotes Linux entre turnos (`env_...`). Use <strong>Upload Direto</strong> para enviar arquivos locais ou pastas inteiras via <code>/upload/v1beta/environments/...</code> sem precisar de Cloud Storage.
           </p>
+
+          <!-- Lista de Arquivos Enviados via Environments API nesta Sessão -->
+          <div id="uploadedFilesGroup" class="hidden space-y-1.5 pt-1">
+            <div class="text-[11px] font-semibold text-emerald-300 flex items-center justify-between">
+              <span>📤 Arquivos Enviados (Environments API)</span>
+              <button onclick="openEnvFilesModal()" class="text-[10px] text-blue-300 hover:underline">Ver no sandbox →</button>
+            </div>
+            <div id="uploadedFilesList" class="space-y-1"></div>
+          </div>
         </div>
 
         <!-- SOURCES CONFIGURATION: Mount Git Repositories / Files into Sandbox (tal qual AI Studio) -->
@@ -398,18 +460,18 @@
               id="addSourceBtn"
               onclick="openAddSourceModal()"
               class="flex items-center gap-1 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 px-2 py-1 rounded-md text-[11px] font-medium transition"
-              title="Adicionar repositório GitHub ou arquivo ao contêiner"
+              title="Adicionar repositório GitHub, Cloud Storage, Inline ou Upload Direto ao contêiner"
             >
               <span>＋</span>
               <span>Adicionar Fonte</span>
             </button>
           </div>
           <p class="text-[11px] text-gray-400 leading-relaxed">
-            Clona repositórios Git públicos (ex: GitHub) diretamente para dentro do contêiner Linux no Turno #1.
+            Clona repositórios Git públicos (GitHub), buckets GCS ou arquivos Inline no Turno #1, ou envie arquivos/pastas locais via <button onclick="openUploadEnvModal()" class="text-emerald-300 hover:underline font-medium">Upload Direto da API</button>.
           </p>
           <div id="sourcesList" class="space-y-1.5 pt-1">
             <div id="sourcesEmptyState" class="text-[11px] text-gray-500 italic py-2 text-center bg-studio-bg/60 rounded-lg border border-dashed border-studio-border">
-              Nenhuma fonte configurada. Clique em "＋ Adicionar Fonte" para clonar um repositório GitHub.
+              Nenhuma fonte configurada. Clique em "＋ Adicionar Fonte" para clonar um repositório GitHub ou subir arquivos.
             </div>
           </div>
         </div>
@@ -545,27 +607,31 @@
     </div>
   </div>
 
-  <!-- MODAL 2: GET CODE (Python & cURL com previous_interaction_id) -->
+  <!-- MODAL 2: GET CODE (Python & cURL com previous_interaction_id & Environments API Upload) -->
   <div id="codeModal" class="fixed inset-0 bg-black/75 hidden items-center justify-center z-50 p-4 select-text">
-    <div class="bg-studio-panel border border-studio-border rounded-2xl max-w-2xl w-full p-6 space-y-4 shadow-2xl">
-      <div class="flex items-center justify-between border-b border-studio-border pb-3">
-        <h3 class="text-base font-semibold text-white">&lt;/&gt; Código da Sessão Atual (Interactions API)</h3>
+    <div class="bg-studio-panel border border-studio-border rounded-2xl max-w-3xl w-full max-h-[90vh] flex flex-col p-6 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-studio-border pb-3 shrink-0">
+        <h3 class="text-base font-semibold text-white">&lt;/&gt; Código da Sessão Atual (Interactions API &amp; Environments API)</h3>
         <button onclick="closeCodeModal()" class="text-gray-400 hover:text-white text-lg">✕</button>
       </div>
-      <div class="space-y-3 text-xs">
+      <div class="space-y-4 text-xs overflow-y-auto pr-1">
         <p class="text-gray-400">
-          Use os snippets abaixo para continuar exatamente esta sessão via SDK Python (`google-genai`) ou `curl`, mantendo o `previous_interaction_id` e o `environment_id`:
+          Use os snippets abaixo para continuar exatamente esta sessão via SDK Python (`google-genai`) ou `curl`, mantendo o `previous_interaction_id` e o `environment_id`, ou enviar arquivos diretamente via <strong>Environments API</strong>:
         </p>
         <div>
-          <div class="font-semibold text-blue-300 mb-1">Python (`google-genai`)</div>
+          <div class="font-semibold text-blue-300 mb-1">1. Python (`google-genai` — Interactions API)</div>
           <pre id="pythonCodeSnippet" class="bg-studio-bg border border-studio-border rounded-lg p-3 font-mono text-[11px] text-gray-200 overflow-x-auto"></pre>
         </div>
         <div>
-          <div class="font-semibold text-emerald-300 mb-1">REST (`cURL`)</div>
+          <div class="font-semibold text-emerald-300 mb-1">2. REST (`cURL` — Interactions API)</div>
           <pre id="curlCodeSnippet" class="bg-studio-bg border border-studio-border rounded-lg p-3 font-mono text-[11px] text-gray-200 overflow-x-auto"></pre>
         </div>
+        <div>
+          <div class="font-semibold text-purple-300 mb-1">3. Upload Direto de Arquivos / Pastas (`Environments API`)</div>
+          <pre id="envUploadCodeSnippet" class="bg-studio-bg border border-studio-border rounded-lg p-3 font-mono text-[11px] text-gray-200 overflow-x-auto"></pre>
+        </div>
       </div>
-      <div class="flex justify-end pt-2 border-t border-studio-border">
+      <div class="flex justify-end pt-2 border-t border-studio-border shrink-0">
         <button onclick="closeCodeModal()" class="px-4 py-2 rounded-lg bg-studio-card hover:bg-gray-800 text-xs text-gray-200">Fechar</button>
       </div>
     </div>
@@ -597,7 +663,7 @@
     </div>
   </div>
 
-  <!-- MODAL 4: ADICIONAR FONTE (GITHUB REPOSITORY / GCS / INLINE) -->
+  <!-- MODAL 4: ADICIONAR FONTE (GITHUB REPOSITORY / GCS / INLINE / UPLOAD DIRETO) -->
   <div id="addSourceModal" class="fixed inset-0 bg-black/75 hidden items-center justify-center z-50 p-4 select-text">
     <div class="bg-studio-panel border border-studio-border rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl">
       <div class="flex items-center justify-between border-b border-studio-border pb-3">
@@ -610,7 +676,7 @@
 
       <div class="space-y-3 text-xs">
         <p class="text-gray-300 leading-relaxed">
-          Assim como no <strong>Google AI Studio Playground</strong>, você pode clonar repositórios Git públicos ou montar arquivos diretamente dentro do contêiner antes de começar a conversa.
+          Assim como no <strong>Google AI Studio Playground</strong>, você pode declarar fontes (GitHub, Cloud Storage ou Inline) para montagem no Turno #1, ou enviar arquivos e pastas locais diretamente via <strong>Environments API</strong>.
         </p>
 
         <div>
@@ -621,8 +687,9 @@
             class="w-full bg-studio-bg border border-studio-border rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-400"
           >
             <option value="repository">📦 Repositório Git (ex: GitHub)</option>
-            <option value="gcs">☁️ Google Cloud Storage (GCS)</option>
-            <option value="inline">📝 Arquivo de Texto Direto (Inline)</option>
+            <option value="gcs">☁️ Google Cloud Storage (GCS - até 2 GB)</option>
+            <option value="inline">📝 Arquivo de Texto Direto (Inline - até 1 MB)</option>
+            <option value="direct_upload">⬆️ Upload Direto de Arquivo/Pasta Local (Environments API)</option>
           </select>
         </div>
 
@@ -647,7 +714,7 @@
           ></textarea>
         </div>
 
-        <div>
+        <div id="sourceTargetFieldGroup">
           <label class="block text-gray-300 font-medium mb-1">Caminho de Destino no Contêiner (`target`) *</label>
           <input
             id="sourceTargetInput"
@@ -671,6 +738,229 @@
         >
           Adicionar ao Ambiente
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 5: UPLOAD DIRETO DE ARQUIVOS / PASTAS VIA ENVIRONMENTS API -->
+  <div id="uploadEnvModal" class="fixed inset-0 bg-black/75 hidden items-center justify-center z-50 p-4 select-text">
+    <div class="bg-studio-panel border border-studio-border rounded-2xl max-w-xl w-full max-h-[92vh] flex flex-col p-6 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-studio-border pb-3 shrink-0">
+        <h3 class="text-base font-semibold text-white flex items-center gap-2">
+          <span>⬆️</span>
+          <span>Upload Direto via Environments API (`/upload/v1beta/environments/...`)</span>
+        </h3>
+        <button onclick="closeUploadEnvModal()" class="text-gray-400 hover:text-white text-lg">✕</button>
+      </div>
+
+      <div class="space-y-3.5 text-xs overflow-y-auto pr-1">
+        <p class="text-gray-300 leading-relaxed">
+          Envie arquivos individuais, pacotes <code>.tar</code> / <code>.tar.gz</code> ou pastas locais inteiras diretamente para dentro do sandbox Linux (sem precisar de Google Cloud Storage), usando o endpoint <code>PUT /upload/v1beta/environments/{environment_id}/files/{path}</code>.
+        </p>
+
+        <!-- Status do Environment ID Alvo -->
+        <div class="p-3 rounded-xl bg-studio-card border border-studio-border flex items-center justify-between gap-2">
+          <div class="min-w-0">
+            <div class="text-gray-400 text-[11px] mb-1">Ambiente Sandbox Alvo (<code class="text-purple-300">environment_id</code>):</div>
+            <div id="uploadModalEnvBadge" class="font-mono text-xs text-amber-300 bg-amber-950/60 px-2.5 py-1 rounded border border-amber-500/30 truncate">remote (provisionamento automático)</div>
+          </div>
+          <label class="flex items-center gap-1.5 text-[11px] text-gray-300 cursor-pointer shrink-0" title="Se ainda não houver environment_id, cria um via POST /v1beta/environments automaticamente">
+            <input type="checkbox" id="uploadAutoProvisionToggle" checked class="accent-emerald-500 rounded" />
+            <span>Auto-provisionar se vazio</span>
+          </label>
+        </div>
+
+        <!-- Seleção do Modo de Upload -->
+        <div>
+          <label class="block text-gray-300 font-medium mb-1.5">Modo de Envio</label>
+          <div class="grid grid-cols-3 gap-1.5 bg-studio-bg p-1 rounded-xl border border-studio-border">
+            <button
+              type="button"
+              id="uploadTabSingle"
+              onclick="setUploadModalMode('single')"
+              class="py-2 px-3 rounded-lg border border-blue-500/50 bg-blue-600/20 text-blue-300 font-semibold transition flex flex-col items-center gap-0.5"
+            >
+              <span>📄 Arquivo(s)</span>
+            </button>
+            <button
+              type="button"
+              id="uploadTabFolder"
+              onclick="setUploadModalMode('folder')"
+              class="py-2 px-3 rounded-lg border border-studio-border bg-studio-bg text-gray-400 hover:text-white transition flex flex-col items-center gap-0.5"
+            >
+              <span>🗂️ Pasta Local (.tar.gz)</span>
+            </button>
+            <button
+              type="button"
+              id="uploadTabArchive"
+              onclick="setUploadModalMode('archive')"
+              class="py-2 px-3 rounded-lg border border-studio-border bg-studio-bg text-gray-400 hover:text-white transition flex flex-col items-center gap-0.5"
+            >
+              <span>📦 Pacote .tar / .tar.gz</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Input de Arquivo / Pasta -->
+        <div class="bg-studio-bg border border-dashed border-emerald-500/40 rounded-xl p-4 text-center space-y-2">
+          <input
+            type="file"
+            id="uploadSingleFileInput"
+            multiple
+            onchange="onUploadFilesSelected(this)"
+            class="hidden"
+          />
+          <input
+            type="file"
+            id="uploadFolderInput"
+            webkitdirectory
+            directory
+            multiple
+            onchange="onUploadFilesSelected(this)"
+            class="hidden"
+          />
+          <input
+            type="file"
+            id="uploadArchiveInput"
+            accept=".tar,.tar.gz,.tgz,application/x-tar,application/gzip"
+            onchange="onUploadFilesSelected(this)"
+            class="hidden"
+          />
+
+          <div id="uploadPickerIcon" class="text-2xl">📄</div>
+          <div id="uploadPickerTitle" class="font-semibold text-gray-200">
+            Clique para selecionar um ou mais arquivos
+          </div>
+          <div id="uploadPickerSubtitle" class="text-[11px] text-gray-400">
+            Se escolher 1 arquivo, faz PUT direto no caminho destino. Se escolher vários, empacota e extrai.
+          </div>
+
+          <div class="flex items-center justify-center gap-2 pt-1">
+            <button
+              type="button"
+              onclick="triggerUploadFilePicker()"
+              class="px-3.5 py-2 rounded-lg bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 font-semibold transition"
+            >
+              📂 Escolher no Computador...
+            </button>
+          </div>
+
+          <div id="uploadSelectedFilesSummary" class="hidden text-left bg-studio-card/90 border border-studio-border rounded-lg p-2.5 mt-2 space-y-1">
+            <div class="flex items-center justify-between text-[11px] font-semibold text-emerald-300">
+              <span id="uploadSelectedCountText">0 arquivo(s)</span>
+              <span id="uploadSelectedSizeText" class="font-mono text-gray-300">0 B</span>
+            </div>
+            <div id="uploadSelectedListPreview" class="font-mono text-[10px] text-gray-400 max-h-24 overflow-y-auto"></div>
+          </div>
+        </div>
+
+        <!-- Caminho de destino (path) no sandbox -->
+        <div>
+          <label class="block text-gray-300 font-medium mb-1">Caminho de Destino no Sandbox (`path`) *</label>
+          <input
+            id="uploadTargetPathInput"
+            type="text"
+            value="/workspace/main.py"
+            placeholder="/workspace/dados/arquivo.txt ou /workspace/projeto"
+            oninput="updateUploadModalCodePreview()"
+            class="w-full bg-studio-bg border border-studio-border rounded-lg px-3 py-2 font-mono text-xs text-emerald-300 focus:outline-none focus:border-emerald-400"
+          />
+          <p class="text-[10px] text-gray-400 mt-1" id="uploadTargetHint">
+            Os diretórios pai são criados automaticamente dentro do sandbox se não existirem.
+          </p>
+        </div>
+
+        <!-- Parâmetros da Environments API (overwrite, extract, resumable) -->
+        <div class="bg-studio-card p-3 rounded-xl border border-studio-border space-y-2">
+          <div class="font-semibold text-gray-200 text-[11px]">Parâmetros da Environments API</div>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" id="uploadOverwriteCheckbox" checked onchange="updateUploadModalCodePreview()" class="accent-emerald-500 rounded" />
+            <span><strong>Sobrescrever se já existir</strong> (<code>overwrite=true</code> — evita erro HTTP 409)</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" id="uploadExtractCheckbox" onchange="updateUploadModalCodePreview()" class="accent-emerald-500 rounded" />
+            <span><strong>Extrair pacote automaticamente no destino</strong> (<code>extract=true</code> para <code>.tar</code> / <code>.tar.gz</code>)</span>
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" id="uploadResumableCheckbox" onchange="updateUploadModalCodePreview()" class="accent-emerald-500 rounded" />
+            <span><strong>Upload Resumível em partes</strong> (<code>uploadType=resumable</code> — ideal para arquivos grandes)</span>
+          </label>
+        </div>
+
+        <!-- Preview de Código (Python SDK & REST cURL) -->
+        <details class="bg-studio-bg border border-studio-border rounded-xl p-3">
+          <summary class="cursor-pointer font-semibold text-blue-300 text-[11px] flex items-center justify-between">
+            <span>&lt;/&gt; Ver chamada equivalente na Environments API (Python SDK &amp; cURL)</span>
+            <span class="text-gray-500">Expandir</span>
+          </summary>
+          <div class="mt-2 pt-2 border-t border-studio-border space-y-2">
+            <pre id="uploadModalCodePreview" class="font-mono text-[10px] text-gray-300 overflow-x-auto whitespace-pre-wrap"></pre>
+          </div>
+        </details>
+
+        <div id="uploadEnvErrorBox" class="hidden p-2.5 rounded-lg bg-red-500/15 border border-red-500/40 text-red-300 text-xs"></div>
+        <div id="uploadEnvSuccessBox" class="hidden p-2.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs"></div>
+      </div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-studio-border shrink-0">
+        <button onclick="closeUploadEnvModal()" class="px-4 py-2 rounded-lg bg-studio-card hover:bg-gray-800 text-xs text-gray-300">Fechar</button>
+        <button
+          id="submitUploadEnvBtn"
+          onclick="submitUploadToEnvironment()"
+          class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white shadow flex items-center gap-1.5"
+        >
+          <span>⬆️</span>
+          <span id="confirmUploadEnvBtnText">Enviar para o Sandbox</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 6: LISTAR ARQUIVOS DO AMBIENTE SANDBOX -->
+  <div id="envFilesModal" class="fixed inset-0 bg-black/75 hidden items-center justify-center z-50 p-4 select-text">
+    <div class="bg-studio-panel border border-studio-border rounded-2xl max-w-xl w-full max-h-[85vh] flex flex-col p-6 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-studio-border pb-3 shrink-0">
+        <h3 class="text-base font-semibold text-white flex items-center gap-2">
+          <span>📂</span>
+          <span>Arquivos no Ambiente Sandbox (`environments.files.list`)</span>
+        </h3>
+        <button onclick="closeEnvFilesModal()" class="text-gray-400 hover:text-white text-lg">✕</button>
+      </div>
+
+      <div class="space-y-3 text-xs flex-1 overflow-y-auto">
+        <div class="flex items-center gap-2">
+          <input
+            id="envFilesPathInput"
+            type="text"
+            value="workspace"
+            placeholder="workspace"
+            class="flex-1 bg-studio-bg border border-studio-border rounded-lg px-3 py-1.5 font-mono text-xs text-white focus:outline-none focus:border-purple-400"
+          />
+          <label class="flex items-center gap-1.5 text-[11px] text-gray-300 cursor-pointer shrink-0">
+            <input type="checkbox" id="envFilesRecursiveCheckbox" checked class="accent-purple-500 rounded" />
+            <span>Recursivo</span>
+          </label>
+          <button
+            onclick="refreshEnvFilesList()"
+            class="px-3 py-1.5 rounded-lg bg-purple-600/30 hover:bg-purple-600/40 text-purple-200 border border-purple-500/40 font-medium"
+          >
+            ↻ Consultar
+          </button>
+        </div>
+
+        <div id="envFilesListContainer" class="bg-studio-bg border border-studio-border rounded-xl p-3 min-h-[180px] space-y-1.5 font-mono text-[11px]">
+          <!-- Populated by app.js -->
+        </div>
+      </div>
+
+      <div class="flex justify-between items-center pt-2 border-t border-studio-border shrink-0">
+        <button
+          onclick="closeEnvFilesModal(); openUploadEnvModal();"
+          class="px-3 py-2 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 text-xs font-medium"
+        >
+          ⬆️ Fazer Novo Upload
+        </button>
+        <button onclick="closeEnvFilesModal()" class="px-4 py-2 rounded-lg bg-studio-card hover:bg-gray-800 text-xs text-gray-300">Fechar</button>
       </div>
     </div>
   </div>

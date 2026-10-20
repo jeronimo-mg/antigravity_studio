@@ -175,6 +175,7 @@ function syncInputsFromSession() {
 
   updateModeUI(currentSession.mode || "agent");
   renderSourcesList();
+  renderUploadedFilesList();
   updateHeaderAndComposerBadges();
 }
 
@@ -263,6 +264,7 @@ async function saveSessionSettings(overrideMode = null) {
     max_total_tokens: parseInt(document.getElementById("maxTokensInput").value || "0", 10),
     system_instruction: document.getElementById("sysInstructionInput").value,
     sources: currentSession ? (currentSession.sources || []) : [],
+    uploaded_files: currentSession ? (currentSession.uploaded_files || []) : [],
   };
 
   try {
@@ -842,8 +844,56 @@ print(interaction.output_text)`;
   }'`;
   }
 
+  const cleanEnv = (!envId || envId === "remote") ? "<ENVIRONMENT_ID>" : envId.replace(/^environments\//, "");
+  const uploadedFiles = currentSession ? (currentSession.uploaded_files || []) : [];
+  const lastUploaded = uploadedFiles.length > 0 ? uploadedFiles[uploadedFiles.length - 1] : null;
+  const sampleTarget = lastUploaded ? (lastUploaded.target_path || "/workspace/project") : "/workspace/project";
+  const sampleRel = sampleTarget.replace(/^\/+/, "");
+
+  const envUploadCode = `# --- Python SDK (google-genai) ---
+from google import genai
+
+client = genai.Client()
+env_id = "${cleanEnv}"  # ou env = client.environments.create(); env_id = env.environment_id
+
+# 1) Upload de arquivo único (sobrescrevendo se existir)
+client.environments.files.upload(
+    environment=env_id,
+    path="${sampleRel}/main.py",
+    file="local_dir/main.py",
+    overwrite=True,
+)
+
+# 2) Upload de pasta compactada (.tar.gz) com extração automática no sandbox
+client.environments.files.upload(
+    environment=env_id,
+    path="${sampleRel}",
+    file="project.tar.gz",
+    extract=True,
+    overwrite=True,
+)
+
+# --- REST / cURL (Environments Upload API) ---
+# Upload simples:
+curl -X PUT \\
+  "https://generativelanguage.googleapis.com/upload/v1beta/environments/${cleanEnv}/files/${sampleRel}/main.py?overwrite=true" \\
+  -H "x-goog-api-key: $GEMINI_API_KEY" \\
+  -H "Content-Type: text/x-python" \\
+  --data-binary @local_dir/main.py
+
+# Upload de arquivo .tar.gz com extração automática (extract=true):
+curl -X PUT \\
+  "https://generativelanguage.googleapis.com/upload/v1beta/environments/${cleanEnv}/files/${sampleRel}?extract=true&overwrite=true" \\
+  -H "x-goog-api-key: $GEMINI_API_KEY" \\
+  -H "Content-Type: application/gzip" \\
+  --data-binary @project.tar.gz`;
+
   document.getElementById("pythonCodeSnippet").textContent = pyCode;
   document.getElementById("curlCodeSnippet").textContent = curlCode;
+  const envUploadEl = document.getElementById("envUploadCodeSnippet");
+  if (envUploadEl) {
+    envUploadEl.textContent = envUploadCode;
+  }
   document.getElementById("codeModal").classList.remove("hidden");
   document.getElementById("codeModal").classList.add("flex");
 }
@@ -890,8 +940,8 @@ async function downloadActiveEnvironmentSnapshot() {
   if (!targetEnv || targetEnv === "remote") {
     alert(
       "⚠️ Nenhum ambiente remoto ativo nesta sessão ainda.\n\n" +
-      "Envie uma mensagem primeiro para que o Antigravity execute e crie o container sandbox ('environment_id'). " +
-      "Assim que o ambiente for provisionado, o botão Download baixará o snapshot compactado (.tar.gz) com todos os arquivos criados pelo agente (assim como no Google AI Studio)."
+      "Envie uma mensagem primeiro ou clique em '⚡ Provisionar' / '⬆️ Upload Ambiente' para criar o container sandbox ('environment_id'). " +
+      "Assim que o ambiente for provisionado, o botão Download baixará o snapshot compactado (.tar.gz) com todos os arquivos do ambiente."
     );
     return;
   }
@@ -972,7 +1022,7 @@ function renderSourcesList() {
   if (sources.length === 0) {
     container.innerHTML = `
       <div id="sourcesEmptyState" class="text-[11px] text-gray-500 italic py-2 text-center bg-studio-bg/60 rounded-lg border border-dashed border-studio-border">
-        Nenhuma fonte configurada. Clique em "＋ Adicionar Fonte" para clonar um repositório GitHub.
+        Nenhuma fonte configurada. Clique em "＋ Adicionar Fonte" para clonar um repositório GitHub ou use "⬆️ Upload Direto ao Ambiente".
       </div>
     `;
     return;
@@ -1042,6 +1092,12 @@ function onSourceTypeChanged() {
   const urlLabel = document.getElementById("sourceUrlLabel");
   const urlInput = document.getElementById("sourceUrlInput");
 
+  if (type === "direct_upload") {
+    closeAddSourceModal();
+    openUploadEnvModal("folder");
+    return;
+  }
+
   if (type === "repository") {
     urlGroup.classList.remove("hidden");
     contentGroup.classList.add("hidden");
@@ -1081,6 +1137,12 @@ async function submitAddSource() {
   errBox.classList.add("hidden");
 
   const type = document.getElementById("sourceTypeSelect").value;
+  if (type === "direct_upload") {
+    closeAddSourceModal();
+    openUploadEnvModal("folder");
+    return;
+  }
+
   const target = document.getElementById("sourceTargetInput").value.trim();
 
   if (!target) {
@@ -1132,4 +1194,524 @@ async function removeSource(index) {
   renderSourcesList();
   await saveSessionSettings();
 }
+
+// ============================================================================
+// UPLOAD DIRETO VIA API DE AMBIENTES (ENVIRONMENTS API)
+// PUT /upload/v1beta/environments/{environment_id}/files/{path}
+// ============================================================================
+
+let currentUploadModalMode = "single"; // 'single' | 'folder' | 'archive'
+let selectedUploadFiles = [];
+
+function formatBytesSize(bytes) {
+  const n = Number(bytes || 0);
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function renderUploadedFilesList() {
+  const group = document.getElementById("uploadedFilesGroup");
+  const container = document.getElementById("uploadedFilesList");
+  const countBadge = document.getElementById("uploadedFilesCountBadge");
+  if (!group || !container) return;
+
+  const uploaded = (currentSession && Array.isArray(currentSession.uploaded_files))
+    ? currentSession.uploaded_files
+    : [];
+
+  if (uploaded.length === 0) {
+    group.classList.add("hidden");
+    container.innerHTML = "";
+    if (countBadge) countBadge.textContent = "0";
+    return;
+  }
+
+  group.classList.remove("hidden");
+  if (countBadge) countBadge.textContent = String(uploaded.length);
+
+  container.innerHTML = uploaded
+    .map((item, idx) => {
+      const icon = item.extract ? "📦" : "📄";
+      const label = item.summary || item.target_path || "Upload";
+      const targetPath = item.target_path || "/workspace";
+      const sizeStr = formatBytesSize(item.size_bytes || 0);
+      const flags = [];
+      if (item.extract) flags.push("extract=true");
+      if (item.overwrite) flags.push("overwrite=true");
+      if (item.resumable) flags.push("resumable");
+
+      return `
+        <div class="flex items-center justify-between gap-2 bg-studio-bg p-2 rounded-lg border border-blue-500/30 text-xs group hover:border-blue-400/60 transition">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="text-sm shrink-0">${icon}</span>
+            <div class="min-w-0">
+              <div class="font-medium text-blue-300 truncate text-[11px]" title="${escapeHtml(label)}">
+                ${escapeHtml(label)} <span class="text-[10px] text-gray-500">(${sizeStr})</span>
+              </div>
+              <div class="font-mono text-[10px] text-gray-400 truncate" title="${escapeHtml(targetPath)}">
+                ➜ ${escapeHtml(targetPath)} ${flags.length ? `<span class="text-emerald-400/80">[${flags.join(", ")}]</span>` : ""}
+              </div>
+            </div>
+          </div>
+          <button
+            onclick="removeUploadedFileRecord(${idx})"
+            class="text-gray-500 hover:text-red-400 p-1 rounded transition shrink-0"
+            title="Remover registro da lista"
+          >
+            ✕
+          </button>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+async function removeUploadedFileRecord(index) {
+  if (!currentSession || !Array.isArray(currentSession.uploaded_files)) return;
+  currentSession.uploaded_files.splice(index, 1);
+  renderUploadedFilesList();
+  await saveSessionSettings();
+}
+
+async function provisionSessionEnvironmentNow() {
+  if (!currentSession) return;
+  const envInput = document.getElementById("environmentIdInput");
+  const currentEnv = (envInput.value || "").trim();
+  if (currentEnv && currentEnv !== "remote") {
+    alert(`✅ Esta sessão já possui um ambiente provisionado:\n\n${currentEnv}\n\nSe quiser criar outro do zero, clique primeiro em 'Resetar' ao lado do Environment ID.`);
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/sessions/${currentSession.id}/environment/provision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sources: currentSession.sources || [],
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+
+    currentSession = data.session || currentSession;
+    syncInputsFromSession();
+    await loadSessionsList();
+    alert(`✅ Ambiente remoto provisionado com sucesso via Environments API!\n\nenvironment_id: ${data.environment_id}`);
+  } catch (err) {
+    alert(`❌ Falha ao provisionar ambiente remoto:\n${err.message}`);
+  }
+}
+
+function openUploadEnvModal(initialMode = "single") {
+  selectedUploadFiles = [];
+  const fileSingle = document.getElementById("uploadSingleFileInput");
+  const fileFolder = document.getElementById("uploadFolderInput");
+  const fileArchive = document.getElementById("uploadArchiveInput");
+  if (fileSingle) fileSingle.value = "";
+  if (fileFolder) fileFolder.value = "";
+  if (fileArchive) fileArchive.value = "";
+
+  const errBox = document.getElementById("uploadEnvErrorBox");
+  const okBox = document.getElementById("uploadEnvSuccessBox");
+  if (errBox) errBox.classList.add("hidden");
+  if (okBox) okBox.classList.add("hidden");
+
+  const envId = (document.getElementById("environmentIdInput").value || "").trim();
+  const badge = document.getElementById("uploadModalEnvBadge");
+  if (badge) {
+    if (envId && envId !== "remote") {
+      badge.textContent = envId;
+      badge.className = "font-mono text-xs text-blue-300 bg-blue-950/60 px-2.5 py-1 rounded border border-blue-500/30";
+    } else {
+      badge.textContent = "remote (será provisionado automaticamente antes do upload)";
+      badge.className = "font-mono text-xs text-amber-300 bg-amber-950/60 px-2.5 py-1 rounded border border-amber-500/30";
+    }
+  }
+
+  setUploadModalMode(initialMode || "single");
+
+  const modal = document.getElementById("uploadEnvModal");
+  modal.classList.remove("hidden");
+  modal.classList.add("flex");
+}
+
+function closeUploadEnvModal() {
+  const modal = document.getElementById("uploadEnvModal");
+  modal.classList.add("hidden");
+  modal.classList.remove("flex");
+}
+
+function setUploadModalMode(mode) {
+  currentUploadModalMode = mode;
+  selectedUploadFiles = [];
+
+  const tabSingle = document.getElementById("uploadTabSingle");
+  const tabFolder = document.getElementById("uploadTabFolder");
+  const tabArchive = document.getElementById("uploadTabArchive");
+
+  const activeCls = "py-2 px-3 rounded-lg border border-blue-500/50 bg-blue-600/20 text-blue-300 font-semibold transition flex flex-col items-center gap-0.5";
+  const inactiveCls = "py-2 px-3 rounded-lg border border-studio-border bg-studio-bg text-gray-400 hover:text-white transition flex flex-col items-center gap-0.5";
+
+  if (tabSingle) tabSingle.className = mode === "single" ? activeCls : inactiveCls;
+  if (tabFolder) tabFolder.className = mode === "folder" ? activeCls : inactiveCls;
+  if (tabArchive) tabArchive.className = mode === "archive" ? activeCls : inactiveCls;
+
+  const pickerIcon = document.getElementById("uploadPickerIcon");
+  const pickerTitle = document.getElementById("uploadPickerTitle");
+  const pickerSub = document.getElementById("uploadPickerSubtitle");
+  const targetInput = document.getElementById("uploadTargetPathInput");
+  const targetHint = document.getElementById("uploadTargetHint");
+  const extractCheck = document.getElementById("uploadExtractCheckbox");
+  const selectedBox = document.getElementById("uploadSelectedFilesSummary");
+
+  if (selectedBox) selectedBox.classList.add("hidden");
+
+  if (mode === "single") {
+    if (pickerIcon) pickerIcon.textContent = "📄";
+    if (pickerTitle) pickerTitle.textContent = "Clique para selecionar um ou mais arquivos";
+    if (pickerSub) pickerSub.textContent = "Se escolher 1 arquivo, faz PUT direto no caminho destino. Se escolher vários, empacota e extrai.";
+    if (targetInput) targetInput.value = "/workspace/main.py";
+    if (targetHint) targetHint.textContent = "Para 1 arquivo, informe o caminho completo (ex: /workspace/main.py) ou diretório (/workspace/).";
+    if (extractCheck) extractCheck.checked = false;
+  } else if (mode === "folder") {
+    if (pickerIcon) pickerIcon.textContent = "📁";
+    if (pickerTitle) pickerTitle.textContent = "Clique para selecionar uma pasta local inteira";
+    if (pickerSub) pickerSub.textContent = "O backend empacota automaticamente a pasta em .tar.gz em memória e envia com extract=true.";
+    if (targetInput) targetInput.value = "/workspace/project";
+    if (targetHint) targetHint.textContent = "Diretório de destino onde os arquivos da pasta serão extraídos no sandbox.";
+    if (extractCheck) extractCheck.checked = true;
+  } else if (mode === "archive") {
+    if (pickerIcon) pickerIcon.textContent = "📦";
+    if (pickerTitle) pickerTitle.textContent = "Clique para selecionar um arquivo .tar.gz ou .tar";
+    if (pickerSub) pickerSub.textContent = "Envia o pacote compactado e extrai automaticamente no destino (extract=true).";
+    if (targetInput) targetInput.value = "/workspace/project";
+    if (targetHint) targetHint.textContent = "Diretório onde o conteúdo do .tar.gz será extraído.";
+    if (extractCheck) extractCheck.checked = true;
+  }
+
+  updateUploadModalCodePreview();
+}
+
+function triggerUploadFilePicker() {
+  if (currentUploadModalMode === "folder") {
+    document.getElementById("uploadFolderInput").click();
+  } else if (currentUploadModalMode === "archive") {
+    document.getElementById("uploadArchiveInput").click();
+  } else {
+    document.getElementById("uploadSingleFileInput").click();
+  }
+}
+
+function onUploadFilesSelected(inputElOrFiles) {
+  const rawList = (inputElOrFiles && inputElOrFiles.files) ? inputElOrFiles.files : inputElOrFiles;
+  const files = Array.from(rawList || []);
+  selectedUploadFiles = files;
+
+  const summaryBox = document.getElementById("uploadSelectedFilesSummary");
+  const countText = document.getElementById("uploadSelectedCountText");
+  const sizeText = document.getElementById("uploadSelectedSizeText");
+  const listPreview = document.getElementById("uploadSelectedListPreview");
+  const targetInput = document.getElementById("uploadTargetPathInput");
+  const extractCheck = document.getElementById("uploadExtractCheckbox");
+
+  if (files.length === 0) {
+    if (summaryBox) summaryBox.classList.add("hidden");
+    updateUploadModalCodePreview();
+    return;
+  }
+
+  const totalBytes = files.reduce((acc, f) => acc + (f.size || 0), 0);
+  if (summaryBox) summaryBox.classList.remove("hidden");
+  if (countText) countText.textContent = `${files.length} arquivo(s) selecionado(s)`;
+  if (sizeText) sizeText.textContent = formatBytesSize(totalBytes);
+
+  if (listPreview) {
+    const previewItems = files.slice(0, 15).map((f) => {
+      const rel = f.webkitRelativePath || f.name;
+      return `• ${escapeHtml(rel)} (${formatBytesSize(f.size)})`;
+    });
+    if (files.length > 15) {
+      previewItems.push(`... e mais ${files.length - 15} arquivo(s)`);
+    }
+    listPreview.innerHTML = previewItems.join("<br/>");
+  }
+
+  if (currentUploadModalMode === "single" && files.length === 1) {
+    const fname = files[0].name;
+    const isArchive = /\.(tar\.gz|tgz|tar)$/i.test(fname);
+    if (isArchive) {
+      if (extractCheck) extractCheck.checked = true;
+      const baseName = fname.replace(/\.(tar\.gz|tgz|tar)$/i, "");
+      if (targetInput) targetInput.value = `/workspace/${baseName}`;
+    } else {
+      if (extractCheck) extractCheck.checked = false;
+      if (targetInput) targetInput.value = `/workspace/${fname}`;
+    }
+  } else if (currentUploadModalMode === "single" && files.length > 1) {
+    if (extractCheck) extractCheck.checked = true;
+    if (targetInput && targetInput.value.endsWith(".py")) {
+      targetInput.value = "/workspace/project";
+    }
+  } else if (currentUploadModalMode === "folder" && files.length > 0) {
+    if (extractCheck) extractCheck.checked = true;
+    const firstRel = files[0].webkitRelativePath || "";
+    const topFolder = firstRel.split("/")[0];
+    if (topFolder && targetInput) {
+      targetInput.value = `/workspace/${topFolder}`;
+    }
+  } else if (currentUploadModalMode === "archive" && files.length === 1) {
+    if (extractCheck) extractCheck.checked = true;
+    const baseName = files[0].name.replace(/\.(tar\.gz|tgz|tar)$/i, "");
+    if (targetInput && baseName) {
+      targetInput.value = `/workspace/${baseName}`;
+    }
+  }
+
+  updateUploadModalCodePreview();
+}
+
+function updateUploadModalCodePreview() {
+  const previewEl = document.getElementById("uploadModalCodePreview");
+  if (!previewEl) return;
+
+  const envIdRaw = (document.getElementById("environmentIdInput").value || "").trim();
+  const cleanEnv = (!envIdRaw || envIdRaw === "remote") ? "<ENVIRONMENT_ID>" : envIdRaw.replace(/^environments\//, "");
+  const targetVal = (document.getElementById("uploadTargetPathInput").value || "/workspace/project").trim();
+  const relPath = targetVal.replace(/^\/+/, "") || "workspace/project";
+  const overwrite = document.getElementById("uploadOverwriteCheckbox")?.checked ?? true;
+  const extract = document.getElementById("uploadExtractCheckbox")?.checked ?? false;
+  const resumable = document.getElementById("uploadResumableCheckbox")?.checked ?? false;
+
+  const firstFile = selectedUploadFiles.length === 1 ? selectedUploadFiles[0].name : (extract ? "project.tar.gz" : "local_dir/main.py");
+  const qParams = [];
+  if (resumable) qParams.push("uploadType=resumable");
+  if (extract) qParams.push("extract=true");
+  if (overwrite) qParams.push("overwrite=true");
+  const qs = qParams.length ? `?${qParams.join("&")}` : "";
+
+  const snippet = `# Python SDK (google-genai)
+client.environments.files.upload(
+    environment="${cleanEnv}",
+    path="${relPath}",
+    file="${firstFile}",${extract ? "\n    extract=True," : ""}${overwrite ? "\n    overwrite=True," : ""}
+)
+
+# REST API (Environments Upload)
+curl -X PUT \\
+  "https://generativelanguage.googleapis.com/upload/v1beta/environments/${cleanEnv}/files/${relPath}${qs}" \\
+  -H "x-goog-api-key: $GEMINI_API_KEY" \\
+  --data-binary @${firstFile}`;
+
+  previewEl.textContent = snippet;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const commaIdx = result.indexOf(",");
+      resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+    };
+    reader.onerror = (err) => reject(err);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function submitUploadToEnvironment() {
+  if (!currentSession) return;
+
+  const errBox = document.getElementById("uploadEnvErrorBox");
+  const okBox = document.getElementById("uploadEnvSuccessBox");
+  const submitBtn = document.getElementById("submitUploadEnvBtn");
+  errBox.classList.add("hidden");
+  okBox.classList.add("hidden");
+
+  if (!selectedUploadFiles || selectedUploadFiles.length === 0) {
+    errBox.textContent = "Selecione pelo menos um arquivo ou pasta para enviar ao ambiente.";
+    errBox.classList.remove("hidden");
+    return;
+  }
+
+  const targetPath = (document.getElementById("uploadTargetPathInput").value || "").trim();
+  if (!targetPath) {
+    errBox.textContent = "Informe o caminho de destino (path) dentro do ambiente (ex: /workspace/main.py).";
+    errBox.classList.remove("hidden");
+    return;
+  }
+
+  const overwrite = document.getElementById("uploadOverwriteCheckbox")?.checked ?? true;
+  const extract = document.getElementById("uploadExtractCheckbox")?.checked ?? false;
+  const resumable = document.getElementById("uploadResumableCheckbox")?.checked ?? false;
+  const autoProvision = document.getElementById("uploadAutoProvisionToggle")?.checked ?? true;
+
+  const originalBtnHtml = submitBtn.innerHTML;
+  submitBtn.disabled = true;
+  submitBtn.innerHTML = '<span>⏳</span><span>Enviando para o Ambiente...</span>';
+
+  try {
+    const encodedFiles = [];
+    for (const f of selectedUploadFiles) {
+      const b64 = await fileToBase64(f);
+      let relPath = f.webkitRelativePath || f.name;
+      // Se for upload de pasta (webkitRelativePath = "minha_pasta/sub/arq.py") e o targetPath já termina com "minha_pasta",
+      // removemos o primeiro nível para evitar duplicar "/workspace/minha_pasta/minha_pasta/sub/arq.py"
+      if (currentUploadModalMode === "folder" && relPath.includes("/")) {
+        const parts = relPath.split("/");
+        const topDir = parts[0];
+        if (targetPath.replace(/\/+$/, "").endsWith(`/${topDir}`)) {
+          relPath = parts.slice(1).join("/");
+        }
+      }
+      encodedFiles.push({
+        path: relPath,
+        content_b64: b64,
+        content_type: f.type || "",
+      });
+    }
+
+    const res = await fetch(`/api/sessions/${currentSession.id}/environment/upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target_path: targetPath,
+        overwrite,
+        extract,
+        resumable,
+        auto_provision: autoProvision,
+        pack_as_tar_gz: currentUploadModalMode === "folder" || encodedFiles.length > 1,
+        files: encodedFiles,
+      }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+
+    if (data.session) {
+      currentSession = data.session;
+    }
+    syncInputsFromSession();
+    await loadSessionsList();
+
+    const envBadge = document.getElementById("uploadModalEnvBadge");
+    if (envBadge && data.environment_id) {
+      envBadge.textContent = data.environment_id;
+      envBadge.className = "font-mono text-xs text-blue-300 bg-blue-950/60 px-2.5 py-1 rounded border border-blue-500/30";
+    }
+
+    okBox.innerHTML = `✅ <strong>Upload concluído com sucesso!</strong><br/>` +
+      `Ambiente: <code class="font-mono text-emerald-200">${escapeHtml(data.environment_id)}</code><br/>` +
+      `Destino: <code class="font-mono text-emerald-200">${escapeHtml(data.upload?.target_path || targetPath)}</code> ` +
+      `(${formatBytesSize(data.upload?.size_bytes || 0)})`;
+    okBox.classList.remove("hidden");
+  } catch (err) {
+    errBox.textContent = `❌ Falha no upload para o ambiente: ${err.message}`;
+    errBox.classList.remove("hidden");
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.innerHTML = originalBtnHtml;
+  }
+}
+
+// ============================================================================
+// MODAL EXPLORADOR DE ARQUIVOS DO AMBIENTE (GET /v1beta/environments/{id}/files)
+// ============================================================================
+
+async function openEnvFilesModal() {
+  const modal = document.getElementById("envFilesModal");
+  modal.classList.remove("hidden");
+  modal.classList.add("flex");
+  await refreshEnvFilesList();
+}
+
+function closeEnvFilesModal() {
+  const modal = document.getElementById("envFilesModal");
+  modal.classList.add("hidden");
+  modal.classList.remove("flex");
+}
+
+async function refreshEnvFilesList() {
+  const container = document.getElementById("envFilesListContainer");
+  if (!container) return;
+
+  const envId = (document.getElementById("environmentIdInput").value || "").trim();
+  const pathVal = (document.getElementById("envFilesPathInput")?.value || "/workspace").trim();
+  const recursive = document.getElementById("envFilesRecursiveCheckbox")?.checked ?? true;
+
+  if (!envId || envId === "remote") {
+    const uploaded = (currentSession && Array.isArray(currentSession.uploaded_files))
+      ? currentSession.uploaded_files
+      : [];
+    container.innerHTML = `
+      <div class="p-4 text-xs text-amber-300 bg-amber-950/30 border border-amber-500/30 rounded-lg space-y-2">
+        <p class="font-semibold">⚠️ O ambiente desta sessão ainda está como <code>remote</code> (não provisionado).</p>
+        <p class="text-gray-300">Clique em <strong>"⚡ Provisionar"</strong>, <strong>"⬆️ Upload de Arquivo/Pasta"</strong> ou envie uma mensagem no chat para instanciar o contêiner e listar seus arquivos.</p>
+        ${uploaded.length > 0 ? `<p class="text-blue-300">Registros de uploads na sessão: ${uploaded.length}</p>` : ""}
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = `<div class="text-xs text-gray-400 py-8 text-center">⏳ Consultando arquivos de <code>${escapeHtml(envId)}</code> (${escapeHtml(pathVal)})...</div>`;
+
+  try {
+    const qs = new URLSearchParams({ path: pathVal, recursive: String(recursive) }).toString();
+    const url = (currentSession && currentSession.id)
+      ? `/api/sessions/${currentSession.id}/environment/files?${qs}`
+      : `/api/environments/${encodeURIComponent(envId)}/files?${qs}`;
+
+    const res = await fetch(url);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
+
+    const apiData = data.data || {};
+    const filesArr = Array.isArray(apiData.files)
+      ? apiData.files
+      : (Array.isArray(apiData.entries) ? apiData.entries : null);
+
+    let html = "";
+    if (filesArr && filesArr.length > 0) {
+      html += `<div class="space-y-1">`;
+      for (const item of filesArr) {
+        const name = typeof item === "string" ? item : (item.path || item.name || JSON.stringify(item));
+        const isDir = typeof item === "object" && (item.type === "directory" || item.is_dir || item.mimeType === "inode/directory");
+        const size = typeof item === "object" && item.size !== undefined ? formatBytesSize(item.size) : "";
+        html += `
+          <div class="flex items-center justify-between px-3 py-1.5 rounded bg-studio-card border border-studio-border text-xs font-mono">
+            <span class="text-gray-200 truncate">${isDir ? "📁" : "📄"} ${escapeHtml(name)}</span>
+            <span class="text-gray-500 text-[11px] shrink-0">${escapeHtml(size)}</span>
+          </div>
+        `;
+      }
+      html += `</div>`;
+    } else {
+      html += `<pre class="text-xs font-mono text-gray-200 whitespace-pre-wrap">${escapeHtml(JSON.stringify(apiData, null, 2))}</pre>`;
+    }
+
+    container.innerHTML = html;
+  } catch (err) {
+    const uploaded = (currentSession && Array.isArray(currentSession.uploaded_files))
+      ? currentSession.uploaded_files
+      : [];
+    container.innerHTML = `
+      <div class="p-3 text-xs text-red-300 bg-red-950/30 border border-red-500/30 rounded-lg space-y-2">
+        <div>❌ Erro ao consultar API de arquivos do ambiente: ${escapeHtml(err.message)}</div>
+        ${uploaded.length > 0 ? `
+          <div class="pt-2 border-t border-red-500/20 text-gray-300">
+            <div class="font-semibold text-blue-300 mb-1">Histórico de Uploads registrados nesta sessão:</div>
+            ${uploaded.map(u => `<div class="font-mono text-[11px]">• ${escapeHtml(u.target_path)} (${formatBytesSize(u.size_bytes || 0)})</div>`).join("")}
+          </div>
+        ` : ""}
+      </div>
+    `;
+  }
+}
+
 

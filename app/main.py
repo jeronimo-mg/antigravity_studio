@@ -1,6 +1,7 @@
+import base64
 import os
-from typing import Any, Dict, Optional
-from fastapi import FastAPI, HTTPException
+from typing import Any, Dict, List, Optional, Tuple
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +14,7 @@ from .database import (
     get_setting,
     init_db,
     list_sessions,
+     now_iso,
     set_setting,
     update_session,
     upsert_turn,
@@ -20,13 +22,18 @@ from .database import (
 from .interactions_client import (
     build_create_payload,
     cancel_interaction,
+    clean_environment_id,
     create_interaction,
+    create_remote_environment,
     download_environment_snapshot,
     extract_texts_from_interaction,
     format_session_as_markdown,
     get_interaction,
+    list_environment_files,
+    pack_files_as_tar_gz,
     recover_conversation_chain,
     resolve_api_key,
+    upload_file_to_environment,
 )
 
 app = FastAPI(
@@ -66,6 +73,7 @@ class SessionCreateRequest(BaseModel):
     max_total_tokens: Optional[int] = 0
     system_instruction: Optional[str] = ""
     sources: Optional[list] = None
+    uploaded_files: Optional[list] = None
 
 
 class SessionUpdateRequest(BaseModel):
@@ -78,6 +86,8 @@ class SessionUpdateRequest(BaseModel):
     max_total_tokens: Optional[int] = None
     system_instruction: Optional[str] = None
     sources: Optional[list] = None
+    uploaded_files: Optional[list] = None
+
 
 
 class ImportChainRequest(BaseModel):
@@ -587,6 +597,398 @@ async def api_download_environment_by_id(
     )
 
 
+async def _parse_upload_request(request: Request) -> Dict[str, Any]:
+    """
+    Suporta tanto payload JSON (application/json com arquivos em Base64 ou texto)
+    quanto multipart/form-data (UploadFile do navegador/cURL).
+    """
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in ctype:
+        form = await request.form()
+        target_path = str(form.get("target_path") or form.get("path") or "/workspace").strip()
+        overwrite = str(form.get("overwrite", "true")).lower() in ("true", "1", "yes", "on")
+        extract = str(form.get("extract", "false")).lower() in ("true", "1", "yes", "on")
+        resumable = str(form.get("resumable", "false")).lower() in ("true", "1", "yes", "on")
+        pack_as_tar_gz = str(form.get("pack_as_tar_gz", "false")).lower() in ("true", "1", "yes", "on")
+        auto_provision = str(form.get("auto_provision", "true")).lower() in ("true", "1", "yes", "on")
+        environment_id = str(form.get("environment_id") or "").strip()
+        api_key = str(form.get("api_key") or "").strip() or None
+        explicit_mime = str(form.get("mime_type") or "").strip() or None
+
+        rel_paths = form.getlist("relative_paths")
+        raw_files = form.getlist("files") or form.getlist("file")
+        parsed_files: List[Dict[str, Any]] = []
+        for idx, item in enumerate(raw_files):
+            if hasattr(item, "read"):
+                f_bytes = await item.read()
+                fname = getattr(item, "filename", "") or f"file_{idx}"
+                rel_p = str(rel_paths[idx]) if idx < len(rel_paths) and rel_paths[idx] else fname
+                f_mime = explicit_mime or getattr(item, "content_type", None) or None
+                parsed_files.append({
+                    "path": rel_p,
+                    "bytes": f_bytes,
+                    "mime_type": f_mime,
+                })
+
+        return {
+            "target_path": target_path,
+            "overwrite": overwrite,
+            "extract": extract,
+            "resumable": resumable,
+            "pack_as_tar_gz": pack_as_tar_gz,
+            "auto_provision": auto_provision,
+            "environment_id": environment_id,
+            "api_key": api_key,
+            "files": parsed_files,
+        }
+
+    body = await request.json()
+    target_path = str(body.get("target_path") or body.get("path") or "/workspace").strip()
+    overwrite = bool(body.get("overwrite", True))
+    extract = bool(body.get("extract", False))
+    resumable = bool(body.get("resumable", False))
+    pack_as_tar_gz = bool(body.get("pack_as_tar_gz", False))
+    auto_provision = bool(body.get("auto_provision", True))
+    environment_id = str(body.get("environment_id") or "").strip()
+    api_key = body.get("api_key")
+
+    parsed_files = []
+    for idx, f in enumerate(body.get("files") or []):
+        if not isinstance(f, dict):
+            continue
+        rel_p = str(f.get("path") or f.get("name") or f"file_{idx}").strip()
+        b64_raw = f.get("content_base64") if f.get("content_base64") is not None else f.get("content_b64")
+        if b64_raw is not None:
+            b64_str = str(b64_raw)
+            if "," in b64_str and b64_str.startswith("data:"):
+                b64_str = b64_str.split(",", 1)[1]
+            f_bytes = base64.b64decode(b64_str)
+        elif "content_text" in f and f["content_text"] is not None:
+            f_bytes = str(f["content_text"]).encode("utf-8")
+        else:
+            f_bytes = b""
+        parsed_files.append({
+            "path": rel_p,
+            "bytes": f_bytes,
+            "mime_type": f.get("mime_type") or f.get("content_type") or body.get("mime_type"),
+        })
+
+    top_b64 = body.get("content_base64") if body.get("content_base64") is not None else body.get("content_b64")
+    if not parsed_files and (top_b64 is not None or "content_text" in body):
+        if top_b64 is not None:
+            b64_str = str(top_b64)
+            if "," in b64_str and b64_str.startswith("data:"):
+                b64_str = b64_str.split(",", 1)[1]
+            f_bytes = base64.b64decode(b64_str)
+        else:
+            f_bytes = str(body.get("content_text") or "").encode("utf-8")
+        parsed_files.append({
+            "path": os.path.basename(target_path.rstrip("/")) or "arquivo.txt",
+            "bytes": f_bytes,
+            "mime_type": body.get("mime_type") or body.get("content_type"),
+        })
+
+    return {
+        "target_path": target_path,
+        "overwrite": overwrite,
+        "extract": extract,
+        "resumable": resumable,
+        "pack_as_tar_gz": pack_as_tar_gz,
+        "auto_provision": auto_provision,
+        "environment_id": environment_id,
+        "api_key": api_key,
+        "files": parsed_files,
+    }
+
+
+@app.post("/api/sessions/{session_id}/environment/provision")
+async def api_provision_session_environment(
+    session_id: str,
+    request: Request,
+) -> Dict[str, Any]:
+    """
+    Provisiona proativamente um ambiente remoto (POST /v1beta/environments) para a sessão,
+    permitindo obter um environment_id antes mesmo do primeiro turno (por exemplo, para
+    enviar arquivos via Environments API antes do Turno #1).
+    """
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    api_key = body.get("api_key") if isinstance(body, dict) else None
+    from_env = body.get("from_environment") if isinstance(body, dict) else None
+    sources = (
+        body.get("sources")
+        if isinstance(body, dict) and body.get("sources") is not None
+        else session.get("sources", [])
+    )
+
+    try:
+        env_data = await create_remote_environment(
+            sources=sources,
+            from_environment=from_env,
+            api_key=api_key,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    new_env_id = env_data.get("id") or ""
+    if not new_env_id:
+        raise HTTPException(
+            status_code=400,
+            detail="A Environments API não retornou um environment_id válido.",
+        )
+
+    updated_session = update_session(session_id, environment_id=new_env_id)
+    return {
+        "environment": env_data,
+        "environment_id": new_env_id,
+        "session": updated_session,
+    }
+
+
+@app.post("/api/sessions/{session_id}/environment/upload")
+async def api_upload_to_session_environment(
+    session_id: str,
+    request: Request,
+) -> Dict[str, Any]:
+    """
+    Faz upload direto de um arquivo único, múltiplos arquivos/pasta local (compactados em memória
+    como .tar.gz com extract=true) ou um arquivo .tar/.tar.gz diretamente para o ambiente sandbox
+    da sessão usando a Environments API:
+      PUT https://generativelanguage.googleapis.com/upload/v1beta/environments/{environment_id}/files/{path}
+    """
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada.")
+
+    try:
+        parsed = await _parse_upload_request(request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Erro ao ler dados de upload: {exc}")
+
+    files_list: List[Dict[str, Any]] = parsed["files"]
+    if not files_list:
+        raise HTTPException(status_code=400, detail="Nenhum arquivo enviado para upload.")
+
+    env_id = clean_environment_id(parsed["environment_id"] or session.get("environment_id") or "")
+    provisioned_now = False
+
+    # Se ainda não houver um environment_id provisionado na sessão e auto_provision=True,
+    # cria o ambiente via POST /v1beta/environments antes de subir os arquivos.
+    if (not env_id or env_id == "remote") and parsed["auto_provision"]:
+        try:
+            env_resp = await create_remote_environment(
+                sources=session.get("sources", []),
+                api_key=parsed["api_key"],
+            )
+            env_id = clean_environment_id(env_resp.get("id") or "")
+            if env_id:
+                provisioned_now = True
+                update_session(session_id, environment_id=env_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Esta sessão ainda não possui um environment_id ativo e a criação automática "
+                    f"via POST /v1beta/environments falhou: {exc}. "
+                    f"Dica: Envie um primeiro prompt no modo Agente para provisionar o ambiente ou informe um environment_id existente."
+                ),
+            )
+
+    if not env_id or env_id == "remote":
+        raise HTTPException(
+            status_code=400,
+            detail="Informe um environment_id ativo (ex: env_...) ou habilite o provisionamento automático do ambiente.",
+        )
+
+    target_path = parsed["target_path"]
+    overwrite = parsed["overwrite"]
+    extract = parsed["extract"]
+    resumable = parsed["resumable"]
+    pack_as_tar_gz = parsed["pack_as_tar_gz"] or len(files_list) > 1
+
+    try:
+        if pack_as_tar_gz:
+            tar_tuples = [(f["path"], f["bytes"]) for f in files_list]
+            archive_bytes = pack_files_as_tar_gz(tar_tuples)
+            upload_res = await upload_file_to_environment(
+                environment_id=env_id,
+                target_path=target_path,
+                file_bytes=archive_bytes,
+                mime_type="application/x-tar",
+                overwrite=overwrite,
+                extract=True,
+                resumable=resumable,
+                api_key=parsed["api_key"],
+            )
+            upload_summary_label = (
+                f"Pasta/Pacote ({len(files_list)} arquivo{'s' if len(files_list) > 1 else ''})"
+            )
+        else:
+            single = files_list[0]
+            upload_res = await upload_file_to_environment(
+                environment_id=env_id,
+                target_path=target_path,
+                file_bytes=single["bytes"],
+                mime_type=single.get("mime_type"),
+                overwrite=overwrite,
+                extract=extract,
+                resumable=resumable,
+                api_key=parsed["api_key"],
+            )
+            upload_summary_label = single["path"]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Registra no histórico de arquivos enviados da sessão (SQLite)
+    current_uploaded = list(session.get("uploaded_files") or [])
+    upload_record = {
+        "label": upload_summary_label,
+        "summary": upload_summary_label,
+        "target_path": upload_res.get("target_path") or target_path,
+        "size_bytes": upload_res.get("size_bytes", 0),
+        "mime_type": upload_res.get("mime_type", "application/octet-stream"),
+        "extract": bool(upload_res.get("extract")),
+        "overwrite": overwrite,
+        "resumable": resumable,
+        "upload_mode": upload_res.get("upload_mode", "direct_put"),
+        "file_count": len(files_list),
+        "environment_id": env_id,
+        "uploaded_at": now_iso(),
+    }
+    current_uploaded.append(upload_record)
+
+    updated_session = update_session(
+        session_id,
+        environment_id=env_id,
+        uploaded_files=current_uploaded,
+    )
+
+    return {
+        "status": "uploaded",
+        "provisioned_new_environment": provisioned_now,
+        "auto_provisioned_environment": provisioned_now,
+        "environment_id": env_id,
+        "upload": upload_record,
+        "upload_result": upload_res,
+        "session": updated_session,
+    }
+
+
+@app.post("/api/environments/{environment_id}/upload")
+async def api_upload_to_environment_by_id(
+    environment_id: str,
+    request: Request,
+) -> Dict[str, Any]:
+    """Faz upload direto para qualquer environment_id via Environments API."""
+    clean_id = clean_environment_id(environment_id)
+    if not clean_id or clean_id == "remote":
+        raise HTTPException(status_code=400, detail="Informe um environment_id válido (ex: env_...).")
+
+    try:
+        parsed = await _parse_upload_request(request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Erro ao ler dados de upload: {exc}")
+
+    files_list: List[Dict[str, Any]] = parsed["files"]
+    if not files_list:
+        raise HTTPException(status_code=400, detail="Nenhum arquivo enviado para upload.")
+
+    pack_as_tar_gz = parsed["pack_as_tar_gz"] or len(files_list) > 1
+    try:
+        if pack_as_tar_gz:
+            tar_tuples = [(f["path"], f["bytes"]) for f in files_list]
+            archive_bytes = pack_files_as_tar_gz(tar_tuples)
+            upload_res = await upload_file_to_environment(
+                environment_id=clean_id,
+                target_path=parsed["target_path"],
+                file_bytes=archive_bytes,
+                mime_type="application/x-tar",
+                overwrite=parsed["overwrite"],
+                extract=True,
+                resumable=parsed["resumable"],
+                api_key=parsed["api_key"],
+            )
+        else:
+            single = files_list[0]
+            upload_res = await upload_file_to_environment(
+                environment_id=clean_id,
+                target_path=parsed["target_path"],
+                file_bytes=single["bytes"],
+                mime_type=single.get("mime_type"),
+                overwrite=parsed["overwrite"],
+                extract=parsed["extract"],
+                resumable=parsed["resumable"],
+                api_key=parsed["api_key"],
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {
+        "status": "uploaded",
+        "environment_id": clean_id,
+        "upload": upload_res,
+        "upload_result": upload_res,
+    }
+
+
+@app.get("/api/sessions/{session_id}/environment/files")
+async def api_list_session_environment_files(
+    session_id: str,
+    path: str = "workspace",
+    recursive: bool = True,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Lista os arquivos presentes no ambiente sandbox associado à sessão."""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada.")
+    env_id = clean_environment_id(session.get("environment_id") or "")
+    if not env_id or env_id == "remote":
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhum environment_id ativo nesta sessão ainda.",
+        )
+    try:
+        data = await list_environment_files(
+            environment_id=env_id,
+            path=path,
+            recursive=recursive,
+            api_key=api_key,
+        )
+        return {"environment_id": env_id, "data": data}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/environments/{environment_id}/files")
+async def api_list_environment_files_by_id(
+    environment_id: str,
+    path: str = "workspace",
+    recursive: bool = True,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Lista os arquivos presentes em um environment_id específico via Environments API."""
+    clean_id = clean_environment_id(environment_id)
+    try:
+        data = await list_environment_files(
+            environment_id=clean_id,
+            path=path,
+            recursive=recursive,
+            api_key=api_key,
+        )
+        return {"environment_id": clean_id, "data": data}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+

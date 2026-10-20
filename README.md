@@ -23,6 +23,11 @@ Interface visual inspirada no **Google AI Studio Playground**, projetada especif
 7. **Montagem de Fontes e Repositórios GitHub (`sources`):**
    - Assim como no **Google AI Studio Playground**, permite vincular fontes antes do primeiro turno através do botão **"＋ Adicionar Fonte"** no painel *Run Settings*.
    - Suporta clonagem de repositórios Git públicos (ex: GitHub), pastas do Google Cloud Storage (GCS) ou arquivos de texto direto (inline) montados no contêiner Linux (ex: `/workspace/meu-repo`). O backend estrutura automaticamente o parâmetro `environment: {"type": "remote", "sources": [...]}` na chamada inicial à Interactions API.
+8. **Upload Direto de Arquivos e Pastas Locais via API de Ambientes (`Environments Upload API`):**
+   - Permite enviar arquivos locais únicos, múltiplos arquivos, pastas inteiras do seu computador ou pacotes `.tar.gz`/`.tar` diretamente para um ambiente remoto usando a rota oficial `PUT /upload/v1beta/environments/{environment_id}/files/{path}` (equivalente a `client.environments.files.upload(...)` no SDK `google-genai`).
+   - **Empacotamento automático de pastas em `.tar.gz`:** Ao selecionar uma pasta local na interface, o backend gera o arquivo `.tar.gz` em memória e realiza o upload com `extract=true` e `overwrite=true`, extraindo toda a árvore de diretórios dentro do sandbox (ex: `/workspace/meu-projeto`).
+   - **Provisionamento automático (`POST /v1beta/environments`):** Se a sessão ainda estiver com `environment="remote"`, o sistema provisiona automaticamente o contêiner remoto antes de realizar o upload e vincula o `environment_id` retornado à sessão.
+   - **Suporte a Upload Retomável (`uploadType=resumable`):** Opção para envio em chunks (`Content-Range`) e protocolo resumable Scotty para arquivos grandes, além de explorador de arquivos do ambiente (`GET /v1beta/environments/{environment_id}/files/{path}`).
 
 ---
 
