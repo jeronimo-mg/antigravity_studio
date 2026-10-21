@@ -353,23 +353,33 @@
         <div class="space-y-1.5">
           <div class="flex items-center justify-between">
             <label class="text-blue-300 font-semibold">🔗 previous_interaction_id</label>
-            <button
-              onclick="clearPrevInteractionId()"
-              class="text-[11px] text-gray-400 hover:text-red-300"
-              title="Desvincular ID (iniciar nova cadeia no próximo turno)"
-            >
-              Limpar
-            </button>
+            <div class="flex items-center gap-2">
+              <button
+                onclick="loadChainFromPrevIdInput()"
+                id="loadPrevChainBtn"
+                class="text-[11px] text-blue-300 hover:text-blue-200 font-medium"
+                title="Buscar e carregar toda a conversa anterior na tela a partir deste previous_interaction_id"
+              >
+                🔄 Carregar na tela
+              </button>
+              <button
+                onclick="clearPrevInteractionId()"
+                class="text-[11px] text-gray-400 hover:text-red-300"
+                title="Desvincular ID (iniciar nova cadeia no próximo turno)"
+              >
+                Limpar
+              </button>
+            </div>
           </div>
           <input
             id="prevInteractionIdInput"
             type="text"
             placeholder="v1_ChdPU0F4... (vazio = 1º turno)"
-            onchange="saveSessionSettings()"
+            onchange="onPrevInteractionIdChanged()"
             class="w-full bg-studio-bg border border-blue-500/40 rounded-lg px-2.5 py-2 font-mono text-[11px] text-blue-200 placeholder-gray-600 focus:outline-none focus:border-blue-400"
           />
           <p class="text-[11px] text-gray-400 leading-relaxed">
-            Atualizado automaticamente a cada turno. Você também pode colar aqui o ID de qualquer interação anterior para continuar a conversa a partir dela.
+            Atualizado automaticamente a cada turno. Ao colar aqui um <code>previous_interaction_id</code>, toda a conversa anterior é carregada automaticamente na tela.
           </p>
         </div>
 
@@ -994,6 +1004,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=20261020_3"></script>
+  <script src="/app.js?v=20261020_4"></script>
 </body>
 </html>

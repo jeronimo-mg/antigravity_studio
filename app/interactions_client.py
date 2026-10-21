@@ -9,7 +9,7 @@ import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
-from .database import get_setting
+from .database import find_turn_by_interaction_id, get_setting
 
 # Evita falha do httpx quando o ambiente define [::1] em NO_PROXY
 for _proxy_var in ("NO_PROXY", "no_proxy"):
@@ -57,8 +57,14 @@ def extract_texts_from_interaction(
         user_texts.append(raw_input.strip())
     elif isinstance(raw_input, list):
         for item in raw_input:
-            if isinstance(item, dict) and item.get("type") == "text":
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
                 user_texts.append(item.get("text", ""))
+            elif item.get("type") == "user_input" or "content" in item:
+                for c in item.get("content", []) or []:
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        user_texts.append(c.get("text", ""))
 
     for step in data.get("steps", []) or []:
         if not isinstance(step, dict):
@@ -77,7 +83,17 @@ def extract_texts_from_interaction(
     if not output_texts and isinstance(data.get("output_text"), str):
         output_texts.append(data["output_text"])
 
-    user_input_str = "\n".join(t for t in user_texts if t).strip() or fallback_user_input
+    local_user = (data.get("_local_user_input_text") or "").strip()
+    if not local_user and data.get("id"):
+        known_turn = find_turn_by_interaction_id(str(data.get("id")))
+        if known_turn and known_turn.get("user_input_text"):
+            local_user = known_turn["user_input_text"].strip()
+
+    user_input_str = (
+        "\n".join(t for t in user_texts if t).strip()
+        or local_user
+        or fallback_user_input
+    )
     marker = "\n\n---\n[NOTA TÉCNICA DO AMBIENTE SANDBOX"
     if marker in user_input_str:
         user_input_str = user_input_str.split(marker, 1)[0].strip()
@@ -128,7 +144,8 @@ async def recover_conversation_chain(
 ) -> List[Dict[str, Any]]:
     """
     Percorre a cadeia de previous_interaction_id de trás para frente a partir de
-    qualquer interaction_id e devolve a lista completa de turnos em ordem cronológica.
+    qualquer interaction_id (combinando dados da Interactions API com o banco SQLite local)
+    e devolve a lista completa de turnos em ordem cronológica.
     """
     chain: List[Dict[str, Any]] = []
     seen_ids = set()
@@ -140,21 +157,46 @@ async def recover_conversation_chain(
                 break
             seen_ids.add(current_id)
 
-            resp = await client.get(
-                f"{INTERACTIONS_BASE_URL}/{current_id}",
-                params={"include_input": "true"},
-                headers=build_headers(api_key),
-            )
-            if resp.status_code >= 400:
+            local_turn = find_turn_by_interaction_id(current_id)
+            interaction_data: Optional[Dict[str, Any]] = None
+
+            try:
+                resp = await client.get(
+                    f"{INTERACTIONS_BASE_URL}/{current_id}",
+                    params={"include_input": "true"},
+                    headers=build_headers(api_key),
+                )
+                if resp.status_code < 400:
+                    interaction_data = resp.json()
+            except Exception:
+                interaction_data = None
+
+            if not interaction_data and local_turn:
+                raw_local = dict(local_turn.get("raw") or {})
+                raw_local.setdefault("id", current_id)
+                raw_local.setdefault("previous_interaction_id", local_turn.get("previous_interaction_id", ""))
+                raw_local.setdefault("environment_id", local_turn.get("environment_id", ""))
+                raw_local.setdefault("status", local_turn.get("status", "completed"))
+                raw_local.setdefault("steps", local_turn.get("steps", []))
+                raw_local.setdefault("usage", local_turn.get("usage", {}))
+                raw_local.setdefault("output_text", local_turn.get("output_text", ""))
+                raw_local["_local_user_input_text"] = local_turn.get("user_input_text", "")
+                interaction_data = raw_local
+
+            if not interaction_data:
                 if not chain:
                     raise ValueError(
-                        f"Não foi possível recuperar a interação '{current_id}' (HTTP {resp.status_code}): {resp.text}"
+                        f"Não foi possível recuperar a interação '{current_id}' na API nem no banco local."
                     )
                 break
 
-            interaction_data = resp.json()
+            if local_turn and local_turn.get("user_input_text"):
+                interaction_data["_local_user_input_text"] = local_turn["user_input_text"]
+
             chain.append(interaction_data)
-            prev_id = interaction_data.get("previous_interaction_id")
+            prev_id = interaction_data.get("previous_interaction_id") or (
+                local_turn.get("previous_interaction_id") if local_turn else None
+            )
             current_id = prev_id.strip() if isinstance(prev_id, str) and prev_id.strip() else None
 
     chain.reverse()
@@ -376,22 +418,83 @@ async def cancel_interaction(
     interaction_id: str,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Cancela uma interação em background na Interactions API:
+      POST /v1beta/interactions/{interaction_id}/cancel
+    Usa headers sem 'Content-Type: application/json' quando o body é vazio (igual ao SDK oficial google-genai)
+    e tenta fallback com body '{}' ou ':cancel', além de tratar graciosamente interações que já terminaram.
+    """
+    clean_id = (interaction_id or "").strip()
+    if not clean_id:
+        raise ValueError("O interaction_id é obrigatório para cancelar a interação.")
+
+    # Headers sem Content-Type: application/json para POST com body vazio (evita HTTP 400 Invalid JSON payload no GFE)
+    empty_body_headers = build_headers(api_key)
+    empty_body_headers.pop("Content-Type", None)
+    empty_body_headers["Accept"] = "application/json"
+
+    json_headers = build_headers(api_key)
+    json_headers["Accept"] = "application/json"
+
+    attempts = [
+        (f"{INTERACTIONS_BASE_URL}/{clean_id}/cancel", empty_body_headers, b""),
+        (f"{INTERACTIONS_BASE_URL}/{clean_id}/cancel", json_headers, b"{}"),
+        (f"{INTERACTIONS_BASE_URL}/{clean_id}:cancel", empty_body_headers, b""),
+        (f"{INTERACTIONS_BASE_URL}/{clean_id}:cancel", json_headers, b"{}"),
+        (f"https://generativelanguage.googleapis.com/v1alpha/interactions/{clean_id}/cancel", empty_body_headers, b""),
+    ]
+
+    last_status = 0
+    last_text = ""
+
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            f"{INTERACTIONS_BASE_URL}/{interaction_id}/cancel",
-            headers=build_headers(api_key),
+        for url, hdrs, body_bytes in attempts:
+            try:
+                resp = await client.post(url, headers=hdrs, content=body_bytes)
+            except Exception as exc:
+                last_text = str(exc)
+                continue
+
+            if resp.status_code < 400:
+                if not resp.content:
+                    return {"id": clean_id, "status": "cancelled"}
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        if not data.get("status"):
+                            data["status"] = "cancelled"
+                        return data
+                except Exception:
+                    pass
+                return {"id": clean_id, "status": "cancelled"}
+
+            last_status = resp.status_code
+            last_text = resp.text
+
+            # Se retornou 400/409 porque a interação já não está mais in_progress (ex: acabou de concluir ou já foi cancelada),
+            # consulta o estado atual via GET e retorna sem estourar erro
+            if resp.status_code in (400, 409, 412):
+                try:
+                    current_state = await get_interaction(clean_id, include_input=True, api_key=api_key)
+                    cur_status = current_state.get("status", "")
+                    if cur_status and cur_status != "in_progress":
+                        return current_state
+                except Exception:
+                    pass
+
+        # Fallback final: se o endpoint de cancelamento do agente não suportar cancelamento remoto síncrono,
+        # verifica se conseguimos ler a interação e marca como cancelled localmente para destravar a UI do usuário
+        try:
+            current_state = await get_interaction(clean_id, include_input=True, api_key=api_key)
+            current_state["status"] = "cancelled"
+            current_state["_locally_cancelled"] = True
+            return current_state
+        except Exception:
+            pass
+
+        raise ValueError(
+            f"Erro ao cancelar interação '{clean_id}' (HTTP {last_status}): {last_text}"
         )
-        if resp.status_code >= 400:
-            # Fallback para sintaxe :cancel caso necessário
-            resp = await client.post(
-                f"{INTERACTIONS_BASE_URL}/{interaction_id}:cancel",
-                headers=build_headers(api_key),
-            )
-        if resp.status_code >= 400:
-            raise ValueError(
-                f"Erro ao cancelar interação '{interaction_id}' (HTTP {resp.status_code}): {resp.text}"
-            )
-        return resp.json()
 
 
 def format_session_as_markdown(session: Dict[str, Any]) -> str:
@@ -974,41 +1077,123 @@ async def upload_file_to_environment(
         )
 
 
+def _extract_files_list_from_response(raw_data: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_data, dict):
+        return []
+    raw_list = (
+        raw_data.get("files")
+        if isinstance(raw_data.get("files"), list)
+        else (raw_data.get("entries") if isinstance(raw_data.get("entries"), list) else [])
+    )
+    normalized: List[Dict[str, Any]] = []
+    for item in raw_list:
+        if isinstance(item, str):
+            clean_p = item.lstrip("/")
+            normalized.append({
+                "name": os.path.basename(clean_p) or clean_p,
+                "path": clean_p,
+                "size_bytes": 0,
+                "mime_type": "",
+                "type": "file",
+            })
+        elif isinstance(item, dict):
+            raw_p = str(item.get("path") or item.get("name") or "").lstrip("/")
+            raw_type = str(item.get("type") or "").lower()
+            is_dir = (
+                raw_type in ("directory", "dir", "folder")
+                or bool(item.get("is_dir"))
+                or item.get("mime_type") == "inode/directory"
+                or item.get("mimeType") == "inode/directory"
+            )
+            size_val = item.get("size_bytes")
+            if size_val is None:
+                size_val = item.get("sizeBytes", item.get("size", 0))
+            try:
+                size_int = int(size_val or 0)
+            except (ValueError, TypeError):
+                size_int = 0
+            normalized.append({
+                "name": item.get("name") or os.path.basename(raw_p.rstrip("/")) or raw_p,
+                "path": raw_p,
+                "size_bytes": size_int,
+                "mime_type": item.get("mime_type") or item.get("mimeType") or "",
+                "type": "directory" if is_dir else "file",
+                "modified": item.get("modified") or item.get("updated") or "",
+                "created": item.get("created") or "",
+            })
+    return normalized
+
+
 async def list_environment_files(
     environment_id: str,
     path: str = "workspace",
     recursive: bool = True,
+    known_paths: Optional[List[str]] = None,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Lista os arquivos e diretórios presentes dentro do ambiente sandbox via Environments API:
       GET https://generativelanguage.googleapis.com/v1beta/environments/{environment_id}/files/{path}
+    Se o diretório solicitado (ex: 'workspace') retornar 404 ou estiver vazio, tenta automaticamente
+    caminhos alternativos conhecidos (como os diretórios de upload registrados na sessão ou a raiz).
     """
+    import urllib.parse
+
     clean_id = clean_environment_id(environment_id)
     if not clean_id or clean_id == "remote":
         raise ValueError("Informe um environment_id válido (ex: env_...).")
 
     clean_path = (path or "").strip().lstrip("/")
-    url = (
-        f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{clean_path}"
-        if clean_path
-        else f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files"
-    )
+    candidates: List[str] = [clean_path]
+    if known_paths:
+        for kp in known_paths:
+            ckp = (kp or "").strip().lstrip("/")
+            if ckp and ckp not in candidates:
+                candidates.append(ckp)
+            top_seg = ckp.split("/")[0] if ckp else ""
+            if top_seg and top_seg not in candidates:
+                candidates.append(top_seg)
+    for fallback_p in ("workspace", "", "."):
+        if fallback_p not in candidates:
+            candidates.append(fallback_p)
+
     params: Dict[str, str] = {}
     if recursive:
         params["recursive"] = "true"
 
+    last_status = 404
+    last_text = ""
+
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.get(
-            url,
-            params=params,
-            headers=build_headers(api_key),
-        )
-        if resp.status_code >= 400:
-            raise ValueError(
-                f"Erro ao listar arquivos do ambiente '{clean_id}' (HTTP {resp.status_code}): {resp.text}"
+        for idx, cand in enumerate(candidates):
+            enc_cand = urllib.parse.quote(cand, safe="/") if cand else ""
+            url = (
+                f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{enc_cand}"
+                if enc_cand
+                else f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files"
             )
-        return resp.json()
+            resp = await client.get(
+                url,
+                params=params,
+                headers=build_headers(api_key),
+            )
+            if resp.status_code < 400:
+                data = resp.json() if resp.content else {}
+                files_norm = _extract_files_list_from_response(data)
+                if files_norm or idx == 0:
+                    if isinstance(data, dict):
+                        data["files"] = files_norm
+                        data["resolved_path"] = cand or "/"
+                    return data
+            else:
+                last_status = resp.status_code
+                last_text = resp.text
+                if idx == 0 and clean_path not in ("workspace", "", "/"):
+                    break
+
+    raise ValueError(
+        f"Erro ao listar arquivos do ambiente '{clean_id}' (HTTP {last_status}): {last_text}"
+    )
 
 
 def _normalize_env_target_path(raw_path: Optional[str], clean_id: str) -> str:
@@ -1094,44 +1279,180 @@ def _extract_target_from_tar_bytes(
     return None
 
 
+async def _build_tar_gz_from_environment_listing(
+    client: httpx.AsyncClient,
+    clean_id: str,
+    base_path: str,
+    listing_data: Dict[str, Any],
+    headers: Dict[str, str],
+) -> Tuple[bytes, str, str]:
+    """
+    Constrói um pacote `.tar.gz` em memória baixando todos os arquivos listados pela Environments API:
+      1. Lista todos os arquivos recursivamente via `GET /v1beta/environments/{id}/files/{dir}?recursive=true`
+      2. Baixa cada arquivo via `GET /v1beta/environments/{id}/files/{file_path}?alt=media`
+      3. Compacta tudo em um arquivo `.tar.gz` mantendo a estrutura de diretórios original.
+    Isso resolve definitivamente o erro HTTP 404 ('Directory not found or is empty') ao clicar em
+    'Download Snapshot' ou ao baixar uma pasta da lista de arquivos!
+    """
+    import urllib.parse
+
+    entries = _extract_files_list_from_response(listing_data)
+    file_entries = [e for e in entries if e.get("type") != "directory" and e.get("path")]
+    if not file_entries:
+        raise ValueError(f"Nenhum arquivo encontrado em '{base_path or 'workspace'}' para compactar no snapshot.")
+
+    sem = asyncio.Semaphore(6)
+
+    async def _fetch_one(entry: Dict[str, Any]) -> Optional[Tuple[str, bytes]]:
+        f_path = _normalize_env_target_path(str(entry.get("path") or ""), clean_id)
+        if not f_path and base_path:
+            f_path = f"{base_path.lstrip('/')}/{entry.get('name', '')}".lstrip("/")
+        if not f_path:
+            return None
+        enc_f_path = urllib.parse.quote(f_path, safe="/")
+        file_url = f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{enc_f_path}?alt=media"
+        async with sem:
+            try:
+                r = await client.get(file_url, headers=headers)
+                if r.status_code == 200 and r.content:
+                    extracted = _extract_target_from_tar_bytes(r.content, f_path)
+                    if extracted is not None:
+                        return (f_path, extracted[0])
+                    return (f_path, r.content)
+            except Exception:
+                pass
+        return None
+
+    results = await asyncio.gather(*[_fetch_one(e) for e in file_entries])
+    downloaded = [item for item in results if item is not None]
+    if not downloaded:
+        raise ValueError(
+            f"Não foi possível baixar o conteúdo dos arquivos listados em '{base_path or 'workspace'}' no ambiente '{clean_id}'."
+        )
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for rel_p, data_bytes in downloaded:
+            clean_rel = rel_p.lstrip("/")
+            info = tarfile.TarInfo(name=clean_rel)
+            info.size = len(data_bytes)
+            info.mode = 0o644
+            tar.addfile(info, io.BytesIO(data_bytes))
+    buf.seek(0)
+    slug = (base_path or "workspace").strip("/").replace("/", "_") or "snapshot"
+    return buf.read(), f"environment_snapshot_{clean_id}_{slug}.tar.gz", "application/gzip"
+
+
 async def download_environment_snapshot(
     environment_id: str,
     path: Optional[str] = None,
+    known_paths: Optional[List[str]] = None,
     api_key: Optional[str] = None,
 ) -> Tuple[bytes, str, str]:
     """
     Baixa o snapshot completo do ambiente remoto sandbox (.tar.gz) OU um arquivo/diretório específico
     selecionado na lista de arquivos do ambiente.
-    - Quando `path` aponta para um arquivo individual (ex: `/workspace/ID/relatorio.pdf`), baixa os bytes
-      do arquivo e entrega com seu nome original (`relatorio.pdf`) e MIME type correspondente.
+    - Quando `path` aponta para um arquivo individual (ex: `workspace/ID/relatorio.pdf`), baixa os bytes
+      do arquivo via `GET /v1beta/environments/{id}/files/{path}?alt=media` e entrega com seu nome original.
+    - Quando `path` é vazio (Download Snapshot) ou aponta para um diretório, tenta os endpoints de snapshot
+      e, caso a API retorne HTTP 404 ('Directory not found or is empty') porque `?alt=media` na Environments API
+      não suporta diretórios raiz diretamente, lista todos os arquivos recursivamente (`workspace`, pastas de
+      upload da sessão, etc.) e monta o `.tar.gz` completo automaticamente!
     """
+    import base64
     import urllib.parse
 
     clean_id = clean_environment_id(environment_id)
+    if not clean_id or clean_id == "remote":
+        raise ValueError("Informe um environment_id válido.")
+
     headers = build_headers(api_key)
     headers.pop("Content-Type", None)
+    json_headers = build_headers(api_key)
 
     target_path = _normalize_env_target_path(path, clean_id)
 
     # Caso 1: Download do Snapshot Completo (sem path específico)
     if not target_path:
-        snapshot_url = f"{FILES_BASE_URL}/environment-{clean_id}:download?alt=media"
         async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as client:
+            # 1a. Tenta endpoint de snapshot na Files API
+            snapshot_url = f"{FILES_BASE_URL}/environment-{clean_id}:download?alt=media"
             try:
                 resp = await client.get(snapshot_url, headers=headers)
                 if resp.status_code == 200 and resp.content:
                     ctype = resp.headers.get("content-type", "application/x-tar")
-                    return resp.content, f"environment_snapshot_{clean_id}.tar.gz", ctype
+                    if "application/json" not in ctype.lower():
+                        return resp.content, f"environment_snapshot_{clean_id}.tar.gz", ctype
             except Exception:
                 pass
 
-            root_url = f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files?alt=media"
-            resp = await client.get(root_url, headers=headers)
-            if resp.status_code == 200 and resp.content:
-                ctype = resp.headers.get("content-type", "application/x-tar")
-                return resp.content, f"environment_snapshot_{clean_id}.tar.gz", ctype
+            # 1b. Tenta listar recursivamente os diretórios do ambiente (workspace + pastas de upload conhecidas)
+            # e empacotar todos os arquivos do ambiente em um .tar.gz!
+            candidate_dirs: List[str] = ["workspace"]
+            if known_paths:
+                for kp in known_paths:
+                    ckp = _normalize_env_target_path(kp, clean_id)
+                    if ckp and ckp not in candidate_dirs:
+                        candidate_dirs.append(ckp)
+                    top_seg = ckp.split("/")[0] if ckp else ""
+                    if top_seg and top_seg not in candidate_dirs:
+                        candidate_dirs.append(top_seg)
+            for extra in ("", "."):
+                if extra not in candidate_dirs:
+                    candidate_dirs.append(extra)
+
+            merged_entries_map: Dict[str, Dict[str, Any]] = {}
+            last_err_detail = ""
+
+            for cand_dir in candidate_dirs:
+                enc_dir = urllib.parse.quote(cand_dir, safe="/") if cand_dir else ""
+                list_url = (
+                    f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{enc_dir}"
+                    if enc_dir
+                    else f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files"
+                )
+                try:
+                    l_resp = await client.get(
+                        list_url,
+                        params={"recursive": "true"},
+                        headers=json_headers,
+                    )
+                    if l_resp.status_code == 200 and l_resp.content:
+                        jdata = l_resp.json()
+                        for entry in _extract_files_list_from_response(jdata):
+                            epath = entry.get("path") or ""
+                            if epath and epath not in merged_entries_map:
+                                merged_entries_map[epath] = entry
+                        # Se já encontrou arquivos em "workspace" e não há outros known_paths fora de workspace, podemos parar
+                        if merged_entries_map and cand_dir == "workspace" and not known_paths:
+                            break
+                    else:
+                        last_err_detail = f"(HTTP {l_resp.status_code}): {l_resp.text}"
+                except Exception as exc:
+                    last_err_detail = str(exc)
+
+            if merged_entries_map:
+                return await _build_tar_gz_from_environment_listing(
+                    client=client,
+                    clean_id=clean_id,
+                    base_path="workspace",
+                    listing_data={"files": list(merged_entries_map.values())},
+                    headers=headers,
+                )
+
+            # 1c. Último fallback: tenta GET /environments/{id}/files/workspace?alt=media ou raiz
+            for fallback_url in (
+                f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/workspace?alt=media",
+                f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files?alt=media",
+            ):
+                resp = await client.get(fallback_url, headers=headers)
+                if resp.status_code == 200 and resp.content:
+                    ctype = resp.headers.get("content-type", "application/x-tar")
+                    return resp.content, f"environment_snapshot_{clean_id}.tar.gz", ctype
+                last_err_detail = f"(HTTP {resp.status_code}): {resp.text}"
+
             raise ValueError(
-                f"Erro ao baixar snapshot do ambiente '{clean_id}' (HTTP {resp.status_code}): {resp.text}"
+                f"Erro ao baixar snapshot do ambiente '{clean_id}' {last_err_detail}"
             )
 
     # Caso 2: Download de um Arquivo ou Diretório específico (target_path informado)
@@ -1174,9 +1495,14 @@ async def download_environment_snapshot(
                                     return decoded, base_name, guessed_mime
                                 except Exception:
                                     return str(raw_val).encode("utf-8"), base_name, guessed_mime
-                            # Se retornou listagem de arquivos (é um diretório), tenta o próximo método/snapshot
                             if "files" in jdata or "entries" in jdata:
-                                continue
+                                return await _build_tar_gz_from_environment_listing(
+                                    client=client,
+                                    clean_id=clean_id,
+                                    base_path=target_path,
+                                    listing_data=jdata,
+                                    headers=headers,
+                                )
                     except Exception:
                         pass
 
@@ -1185,28 +1511,56 @@ async def download_environment_snapshot(
                 if extracted is not None:
                     return extracted
 
-                # Se o content-type for tar/gzip mas não extraímos um único arquivo (ex: era diretório)
                 if ("tar" in resp_ctype or "gzip" in resp_ctype) and not base_name.lower().endswith((".tar", ".tar.gz", ".tgz")):
                     return resp.content, f"{base_name}.tar.gz", resp_ctype
 
                 final_mime = guessed_mime if guessed_mime != "application/octet-stream" else (resp_ctype or "application/octet-stream")
                 return resp.content, base_name, final_mime
 
-        # Fallback automático: baixa o snapshot do ambiente e extrai o arquivo solicitado em memória
-        for snap_url in (
-            f"{FILES_BASE_URL}/environment-{clean_id}:download?alt=media",
-            f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files?alt=media",
-        ):
-            try:
-                snap_resp = await client.get(snap_url, headers=headers)
-                if snap_resp.status_code == 200 and snap_resp.content:
-                    extracted = _extract_target_from_tar_bytes(snap_resp.content, target_path)
-                    if extracted is not None:
-                        return extracted
-            except Exception:
-                pass
+        # Se ?alt=media retornou 400/404 porque `target_path` é uma pasta (ex: "workspace/ID"),
+        # consulta a listagem recursiva desse diretório e gera um .tar.gz com todos os seus arquivos!
+        try:
+            dir_list_resp = await client.get(
+                f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{encoded_path}",
+                params={"recursive": "true"},
+                headers=json_headers,
+            )
+            if dir_list_resp.status_code == 200 and dir_list_resp.content:
+                jdata = dir_list_resp.json()
+                entries = _extract_files_list_from_response(jdata)
+                if entries:
+                    return await _build_tar_gz_from_environment_listing(
+                        client=client,
+                        clean_id=clean_id,
+                        base_path=target_path,
+                        listing_data=jdata,
+                        headers=headers,
+                    )
+        except Exception:
+            pass
+
+        # Fallback: tenta sem o prefixo "workspace/" ou adicionando "workspace/" caso o caminho relativo varie
+        alt_target = (
+            target_path.removeprefix("workspace/")
+            if target_path.startswith("workspace/")
+            else f"workspace/{target_path}"
+        )
+        enc_alt = urllib.parse.quote(alt_target, safe="/")
+        try:
+            alt_resp = await client.get(
+                f"{ENVIRONMENTS_BASE_URL}/{clean_id}/files/{enc_alt}?alt=media",
+                headers=headers,
+            )
+            if alt_resp.status_code == 200 and alt_resp.content:
+                extracted = _extract_target_from_tar_bytes(alt_resp.content, alt_target)
+                if extracted is not None:
+                    return extracted
+                return alt_resp.content, base_name, guessed_mime
+        except Exception:
+            pass
 
     raise ValueError(
         f"Erro ao baixar '{target_path}' do ambiente '{clean_id}' (HTTP {last_status}): {last_text}"
     )
+
 

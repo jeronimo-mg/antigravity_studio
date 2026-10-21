@@ -208,8 +208,96 @@ def api_list_sessions() -> Dict[str, Any]:
     return {"sessions": list_sessions()}
 
 
+class LoadChainRequest(BaseModel):
+    interaction_id: Optional[str] = None
+    api_key: Optional[str] = None
+
+
+async def _load_chain_into_session(
+    session_id: str,
+    target_id: str,
+    api_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    clean_target = (target_id or "").strip()
+    if not clean_target:
+        return get_session(session_id)
+
+    existing = get_session(session_id)
+    if not existing:
+        return None
+
+    chain = await recover_conversation_chain(clean_target, api_key=api_key)
+    if not chain:
+        return existing
+
+    last_item = chain[-1]
+    detected_agent = last_item.get("agent") or existing.get("agent_name") or "antigravity-preview-09-2026"
+    detected_model = (
+        last_item.get("model")
+        or (last_item.get("agent_config") or {}).get("model")
+        or existing.get("model_name")
+        or "gemini-3.8-flash"
+    )
+    detected_mode = "agent" if last_item.get("agent") else (existing.get("mode") or "model")
+    detected_env = clean_environment_id(
+        last_item.get("environment_id")
+        or (last_item.get("environment") if isinstance(last_item.get("environment"), str) else "")
+        or existing.get("environment_id")
+        or ""
+    )
+
+    first_user_text, _ = extract_texts_from_interaction(chain[0], "")
+    current_title = (existing.get("title") or "").strip()
+    if not current_title or current_title in ("Nova Conversa Antigravity", "Nova Conversa", "Conversa Antigravity"):
+        auto_title = (
+            first_user_text[:48] + "..."
+            if len(first_user_text) > 48
+            else (first_user_text or f"Conversa ({clean_target[:12]}...)")
+        )
+    else:
+        auto_title = current_title
+
+    for idx, item in enumerate(chain, start=1):
+        u_text, out_text = extract_texts_from_interaction(item)
+        item_env = clean_environment_id(
+            item.get("environment_id")
+            or (item.get("environment") if isinstance(item.get("environment"), str) else "")
+            or detected_env
+        )
+        upsert_turn(
+            session_id=session_id,
+            interaction_id=item.get("id", f"turn_{idx}"),
+            turn_index=idx,
+            previous_interaction_id=item.get("previous_interaction_id", ""),
+            environment_id=item_env,
+            user_input_text=u_text,
+            output_text=out_text,
+            status=item.get("status", "completed"),
+            steps=item.get("steps", []) or [],
+            usage=item.get("usage", {}) or {},
+            raw=item,
+            created_at=item.get("created"),
+        )
+
+    update_kwargs: Dict[str, Any] = {
+        "title": auto_title,
+        "mode": detected_mode,
+        "agent_name": detected_agent,
+        "model_name": detected_model,
+        "last_interaction_id": last_item.get("id", clean_target),
+    }
+    if detected_env:
+        update_kwargs["environment_id"] = detected_env
+        if not existing.get("uploaded_files"):
+            inherited = _find_uploaded_files_for_environment(detected_env)
+            if inherited:
+                update_kwargs["uploaded_files"] = inherited
+
+    return update_session(session_id, **update_kwargs)
+
+
 @app.post("/api/sessions")
-def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
+async def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
     inherited_uploads = body.uploaded_files
     if not inherited_uploads and body.environment_id:
         inherited_uploads = _find_uploaded_files_for_environment(body.environment_id)
@@ -225,6 +313,13 @@ def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
         sources=body.sources or [],
         uploaded_files=inherited_uploads or [],
     )
+    if body.last_interaction_id and body.last_interaction_id.strip():
+        try:
+            loaded = await _load_chain_into_session(session["id"], body.last_interaction_id.strip())
+            if loaded:
+                return loaded
+        except Exception:
+            pass
     return session
 
 
@@ -237,7 +332,7 @@ def api_get_session(session_id: str) -> Dict[str, Any]:
 
 
 @app.patch("/api/sessions/{session_id}")
-def api_update_session(session_id: str, body: SessionUpdateRequest) -> Dict[str, Any]:
+async def api_update_session(session_id: str, body: SessionUpdateRequest) -> Dict[str, Any]:
     existing = get_session(session_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
@@ -248,13 +343,66 @@ def api_update_session(session_id: str, body: SessionUpdateRequest) -> Dict[str,
         if inherited:
             patch_data["uploaded_files"] = inherited
     updated = update_session(session_id, **patch_data)
+
+    new_last_id = (patch_data.get("last_interaction_id") or "").strip()
+    if new_last_id:
+        existing_turn_ids = {t.get("interaction_id") for t in (existing.get("turns") or [])}
+        if new_last_id not in existing_turn_ids:
+            try:
+                loaded = await _load_chain_into_session(session_id, new_last_id)
+                if loaded:
+                    updated = loaded
+            except Exception:
+                pass
     return updated  # type: ignore
+
+
+@app.post("/api/sessions/{session_id}/load-chain")
+async def api_load_chain_into_existing_session(
+    session_id: str,
+    body: Optional[LoadChainRequest] = None,
+) -> Dict[str, Any]:
+    """
+    Carrega na sessão atual toda a cadeia de turnos anteriores a partir do
+    previous_interaction_id (informado no body ou salvo em session.last_interaction_id).
+    """
+    existing = get_session(session_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada.")
+
+    target_id = (
+        (body.interaction_id if body and body.interaction_id else None)
+        or existing.get("last_interaction_id")
+        or ""
+    ).strip()
+    if not target_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe um previous_interaction_id válido (ex: v1_...) para carregar a conversa anterior.",
+        )
+
+    try:
+        updated = await _load_chain_into_session(
+            session_id=session_id,
+            target_id=target_id,
+            api_key=body.api_key if body else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    turns = (updated or {}).get("turns", [])
+    return {
+        "session": updated,
+        "imported_turns": len(turns),
+        "mode": "full_chain_recovered",
+    }
 
 
 @app.delete("/api/sessions/{session_id}")
 def api_delete_session(session_id: str) -> Dict[str, Any]:
     delete_session(session_id)
     return {"status": "deleted", "id": session_id}
+
 
 
 @app.post("/api/sessions/import")
@@ -455,6 +603,19 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
     uploaded_files = session.get("uploaded_files", []) or _find_uploaded_files_for_environment(env_id)
     turns = session.get("turns", [])
 
+    if prev_id and prev_id.strip() and not turns:
+        try:
+            loaded_session = await _load_chain_into_session(session_id, prev_id.strip(), api_key=body.api_key)
+            if loaded_session:
+                session = loaded_session
+                turns = session.get("turns", [])
+                if not env_id and session.get("environment_id"):
+                    env_id = session["environment_id"]
+                if not uploaded_files and session.get("uploaded_files"):
+                    uploaded_files = session["uploaded_files"]
+        except Exception:
+            pass
+
     # Monta resumo de histórico para fallback caso previous_interaction_id falhe com HTTP 500
     history_lines: List[str] = []
     for t in turns[-6:]:
@@ -464,6 +625,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
             if ut or ot:
                 history_lines.append(f"Usuário: {ut[:600]}\nAgente: {ot[:1200]}")
     fallback_history_text = "\n---\n".join(history_lines) if history_lines else None
+
 
     payload = build_create_payload(
         prompt=prompt,
@@ -603,13 +765,81 @@ async def api_cancel_turn(
     interaction_id: str,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Sessão não encontrada.")
+
     try:
         resp = await cancel_interaction(interaction_id, api_key=api_key)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        resp = {"id": interaction_id, "status": "cancelled", "_cancel_warning": str(exc)}
 
-    await api_poll_turn(session_id, interaction_id, api_key=api_key)
-    return {"status": "cancelled", "interaction": resp, "session": get_session(session_id)}
+    # Tenta buscar os steps/textos parciais mais recentes da API
+    latest_data = resp
+    try:
+        polled = await get_interaction(interaction_id, include_input=True, api_key=api_key)
+        if isinstance(polled, dict):
+            latest_data = polled
+    except Exception:
+        pass
+
+    existing_turn = next(
+        (t for t in session.get("turns", []) if t.get("interaction_id") == interaction_id),
+        None,
+    )
+    turn_index = existing_turn["turn_index"] if existing_turn else len(session.get("turns", [])) + 1
+    fallback_input = existing_turn.get("user_input_text", "") if existing_turn else ""
+
+    u_text, out_text = extract_texts_from_interaction(latest_data, fallback_user_input=fallback_input)
+    if not out_text and existing_turn and existing_turn.get("output_text"):
+        out_text = existing_turn["output_text"]
+
+    returned_env_id = clean_environment_id(
+        latest_data.get("environment_id")
+        or (existing_turn.get("environment_id", "") if existing_turn else "")
+        or session.get("environment_id", "")
+    )
+
+    api_status = latest_data.get("status", "cancelled")
+    final_status = "cancelled" if api_status in ("in_progress", "cancelled", "") else api_status
+
+    upsert_turn(
+        session_id=session_id,
+        interaction_id=interaction_id,
+        turn_index=turn_index,
+        previous_interaction_id=latest_data.get("previous_interaction_id")
+        or (existing_turn.get("previous_interaction_id", "") if existing_turn else ""),
+        environment_id=returned_env_id,
+        user_input_text=u_text,
+        output_text=out_text or "(Execução cancelada pelo usuário)",
+        status=final_status,
+        steps=latest_data.get("steps") or (existing_turn.get("steps", []) if existing_turn else []),
+        usage=latest_data.get("usage") or (existing_turn.get("usage", {}) if existing_turn else {}),
+        raw=latest_data,
+        created_at=latest_data.get("created") or (existing_turn.get("created_at") if existing_turn else None),
+    )
+
+    # Restaura o último interaction_id válido da sessão para que o próximo turno não aponte para o turno cancelado
+    valid_prev = ""
+    if final_status == "completed":
+        valid_prev = interaction_id
+    else:
+        for t in reversed(session.get("turns", [])):
+            if t.get("interaction_id") != interaction_id and t.get("status") in ("completed", "incomplete"):
+                valid_prev = t.get("interaction_id", "")
+                break
+
+    update_session(
+        session_id,
+        environment_id=returned_env_id or session.get("environment_id", ""),
+        last_interaction_id=valid_prev,
+    )
+
+    return {
+        "status": final_status,
+        "interaction": latest_data,
+        "session": get_session(session_id),
+    }
 
 
 @app.get("/api/sessions/{session_id}/export/markdown", response_class=PlainTextResponse)
@@ -642,6 +872,26 @@ def _build_content_disposition(filename: str) -> str:
     return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8''{utf8_quoted}'
 
 
+def _extract_known_paths_for_env(environment_id: str, session: Optional[Dict[str, Any]] = None) -> List[str]:
+    paths: List[str] = []
+    uploads = []
+    if session and session.get("uploaded_files"):
+        uploads.extend(session.get("uploaded_files") or [])
+    uploads.extend(_find_uploaded_files_for_environment(environment_id))
+    for uf in uploads:
+        if isinstance(uf, dict):
+            tp = (uf.get("target_path") or "").strip().lstrip("/")
+            if tp and tp not in paths:
+                paths.append(tp)
+    if session and session.get("sources"):
+        for s in session.get("sources") or []:
+            if isinstance(s, dict):
+                st = (s.get("target") or "").strip().lstrip("/")
+                if st and st not in paths:
+                    paths.append(st)
+    return paths
+
+
 @app.get("/api/sessions/{session_id}/environment/download")
 async def api_download_session_environment(
     session_id: str,
@@ -658,10 +908,12 @@ async def api_download_session_environment(
             status_code=400,
             detail="Nenhum ambiente remoto ativo nesta sessão. Envie uma mensagem primeiro para provisionar um environment_id.",
         )
+    known_paths = _extract_known_paths_for_env(env_id, session=session)
     try:
         content, filename, content_type = await download_environment_snapshot(
             environment_id=env_id,
             path=path,
+            known_paths=known_paths,
             api_key=api_key,
         )
     except Exception as exc:
@@ -689,10 +941,12 @@ async def api_download_environment_by_id(
             status_code=400,
             detail="Informe um environment_id válido (ex: env_... ou UUID).",
         )
+    known_paths = _extract_known_paths_for_env(clean_id)
     try:
         content, filename, content_type = await download_environment_snapshot(
             environment_id=clean_id,
             path=path,
+            known_paths=known_paths,
             api_key=api_key,
         )
     except Exception as exc:
@@ -1065,11 +1319,13 @@ async def api_list_session_environment_files(
             status_code=400,
             detail="Nenhum environment_id ativo nesta sessão ainda.",
         )
+    known_paths = _extract_known_paths_for_env(env_id, session=session)
     try:
         data = await list_environment_files(
             environment_id=env_id,
             path=path,
             recursive=recursive,
+            known_paths=known_paths,
             api_key=api_key,
         )
         return {"environment_id": env_id, "data": data}
@@ -1086,11 +1342,13 @@ async def api_list_environment_files_by_id(
 ) -> Dict[str, Any]:
     """Lista os arquivos presentes em um environment_id específico via Environments API."""
     clean_id = clean_environment_id(environment_id)
+    known_paths = _extract_known_paths_for_env(clean_id)
     try:
         data = await list_environment_files(
             environment_id=clean_id,
             path=path,
             recursive=recursive,
+            known_paths=known_paths,
             api_key=api_key,
         )
         return {"environment_id": clean_id, "data": data}

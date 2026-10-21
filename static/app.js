@@ -288,11 +288,85 @@ async function saveSessionSettings(overrideMode = null) {
     });
     if (res.ok) {
       currentSession = await res.json();
+      syncInputsFromSession();
       updateHeaderAndComposerBadges();
+      renderChatTurns();
       await loadSessionsList();
     }
   } catch (err) {
     console.error("Erro ao salvar configurações da sessão:", err);
+  }
+}
+
+async function onPrevInteractionIdChanged() {
+  const prevId = document.getElementById("prevInteractionIdInput").value.trim();
+  if (!prevId) {
+    await saveSessionSettings();
+    return;
+  }
+  const existingIds = new Set(((currentSession && currentSession.turns) || []).map((t) => t.interaction_id));
+  if (existingIds.has(prevId)) {
+    await saveSessionSettings();
+    return;
+  }
+  await loadChainFromPrevIdInput();
+}
+
+async function loadChainFromPrevIdInput() {
+  if (!currentSession) return;
+  const prevId = document.getElementById("prevInteractionIdInput").value.trim();
+  if (!prevId) {
+    alert("Informe um previous_interaction_id (ex: v1_...) no campo para carregar a conversa anterior.");
+    focusPrevIdInput();
+    return;
+  }
+
+  const loadBtn = document.getElementById("loadPrevChainBtn");
+  const oldBtnText = loadBtn ? loadBtn.textContent : "";
+  if (loadBtn) {
+    loadBtn.disabled = true;
+    loadBtn.textContent = "⏳ Carregando...";
+  }
+
+  const container = document.getElementById("chatContainer");
+  if (container && (!currentSession.turns || currentSession.turns.length === 0)) {
+    container.innerHTML = `
+      <div class="max-w-3xl mx-auto my-8 bg-studio-panel border border-blue-500/40 rounded-2xl p-6 text-xs text-blue-200 flex items-center gap-3">
+        <span class="animate-spin text-base">🔄</span>
+        <div>
+          <div class="font-semibold text-white">Carregando conversa anterior na tela...</div>
+          <div class="text-gray-400">Percorrendo a cadeia de <code>previous_interaction_id</code> a partir de <code class="text-blue-300">${escapeHtml(prevId)}</code></div>
+        </div>
+      </div>
+    `;
+  }
+
+  try {
+    const res = await fetch(`/api/sessions/${currentSession.id}/load-chain`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ interaction_id: prevId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      await saveSessionSettings();
+      throw new Error(data.detail || "Não foi possível recuperar os turnos anteriores na API.");
+    }
+    if (data.session) {
+      currentSession = data.session;
+      syncInputsFromSession();
+      updateHeaderAndComposerBadges();
+      renderChatTurns();
+      await loadSessionsList();
+    }
+  } catch (err) {
+    renderChatTurns();
+    alert("Aviso ao carregar histórico do previous_interaction_id:\n\n" + err.message);
+  } finally {
+    if (loadBtn) {
+      loadBtn.disabled = false;
+      loadBtn.textContent = oldBtnText || "🔄 Carregar na tela";
+    }
   }
 }
 
@@ -341,10 +415,18 @@ function renderChatTurns() {
         ${
           activePrevId
             ? `
-          <div class="p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/30 text-xs space-y-1">
+          <div class="p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/30 text-xs space-y-2">
             <div class="font-semibold text-blue-300">✅ Sessão vinculada a um Interaction ID anterior!</div>
             <div class="text-gray-300">Próxima mensagem continuará a partir de: <code class="font-mono text-blue-200">${escapeHtml(activePrevId)}</code></div>
             ${activeEnvId ? `<div class="text-gray-300">Reutilizando Sandbox Linux: <code class="font-mono text-purple-200">${escapeHtml(activeEnvId)}</code></div>` : ""}
+            <div class="pt-1">
+              <button
+                onclick="loadChainFromPrevIdInput()"
+                class="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition"
+              >
+                🔄 Carregar conversa anterior na tela
+              </button>
+            </div>
           </div>
         `
             : `
@@ -498,8 +580,8 @@ function renderSingleTurnCard(turn, turnNumber) {
             ↻ Atualizar agora
           </button>
           <button
-            onclick="cancelRunningTurn('${currentSession.id}', '${turn.interaction_id}')"
-            class="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30"
+            onclick="cancelRunningTurn('${currentSession.id}', '${turn.interaction_id}', this)"
+            class="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 font-medium transition"
           >
             ⏹ Cancelar
           </button>
@@ -702,19 +784,33 @@ async function pollTurnOnce(sessionId, interactionId) {
   }
 }
 
-async function cancelRunningTurn(sessionId, interactionId) {
+async function cancelRunningTurn(sessionId, interactionId, btnEl = null) {
+  stopPolling();
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.innerHTML = "⏳ Cancelando...";
+  }
   try {
-    const res = await fetch(`/api/sessions/${sessionId}/turns/${interactionId}/cancel`, {
+    const res = await fetchWithRetry(`/api/sessions/${sessionId}/turns/${interactionId}/cancel`, {
       method: "POST",
-    });
-    const data = await res.json();
+    }, 2);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || `HTTP ${res.status}`);
+    }
     stopPolling();
     if (data.session) {
       currentSession = data.session;
+      syncInputsFromSession();
       renderChatTurns();
+      await loadSessionsList();
     }
   } catch (err) {
     alert("Erro ao cancelar execução: " + err.message);
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.innerHTML = "⏹ Cancelar";
+    }
   }
 }
 

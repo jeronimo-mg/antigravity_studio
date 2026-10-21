@@ -231,6 +231,30 @@ def delete_session(session_id: str) -> None:
     conn.close()
 
 
+def find_turn_by_interaction_id(interaction_id: str) -> Optional[Dict[str, Any]]:
+    clean_id = (interaction_id or "").strip()
+    if not clean_id:
+        return None
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT * FROM turns
+        WHERE interaction_id = ?
+        ORDER BY CASE WHEN user_input_text != '' THEN 0 ELSE 1 END, created_at DESC
+        LIMIT 1
+        """,
+        (clean_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    td = dict(row)
+    td["steps"] = json.loads(td.pop("steps_json") or "[]")
+    td["usage"] = json.loads(td.pop("usage_json") or "{}")
+    td["raw"] = json.loads(td.pop("raw_json") or "{}")
+    return td
+
+
 def upsert_turn(
     session_id: str,
     interaction_id: str,
@@ -246,6 +270,12 @@ def upsert_turn(
     created_at: Optional[str] = None,
 ) -> None:
     ts = created_at or now_iso()
+    effective_user_text = (user_input_text or "").strip()
+    if not effective_user_text:
+        known = find_turn_by_interaction_id(interaction_id)
+        if known and known.get("user_input_text"):
+            effective_user_text = known["user_input_text"]
+
     conn = get_connection()
     with conn:
         conn.execute(
@@ -272,7 +302,7 @@ def upsert_turn(
                 turn_index,
                 previous_interaction_id or "",
                 environment_id or "",
-                user_input_text or "",
+                effective_user_text,
                 output_text or "",
                 status or "completed",
                 json.dumps(steps, ensure_ascii=False),
@@ -282,3 +312,4 @@ def upsert_turn(
             ),
         )
     conn.close()
+
