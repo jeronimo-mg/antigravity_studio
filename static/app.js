@@ -1,6 +1,8 @@
 let currentSession = null;
 let sessionsList = [];
 let activePollTimer = null;
+let isPollingInFlight = false;
+let pollGeneration = 0;
 
 async function fetchWithRetry(url, options = {}, maxRetries = 3) {
   let lastErr = null;
@@ -755,32 +757,49 @@ async function forkFromTurn(interactionId) {
 
 function startPollingTurn(sessionId, interactionId) {
   stopPolling();
+  const myGen = ++pollGeneration;
+  let currentPolledId = interactionId;
   activePollTimer = setInterval(async () => {
-    await pollTurnOnce(sessionId, interactionId);
+    if (isPollingInFlight || myGen !== pollGeneration) return;
+    isPollingInFlight = true;
+    try {
+      const nextId = await pollTurnOnce(sessionId, currentPolledId, myGen);
+      if (nextId && nextId !== currentPolledId) {
+        currentPolledId = nextId;
+      }
+    } finally {
+      isPollingInFlight = false;
+    }
   }, 4000);
 }
 
 function stopPolling() {
+  pollGeneration++;
+  isPollingInFlight = false;
   if (activePollTimer) {
     clearInterval(activePollTimer);
     activePollTimer = null;
   }
 }
 
-async function pollTurnOnce(sessionId, interactionId) {
+async function pollTurnOnce(sessionId, interactionId, gen = pollGeneration) {
   try {
     const res = await fetchWithRetry(`/api/sessions/${sessionId}/turns/${interactionId}/poll`, {}, 2);
-    if (!res.ok) return;
+    if (!res.ok || gen !== pollGeneration) return interactionId;
     const data = await res.json();
+    if (gen !== pollGeneration) return interactionId;
     currentSession = data.session;
     syncInputsFromSession();
     renderChatTurns();
-    if (data.latest_interaction && data.latest_interaction.status !== "in_progress") {
+    const latest = data.latest_interaction;
+    if (latest && latest.status !== "in_progress") {
       stopPolling();
       await loadSessionsList();
     }
+    return (latest && latest.id) ? latest.id : interactionId;
   } catch (err) {
     console.error("Erro no polling:", err);
+    return interactionId;
   }
 }
 

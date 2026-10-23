@@ -10,11 +10,12 @@ from pydantic import BaseModel
 from .database import (
     create_session,
     delete_session,
+    delete_turn,
     get_session,
     get_setting,
     init_db,
     list_sessions,
-     now_iso,
+    now_iso,
     set_setting,
     update_session,
     upsert_turn,
@@ -626,9 +627,34 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                 history_lines.append(f"Usuário: {ut[:600]}\nAgente: {ot[:1200]}")
     fallback_history_text = "\n---\n".join(history_lines) if history_lines else None
 
+    # Se algum turno anterior que apontava para este mesmo prev_id (ou o último turno da sessão)
+    # terminou como 'cancelled' ou 'failed', a cadeia raiz no servidor Google pode estar
+    # travada/corrompida em modo background=True (aceita o POST 200 OK mas aborta após ~60s).
+    # Nesses casos, iniciamos proativamente um novo encadeamento mantendo o mesmo environment_id
+    # e injetando o histórico resumido dos últimos turnos.
+    proactively_dropped_prev = False
+    effective_prompt = prompt
+    if prev_id and prev_id.strip() and turns:
+        clean_prev = prev_id.strip()
+        chain_poisoned = any(
+            t.get("status") in ("failed", "cancelled")
+            and (
+                (t.get("previous_interaction_id") or "").strip() == clean_prev
+                or t.get("interaction_id") == clean_prev
+            )
+            for t in turns
+        ) or (turns[-1].get("status") in ("failed", "cancelled"))
+        if chain_poisoned:
+            prev_id = ""
+            proactively_dropped_prev = True
+            if fallback_history_text:
+                effective_prompt = (
+                    f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history_text}\n\n"
+                    f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
+                )
 
     payload = build_create_payload(
-        prompt=prompt,
+        prompt=effective_prompt,
         mode=mode,
         agent_name=agent_name,
         model_name=model_name,
@@ -649,6 +675,9 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    if proactively_dropped_prev:
+        interaction_resp["_dropped_previous_interaction_id"] = True
 
     new_interaction_id = interaction_resp.get("id", "")
     returned_env_id = clean_environment_id(interaction_resp.get("environment_id") or env_id or "")
@@ -679,7 +708,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         created_at=interaction_resp.get("created"),
     )
 
-    next_last_id = new_interaction_id if turn_status not in ("failed", "cancelled") else (prev_id or "")
+    next_last_id = new_interaction_id if turn_status not in ("failed", "cancelled") else ""
 
     update_session(
         session_id,
@@ -716,40 +745,133 @@ async def api_poll_turn(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    turns = session.get("turns", [])
     existing_turn = next(
-        (t for t in session.get("turns", []) if t.get("interaction_id") == interaction_id),
+        (t for t in turns if t.get("interaction_id") == interaction_id),
         None,
     )
-    turn_index = existing_turn["turn_index"] if existing_turn else len(session.get("turns", [])) + 1
+    turn_index = existing_turn["turn_index"] if existing_turn else len(turns) + 1
     fallback_input = existing_turn.get("user_input_text", "") if existing_turn else ""
 
     u_text, out_text = extract_texts_from_interaction(interaction_resp, fallback_user_input=fallback_input)
+    if fallback_input and u_text.startswith("[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:"):
+        u_text = fallback_input
     returned_env_id = interaction_resp.get("environment_id") or session.get("environment_id", "")
+    prev_id_of_turn = interaction_resp.get("previous_interaction_id") or (
+        existing_turn.get("previous_interaction_id", "") if existing_turn else ""
+    )
+
+    turn_status = interaction_resp.get("status", "completed")
+    existing_raw = (existing_turn.get("raw") or {}) if existing_turn else {}
+    was_user_cancelled = bool(existing_raw.get("_user_cancelled"))
+    already_auto_retried = bool(existing_raw.get("_auto_retried_from"))
+
+    # Auto-recuperação transparente: se um turno em background com previous_interaction_id
+    # foi abortado silenciosamente pelo backend Google ("cancelled" ou "failed" sem resposta)
+    # e NÃO foi cancelado manualmente pelo usuário, reenvia automaticamente 1 vez sem
+    # previous_interaction_id (injetando o histórico resumido e mantendo o environment_id).
+    if (
+        turn_status in ("failed", "cancelled")
+        and not (out_text or "").strip()
+        and not was_user_cancelled
+        and not already_auto_retried
+        and prev_id_of_turn
+        and (u_text or "").strip()
+    ):
+        history_lines: List[str] = []
+        for t in turns:
+            if t.get("interaction_id") != interaction_id and t.get("status") in ("completed", "incomplete"):
+                ut = (t.get("user_input_text") or "").strip()
+                ot = (t.get("output_text") or "").strip()
+                if ut or ot:
+                    history_lines.append(f"Usuário: {ut[:600]}\nAgente: {ot[:1200]}")
+        fallback_history_text = "\n---\n".join(history_lines[-6:]) if history_lines else None
+        recovery_prompt = (
+            f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history_text}\n\n"
+            f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{u_text}"
+            if fallback_history_text
+            else u_text
+        )
+        clean_env = clean_environment_id(returned_env_id)
+        uploaded_files = session.get("uploaded_files", []) or _find_uploaded_files_for_environment(clean_env)
+        recovery_payload = build_create_payload(
+            prompt=recovery_prompt,
+            mode=session.get("mode", "agent"),
+            agent_name=session.get("agent_name", "antigravity-preview-09-2026"),
+            model_name=session.get("model_name", "gemini-3.8-flash"),
+            previous_interaction_id="",
+            environment_id=clean_env,
+            max_total_tokens=session.get("max_total_tokens", 0),
+            system_instruction=session.get("system_instruction", ""),
+            background=True,
+            sources=session.get("sources", []),
+            uploaded_files=uploaded_files,
+        )
+        try:
+            retry_resp = await create_interaction(
+                recovery_payload,
+                api_key=api_key,
+                fallback_history_text=fallback_history_text,
+            )
+            new_id = retry_resp.get("id", "")
+            if new_id and new_id != interaction_id:
+                retry_resp["_auto_retried_from"] = interaction_id
+                retry_resp["_dropped_previous_interaction_id"] = True
+                _, retry_out = extract_texts_from_interaction(retry_resp, fallback_user_input=u_text)
+                retry_env = clean_environment_id(retry_resp.get("environment_id") or clean_env)
+                retry_status = retry_resp.get("status", "in_progress")
+                delete_turn(session_id, interaction_id)
+                upsert_turn(
+                    session_id=session_id,
+                    interaction_id=new_id,
+                    turn_index=turn_index,
+                    previous_interaction_id="",
+                    environment_id=retry_env,
+                    user_input_text=u_text,
+                    output_text=retry_out,
+                    status=retry_status,
+                    steps=retry_resp.get("steps", []) or [],
+                    usage=retry_resp.get("usage", {}) or {},
+                    raw=retry_resp,
+                    created_at=retry_resp.get("created"),
+                )
+                update_session(
+                    session_id,
+                    environment_id=retry_env,
+                    last_interaction_id=new_id if retry_status not in ("failed", "cancelled") else "",
+                )
+                return {
+                    "session": get_session(session_id),
+                    "latest_interaction": retry_resp,
+                    "replaced_interaction_id": interaction_id,
+                }
+        except Exception:
+            pass
+
+    if existing_raw.get("_user_cancelled"):
+        interaction_resp["_user_cancelled"] = True
+    if existing_raw.get("_auto_retried_from"):
+        interaction_resp["_auto_retried_from"] = existing_raw["_auto_retried_from"]
 
     upsert_turn(
         session_id=session_id,
         interaction_id=interaction_id,
         turn_index=turn_index,
-        previous_interaction_id=interaction_resp.get("previous_interaction_id") or (existing_turn.get("previous_interaction_id", "") if existing_turn else ""),
+        previous_interaction_id=prev_id_of_turn,
         environment_id=returned_env_id,
         user_input_text=u_text,
         output_text=out_text,
-        status=interaction_resp.get("status", "completed"),
+        status=turn_status,
         steps=interaction_resp.get("steps", []) or [],
         usage=interaction_resp.get("usage", {}) or {},
         raw=interaction_resp,
         created_at=interaction_resp.get("created"),
     )
 
-    turn_status = interaction_resp.get("status", "completed")
     if turn_status in ("failed", "cancelled"):
-        # Se a execução em background falhou ou foi cancelada, restaura o último ID válido da sessão
-        valid_prev = ""
-        for t in reversed(session.get("turns", [])):
-            if t.get("interaction_id") != interaction_id and t.get("status") in ("completed", "incomplete"):
-                valid_prev = t.get("interaction_id", "")
-                break
-        update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id=valid_prev)
+        # Desvincula o last_interaction_id para que o próximo envio não fique preso
+        # em uma cadeia raiz cancelada/corrompida no servidor Google
+        update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id="")
     elif returned_env_id:
         update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id=interaction_id)
 
@@ -783,6 +905,8 @@ async def api_cancel_turn(
     except Exception:
         pass
 
+    latest_data["_user_cancelled"] = True
+
     existing_turn = next(
         (t for t in session.get("turns", []) if t.get("interaction_id") == interaction_id),
         None,
@@ -791,6 +915,8 @@ async def api_cancel_turn(
     fallback_input = existing_turn.get("user_input_text", "") if existing_turn else ""
 
     u_text, out_text = extract_texts_from_interaction(latest_data, fallback_user_input=fallback_input)
+    if fallback_input and u_text.startswith("[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:"):
+        u_text = fallback_input
     if not out_text and existing_turn and existing_turn.get("output_text"):
         out_text = existing_turn["output_text"]
 
@@ -819,15 +945,9 @@ async def api_cancel_turn(
         created_at=latest_data.get("created") or (existing_turn.get("created_at") if existing_turn else None),
     )
 
-    # Restaura o último interaction_id válido da sessão para que o próximo turno não aponte para o turno cancelado
-    valid_prev = ""
-    if final_status == "completed":
-        valid_prev = interaction_id
-    else:
-        for t in reversed(session.get("turns", [])):
-            if t.get("interaction_id") != interaction_id and t.get("status") in ("completed", "incomplete"):
-                valid_prev = t.get("interaction_id", "")
-                break
+    # Limpa last_interaction_id quando o turno foi cancelado para que o próximo turno
+    # inicie uma nova cadeia limpa (com histórico resumido + mesmo environment_id)
+    valid_prev = interaction_id if final_status == "completed" else ""
 
     update_session(
         session_id,

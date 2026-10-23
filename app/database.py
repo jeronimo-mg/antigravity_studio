@@ -231,6 +231,16 @@ def delete_session(session_id: str) -> None:
     conn.close()
 
 
+def delete_turn(session_id: str, interaction_id: str) -> None:
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            "DELETE FROM turns WHERE session_id = ? AND interaction_id = ?",
+            (session_id, interaction_id),
+        )
+    conn.close()
+
+
 def find_turn_by_interaction_id(interaction_id: str) -> Optional[Dict[str, Any]]:
     clean_id = (interaction_id or "").strip()
     if not clean_id:

@@ -398,12 +398,32 @@ class StudioViewModel(
                     }
                 val fallbackHistory = historyLines.takeIf { it.isNotEmpty() }?.joinToString("\n---\n")
 
+                // Se algum turno anterior apontando para prevId (ou o último turno da sessão)
+                // falhou ou foi cancelado, inicia uma nova cadeia limpa mantendo environmentId e histórico
+                var effectivePrevForRequest = prevId.trim()
+                var effectivePrompt = prompt
+                var proactivelyDroppedPrev = false
+                if (effectivePrevForRequest.isNotEmpty() && session.turns.isNotEmpty()) {
+                    val chainPoisoned = session.turns.any { t ->
+                        t.status in listOf("failed", "cancelled") &&
+                            (t.previousInteractionId.trim() == effectivePrevForRequest ||
+                                t.interactionId.trim() == effectivePrevForRequest)
+                    } || (session.turns.last().status in listOf("failed", "cancelled"))
+                    if (chainPoisoned) {
+                        effectivePrevForRequest = ""
+                        proactivelyDroppedPrev = true
+                        if (!fallbackHistory.isNullOrBlank()) {
+                            effectivePrompt = "[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n$fallbackHistory\n\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n$prompt"
+                        }
+                    }
+                }
+
                 val payload = InteractionsClient.buildCreatePayload(
-                    prompt = prompt,
+                    prompt = effectivePrompt,
                     mode = session.mode,
                     agentName = session.agentName,
                     modelName = session.modelName,
-                    previousInteractionId = prevId.takeIf { it.isNotBlank() },
+                    previousInteractionId = effectivePrevForRequest.takeIf { it.isNotBlank() },
                     environmentId = envId,
                     maxTotalTokens = session.maxTotalTokens,
                     systemInstruction = session.systemInstruction,
@@ -417,12 +437,15 @@ class StudioViewModel(
                     apiKey = apiKey,
                     fallbackHistoryText = fallbackHistory
                 )
+                if (proactivelyDroppedPrev) {
+                    resp.put("_dropped_previous_interaction_id", true)
+                }
 
                 val newInteractionId = resp.optString("id", "turn_${System.currentTimeMillis()}")
                 val returnedEnvId = InteractionsClient.cleanEnvironmentId(
                     resp.optString("environment_id").ifBlank { envId }
                 )
-                val effectivePrevId = if (resp.has("_dropped_previous_interaction_id")) "" else prevId
+                val effectivePrevId = if (resp.has("_dropped_previous_interaction_id")) "" else effectivePrevForRequest
                 val (_, outText) = InteractionsClient.extractTextsFromInteraction(resp, fallbackUserInput = prompt)
                 val turnStatus = resp.optString("status", "completed")
                 val nextIndex = session.turns.size + 1
@@ -447,7 +470,7 @@ class StudioViewModel(
                     createdAt = resp.optString("created").takeIf { it.isNotBlank() }
                 )
 
-                val nextLastId = if (turnStatus !in listOf("failed", "cancelled")) newInteractionId else prevId
+                val nextLastId = if (turnStatus !in listOf("failed", "cancelled")) newInteractionId else ""
                 val updatedSession = repository.updateSession(
                     sessionId = session.id,
                     title = newTitle,
@@ -519,7 +542,12 @@ class StudioViewModel(
         val turnIndex = existingTurn?.turnIndex ?: (session.turns.size + 1)
         val fallbackInput = existingTurn?.userInputText.orEmpty()
 
-        val (uText, outText) = InteractionsClient.extractTextsFromInteraction(resp, fallbackInput)
+        val (rawUText, outText) = InteractionsClient.extractTextsFromInteraction(resp, fallbackInput)
+        val uText = if (fallbackInput.isNotBlank() && rawUText.startsWith("[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:")) {
+            fallbackInput
+        } else {
+            rawUText
+        }
         val returnedEnvId = InteractionsClient.cleanEnvironmentId(
             resp.optString("environment_id").ifBlank { session.environmentId }
         )
@@ -542,9 +570,7 @@ class StudioViewModel(
         )
 
         val nextLastId = if (turnStatus in listOf("failed", "cancelled")) {
-            session.turns.lastOrNull {
-                it.interactionId != interactionId && it.status in listOf("completed", "incomplete")
-            }?.interactionId.orEmpty()
+            ""
         } else {
             interactionId
         }
@@ -598,14 +624,10 @@ class StudioViewModel(
                     createdAt = existingTurn?.createdAt
                 )
 
-                val validPrev = session.turns.lastOrNull {
-                    it.interactionId != interactionId && it.status in listOf("completed", "incomplete")
-                }?.interactionId.orEmpty()
-
                 val updated = repository.updateSession(
                     sessionId = session.id,
                     environmentId = returnedEnvId,
-                    lastInteractionId = validPrev
+                    lastInteractionId = ""
                 )
                 _uiState.update {
                     it.copy(
