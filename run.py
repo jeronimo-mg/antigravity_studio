@@ -95,12 +95,14 @@ def install_windows_asyncio_shield() -> None:
 
 if __name__ == "__main__":
     install_windows_asyncio_shield()
+    from app.main import app as fastapi_app
+
     print("🚀 Iniciando Antigravity Studio Playground em http://127.0.0.1:8000 ...")
     if sys.platform == "win32":
         loop = asyncio.SelectorEventLoop()
         asyncio.set_event_loop(loop)
         config = uvicorn.Config(
-            "app.main:app",
+            fastapi_app,
             host="0.0.0.0",
             port=8000,
             reload=False,
@@ -109,4 +111,4 @@ if __name__ == "__main__":
         server = uvicorn.Server(config)
         loop.run_until_complete(server.serve())
     else:
-        uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=8000, reload=False)

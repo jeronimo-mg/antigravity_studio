@@ -1476,7 +1476,10 @@ async def api_list_environment_files_by_id(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+import sys as _sys
+
+_BUNDLE_DIR = getattr(_sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+STATIC_DIR = os.path.join(_BUNDLE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 

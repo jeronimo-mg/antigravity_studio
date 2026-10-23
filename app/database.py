@@ -1,11 +1,17 @@
 import json
 import os
 import sqlite3
+import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-DB_PATH = os.environ.get("ANTIGRAVITY_DB_PATH", os.path.join(os.path.dirname(os.path.dirname(__file__)), "antigravity_studio.db"))
+if getattr(sys, "frozen", False):
+    _DEFAULT_BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _DEFAULT_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+DB_PATH = os.environ.get("ANTIGRAVITY_DB_PATH", os.path.join(_DEFAULT_BASE_DIR, "antigravity_studio.db"))
 
 
 def get_connection() -> sqlite3.Connection:
