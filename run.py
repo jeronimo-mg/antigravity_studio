@@ -94,10 +94,15 @@ def install_windows_asyncio_shield() -> None:
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     install_windows_asyncio_shield()
     from app.main import app as fastapi_app
 
-    print("🚀 Iniciando Antigravity Studio Playground em http://127.0.0.1:8000 ...")
+    print(">> Iniciando Antigravity Studio Playground em http://127.0.0.1:8000 ...")
     if sys.platform == "win32":
         loop = asyncio.SelectorEventLoop()
         asyncio.set_event_loop(loop)
