@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 if getattr(sys, "frozen", False):
-    _DEFAULT_BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    _EXEC_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    if _EXEC_DIR.startswith(("/opt", "/usr", "/bin", "/sbin")) or not os.access(_EXEC_DIR, os.W_OK):
+        _xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+        _DEFAULT_BASE_DIR = os.path.join(_xdg_data, "antigravity-studio")
+        os.makedirs(_DEFAULT_BASE_DIR, exist_ok=True)
+    else:
+        _DEFAULT_BASE_DIR = _EXEC_DIR
 else:
     _DEFAULT_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

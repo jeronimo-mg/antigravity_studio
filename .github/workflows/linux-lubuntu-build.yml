@@ -1,0 +1,126 @@
+name: Build Antigravity Studio Linux / Lubuntu (DEB + Standalone)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - 'app/**'
+      - 'static/**'
+      - 'run.py'
+      - 'requirements.txt'
+      - '.github/workflows/linux-lubuntu-build.yml'
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build Standalone Linux Binary (AntigravityStudio-linux-x86_64)
+        run: |
+          pyinstaller --noconfirm --clean --onefile \
+            --name "AntigravityStudio-linux-x86_64" \
+            --add-data "static:static" \
+            --hidden-import "uvicorn.logging" \
+            --hidden-import "uvicorn.loops" \
+            --hidden-import "uvicorn.loops.auto" \
+            --hidden-import "uvicorn.protocols" \
+            --hidden-import "uvicorn.protocols.http" \
+            --hidden-import "uvicorn.protocols.http.auto" \
+            --hidden-import "uvicorn.protocols.websockets" \
+            --hidden-import "uvicorn.protocols.websockets.auto" \
+            --hidden-import "uvicorn.lifespan" \
+            --hidden-import "uvicorn.lifespan.on" \
+            --hidden-import "app" \
+            --hidden-import "app.main" \
+            --hidden-import "app.database" \
+            --hidden-import "app.interactions_client" \
+            run.py
+          chmod +x dist/AntigravityStudio-linux-x86_64
+
+      - name: Package Debian / Lubuntu Installer (.deb)
+        run: |
+          PKG_DIR="build_deb/antigravity-studio_1.1.0_amd64"
+          mkdir -p "$PKG_DIR/DEBIAN"
+          mkdir -p "$PKG_DIR/opt/antigravity-studio"
+          mkdir -p "$PKG_DIR/usr/bin"
+          mkdir -p "$PKG_DIR/usr/share/applications"
+          mkdir -p "$PKG_DIR/usr/share/icons/hicolor/scalable/apps"
+
+          cp dist/AntigravityStudio-linux-x86_64 "$PKG_DIR/opt/antigravity-studio/AntigravityStudio"
+          chmod 755 "$PKG_DIR/opt/antigravity-studio/AntigravityStudio"
+
+          cat << 'EOF' > "$PKG_DIR/usr/bin/antigravity-studio"
+          #!/bin/sh
+          exec /opt/antigravity-studio/AntigravityStudio "$@"
+          EOF
+          chmod 755 "$PKG_DIR/usr/bin/antigravity-studio"
+
+          cat << 'EOF' > "$PKG_DIR/usr/share/applications/antigravity-studio.desktop"
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Antigravity Studio
+          Comment=Interface Visual para Google Antigravity & Interactions API
+          Exec=/opt/antigravity-studio/AntigravityStudio
+          Icon=antigravity-studio
+          Terminal=true
+          Categories=Development;Utility;
+          StartupNotify=false
+          EOF
+
+          cat << 'EOF' > "$PKG_DIR/usr/share/icons/hicolor/scalable/apps/antigravity-studio.svg"
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+            <defs>
+              <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#1e1b4b"/>
+                <stop offset="100%" stop-color="#3b0764"/>
+              </linearGradient>
+              <linearGradient id="acc" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#60a5fa"/>
+                <stop offset="100%" stop-color="#c084fc"/>
+              </linearGradient>
+            </defs>
+            <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+            <path d="M64 22 L98 98 L82 98 L74 78 L54 78 L46 98 L30 98 Z M64 44 L57 64 L71 64 Z" fill="url(#acc)"/>
+            <circle cx="64" cy="22" r="5" fill="#93c5fd"/>
+          </svg>
+          EOF
+
+          cat << 'EOF' > "$PKG_DIR/DEBIAN/control"
+          Package: antigravity-studio
+          Version: 1.1.0
+          Section: devel
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Jeronimo MG <https://github.com/jeronimo-mg/antigravity_studio>
+          Depends: libc6 (>= 2.35), xdg-utils
+          Description: Antigravity Studio Playground para Lubuntu / Ubuntu / Debian
+           Interface visual estilo Google AI Studio com recuperacao e continuacao
+           completa de sessoes Antigravity via previous_interaction_id e environment_id.
+          EOF
+
+          dpkg-deb --build --root-owner-group "$PKG_DIR" dist/antigravity-studio_1.1.0_amd64.deb
+
+      - name: Upload Linux / Lubuntu Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: antigravity-studio-linux-lubuntu
+          path: |
+            dist/AntigravityStudio-linux-x86_64
+            dist/antigravity-studio_1.1.0_amd64.deb

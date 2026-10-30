@@ -93,27 +93,94 @@ def install_windows_asyncio_shield() -> None:
         pass
 
 
+def _is_port_in_use(host: str = "127.0.0.1", port: int = 8000) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _open_browser_url(url: str) -> None:
+    import shutil
+    import subprocess
+    import webbrowser
+
+    try:
+        if sys.platform.startswith("linux") and shutil.which("xdg-open"):
+            subprocess.Popen(
+                ["xdg-open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+    except Exception:
+        pass
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def _schedule_browser_open(url: str, port: int = 8000) -> None:
+    import threading
+    import time
+
+    def _worker() -> None:
+        for _ in range(30):
+            if _is_port_in_use("127.0.0.1", port):
+                _open_browser_url(url)
+                return
+            time.sleep(0.25)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
 if __name__ == "__main__":
+    import os
+
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+    port = int(os.environ.get("ANTIGRAVITY_PORT", "8000"))
+    url = f"http://127.0.0.1:{port}"
+    no_browser = (
+        "--no-browser" in sys.argv
+        or os.environ.get("ANTIGRAVITY_NO_BROWSER", "").strip() in ("1", "true", "yes")
+    )
+    should_open_browser = (
+        not no_browser
+        and (getattr(sys, "frozen", False) or "--open-browser" in sys.argv)
+    )
+
+    if _is_port_in_use("127.0.0.1", port):
+        print(f">> Antigravity Studio ja esta em execucao em {url} ...")
+        if not no_browser:
+            _open_browser_url(url)
+        sys.exit(0)
+
     install_windows_asyncio_shield()
     from app.main import app as fastapi_app
 
-    print(">> Iniciando Antigravity Studio Playground em http://127.0.0.1:8000 ...")
+    print(f">> Iniciando Antigravity Studio Playground em {url} ...")
+    if should_open_browser:
+        _schedule_browser_open(url, port=port)
+
     if sys.platform == "win32":
         loop = asyncio.SelectorEventLoop()
         asyncio.set_event_loop(loop)
         config = uvicorn.Config(
             fastapi_app,
             host="0.0.0.0",
-            port=8000,
+            port=port,
             reload=False,
             loop="none",
         )
         server = uvicorn.Server(config)
         loop.run_until_complete(server.serve())
     else:
-        uvicorn.run(fastapi_app, host="0.0.0.0", port=8000, reload=False)
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=port, reload=False)
+
