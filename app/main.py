@@ -672,6 +672,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
             payload,
             api_key=body.api_key,
             fallback_history_text=fallback_history_text,
+            fallback_sources=sources,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -680,7 +681,8 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         interaction_resp["_dropped_previous_interaction_id"] = True
 
     new_interaction_id = interaction_resp.get("id", "")
-    returned_env_id = clean_environment_id(interaction_resp.get("environment_id") or env_id or "")
+    fallback_env = "" if interaction_resp.get("_dropped_environment_id") else (env_id or "")
+    returned_env_id = clean_environment_id(interaction_resp.get("environment_id") or fallback_env)
     effective_prev_id = "" if interaction_resp.get("_dropped_previous_interaction_id") else (prev_id or "")
     _, out_text = extract_texts_from_interaction(interaction_resp, fallback_user_input=prompt)
     u_text = prompt
@@ -812,13 +814,15 @@ async def api_poll_turn(
                 recovery_payload,
                 api_key=api_key,
                 fallback_history_text=fallback_history_text,
+                fallback_sources=session.get("sources", []),
             )
             new_id = retry_resp.get("id", "")
             if new_id and new_id != interaction_id:
                 retry_resp["_auto_retried_from"] = interaction_id
                 retry_resp["_dropped_previous_interaction_id"] = True
                 _, retry_out = extract_texts_from_interaction(retry_resp, fallback_user_input=u_text)
-                retry_env = clean_environment_id(retry_resp.get("environment_id") or clean_env)
+                fallback_retry_env = "" if retry_resp.get("_dropped_environment_id") else clean_env
+                retry_env = clean_environment_id(retry_resp.get("environment_id") or fallback_retry_env)
                 retry_status = retry_resp.get("status", "in_progress")
                 delete_turn(session_id, interaction_id)
                 upsert_turn(
@@ -1297,12 +1301,12 @@ async def api_upload_to_session_environment(
     resumable = parsed["resumable"]
     pack_as_tar_gz = parsed["pack_as_tar_gz"] or len(files_list) > 1
 
-    try:
+    async def _do_upload(target_env_id: str) -> Tuple[Dict[str, Any], str]:
         if pack_as_tar_gz:
             tar_tuples = [(f["path"], f["bytes"]) for f in files_list]
             archive_bytes = pack_files_as_tar_gz(tar_tuples)
-            upload_res = await upload_file_to_environment(
-                environment_id=env_id,
+            res = await upload_file_to_environment(
+                environment_id=target_env_id,
                 target_path=target_path,
                 file_bytes=archive_bytes,
                 mime_type="application/x-tar",
@@ -1311,13 +1315,14 @@ async def api_upload_to_session_environment(
                 resumable=resumable,
                 api_key=parsed["api_key"],
             )
-            upload_summary_label = (
+            label = (
                 f"Pasta/Pacote ({len(files_list)} arquivo{'s' if len(files_list) > 1 else ''})"
             )
+            return res, label
         else:
             single = files_list[0]
-            upload_res = await upload_file_to_environment(
-                environment_id=env_id,
+            res = await upload_file_to_environment(
+                environment_id=target_env_id,
                 target_path=target_path,
                 file_bytes=single["bytes"],
                 mime_type=single.get("mime_type"),
@@ -1326,9 +1331,32 @@ async def api_upload_to_session_environment(
                 resumable=resumable,
                 api_key=parsed["api_key"],
             )
-            upload_summary_label = single["path"]
+            return res, single["path"]
+
+    try:
+        upload_res, upload_summary_label = await _do_upload(env_id)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        err_str = str(exc)
+        # Se o environment_id antigo foi desalocado na nuvem (HTTP 404) e auto_provision está ativo,
+        # provisiona um novo ambiente remoto automaticamente e refaz o upload!
+        if ("HTTP 404" in err_str or "not_found" in err_str) and parsed["auto_provision"] and not provisioned_now:
+            try:
+                env_resp = await create_remote_environment(
+                    sources=session.get("sources", []),
+                    api_key=parsed["api_key"],
+                )
+                new_env_id = clean_environment_id(env_resp.get("id") or "")
+                if new_env_id:
+                    env_id = new_env_id
+                    provisioned_now = True
+                    update_session(session_id, environment_id=env_id, last_interaction_id="")
+                    upload_res, upload_summary_label = await _do_upload(env_id)
+                else:
+                    raise exc
+            except Exception as retry_exc:
+                raise HTTPException(status_code=400, detail=str(retry_exc))
+        else:
+            raise HTTPException(status_code=400, detail=err_str)
 
     # Registra no histórico de arquivos enviados da sessão (SQLite)
     current_uploaded = list(session.get("uploaded_files") or [])

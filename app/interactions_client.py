@@ -249,6 +249,42 @@ def enrich_agent_prompt_for_sandbox(
     return prompt + "\n".join(notes)
 
 
+def _build_remote_environment_spec(
+    sources: Optional[List[Dict[str, Any]]] = None,
+) -> Any:
+    if not sources:
+        return "remote"
+    clean_sources = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        stype = s.get("type", "repository")
+        if stype == "repository" and s.get("source"):
+            clean_sources.append({
+                "type": "repository",
+                "source": s["source"].strip(),
+                "target": (s.get("target") or "/workspace").strip(),
+            })
+        elif stype == "gcs" and s.get("source"):
+            clean_sources.append({
+                "type": "gcs",
+                "source": s["source"].strip(),
+                "target": (s.get("target") or "/workspace").strip(),
+            })
+        elif stype == "inline" and s.get("target"):
+            clean_sources.append({
+                "type": "inline",
+                "content": s.get("content", ""),
+                "target": s["target"].strip(),
+            })
+    if clean_sources:
+        return {
+            "type": "remote",
+            "sources": clean_sources,
+        }
+    return "remote"
+
+
 def build_create_payload(
     prompt: str,
     mode: str = "agent",
@@ -284,34 +320,7 @@ def build_create_payload(
 
         # Se for um novo ambiente (sem environment_id prévio) e houver sources configuradas (ex: repositório GitHub)
         if (not env_val or env_val == "remote") and sources:
-            clean_sources = []
-            for s in sources:
-                stype = s.get("type", "repository")
-                if stype == "repository" and s.get("source"):
-                    clean_sources.append({
-                        "type": "repository",
-                        "source": s["source"].strip(),
-                        "target": (s.get("target") or "/workspace").strip(),
-                    })
-                elif stype == "gcs" and s.get("source"):
-                    clean_sources.append({
-                        "type": "gcs",
-                        "source": s["source"].strip(),
-                        "target": (s.get("target") or "/workspace").strip(),
-                    })
-                elif stype == "inline" and s.get("target"):
-                    clean_sources.append({
-                        "type": "inline",
-                        "content": s.get("content", ""),
-                        "target": s["target"].strip(),
-                    })
-            if clean_sources:
-                payload["environment"] = {
-                    "type": "remote",
-                    "sources": clean_sources,
-                }
-            else:
-                payload["environment"] = "remote"
+            payload["environment"] = _build_remote_environment_spec(sources)
         else:
             payload["environment"] = env_val if env_val else "remote"
 
@@ -335,21 +344,40 @@ async def create_interaction(
     payload: Dict[str, Any],
     api_key: Optional[str] = None,
     fallback_history_text: Optional[str] = None,
+    fallback_sources: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Cria uma interação na Interactions API com proteção resiliente contra erros HTTP 400/500/502/503/504:
+    Cria uma interação na Interactions API com proteção resiliente contra erros HTTP 400/404/500/502/503/504:
     1. Se uma chamada síncrona (`background=False`) para um agente demorar demais ou falhar com HTTP 500/502/503/504/Timeout,
        ativa automaticamente `background=True` para evitar timeout no gateway HTTP da Google.
-    2. Se `previous_interaction_id` for proveniente de uma sessão/turno que deu erro (HTTP 400 ou HTTP 500),
-       desvincula automaticamente o `previous_interaction_id` defeituoso mas PRESERVA o `environment`
-       (container Linux com todos os arquivos enviados), permitindo continuar no mesmo sandbox sem erro.
+    2. Se `previous_interaction_id` for proveniente de uma sessão/turno que deu erro ou expirou na nuvem (HTTP 400/404/500),
+       desvincula automaticamente o `previous_interaction_id` defeituoso tentando preservar o `environment`.
+    3. Se o contêiner remoto (`environment` / `environment_id`) também tiver sido desalocado/expirado na nuvem
+       (retornando HTTP 400/404 `Requested entity was not found`), substitui automaticamente o `environment_id`
+       antigo por `"remote"` (ou `{"type": "remote", "sources": ...}`), provisionando um novo contêiner na nuvem
+       e preservando o histórico resumido da conversa.
     """
     current_payload = dict(payload)
     is_agent = bool(current_payload.get("agent"))
     dropped_prev_id: Optional[str] = None
+    dropped_env_id: Optional[str] = None
+
+    def _inject_fallback_history() -> None:
+        if not fallback_history_text:
+            return
+        cur_input = str(current_payload.get("input", ""))
+        if "[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:" not in cur_input:
+            current_payload["input"] = (
+                f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history_text}\n\n"
+                f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{cur_input}"
+            )
+
+    def _has_custom_environment_id() -> bool:
+        env_val = current_payload.get("environment")
+        return bool(is_agent and isinstance(env_val, str) and env_val.strip() not in ("", "remote"))
 
     async with httpx.AsyncClient(timeout=300.0) as client:
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 resp = await client.post(
                     INTERACTIONS_BASE_URL,
@@ -357,10 +385,10 @@ async def create_interaction(
                     headers=build_headers(api_key),
                 )
             except (httpx.TimeoutException, httpx.TransportError):
-                if is_agent and not current_payload.get("background") and attempt < 3:
+                if is_agent and not current_payload.get("background") and attempt < 4:
                     current_payload["background"] = True
                     continue
-                if attempt < 3:
+                if attempt < 4:
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 raise ValueError(
@@ -369,24 +397,30 @@ async def create_interaction(
 
             if resp.status_code < 400:
                 data = resp.json()
-                if isinstance(data, dict) and dropped_prev_id:
-                    data["_dropped_previous_interaction_id"] = dropped_prev_id
+                if isinstance(data, dict):
+                    if dropped_prev_id:
+                        data["_dropped_previous_interaction_id"] = dropped_prev_id
+                    if dropped_env_id:
+                        data["_dropped_environment_id"] = dropped_env_id
                 return data
 
-            # Se previous_interaction_id veio de uma interação que falhou/deu erro (HTTP 400 ou 404 referenciando previous_interaction_id),
-            # remove o previous_interaction_id mantendo o mesmo environment (sandbox) imediatamente!
-            if resp.status_code in (400, 404) and current_payload.get("previous_interaction_id") and attempt < 3:
-                dropped_prev_id = str(current_payload.pop("previous_interaction_id", ""))
-                if fallback_history_text:
-                    current_payload["input"] = (
-                        f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history_text}\n\n"
-                        f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{current_payload.get('input', '')}"
-                    )
-                await asyncio.sleep(0.8)
-                continue
+            # Tratamento resiliente para HTTP 400 / 404 (ex: previous_interaction_id e/ou environment_id desalocados na nuvem)
+            if resp.status_code in (400, 404) and attempt < 4:
+                if current_payload.get("previous_interaction_id"):
+                    dropped_prev_id = str(current_payload.pop("previous_interaction_id", ""))
+                    _inject_fallback_history()
+                    await asyncio.sleep(0.6)
+                    continue
+
+                if _has_custom_environment_id():
+                    dropped_env_id = str(current_payload.get("environment", ""))
+                    current_payload["environment"] = _build_remote_environment_spec(fallback_sources)
+                    _inject_fallback_history()
+                    await asyncio.sleep(0.6)
+                    continue
 
             # Tratamento resiliente para HTTP 500 / 502 / 503 / 504
-            if resp.status_code in (500, 502, 503, 504) and attempt < 3:
+            if resp.status_code in (500, 502, 503, 504) and attempt < 4:
                 # Passo 1: Se for agente rodando síncrono (background=False), muda para background=True imediatamente
                 if is_agent and not current_payload.get("background"):
                     current_payload["background"] = True
@@ -397,11 +431,16 @@ async def create_interaction(
                 # desvincula o previous_interaction_id corrompido já na próxima tentativa mantendo o mesmo environment_id!
                 if current_payload.get("previous_interaction_id"):
                     dropped_prev_id = str(current_payload.pop("previous_interaction_id", ""))
-                    if fallback_history_text:
-                        current_payload["input"] = (
-                            f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history_text}\n\n"
-                            f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{current_payload.get('input', '')}"
-                        )
+                    _inject_fallback_history()
+                    await asyncio.sleep(1.0)
+                    continue
+
+                # Passo 3: Se o próprio environment_id estiver corrompido/inacessível com erro 5xx persistente,
+                # realoca um novo ambiente remoto limpo.
+                if _has_custom_environment_id():
+                    dropped_env_id = str(current_payload.get("environment", ""))
+                    current_payload["environment"] = _build_remote_environment_spec(fallback_sources)
+                    _inject_fallback_history()
                     await asyncio.sleep(1.0)
                     continue
 

@@ -404,10 +404,51 @@ if __name__ == "__main__":
         chain
     }
 
+    private fun buildRemoteEnvironmentSpec(sources: List<SourceItem>): Any {
+        if (sources.isEmpty()) return "remote"
+        val cleanSources = JSONArray()
+        for (s in sources) {
+            when (s.type) {
+                "repository" -> if (s.source.isNotBlank()) {
+                    cleanSources.put(
+                        JSONObject()
+                            .put("type", "repository")
+                            .put("source", s.source.trim())
+                            .put("target", s.target.ifBlank { "/workspace" }.trim())
+                    )
+                }
+                "gcs" -> if (s.source.isNotBlank()) {
+                    cleanSources.put(
+                        JSONObject()
+                            .put("type", "gcs")
+                            .put("source", s.source.trim())
+                            .put("target", s.target.ifBlank { "/workspace" }.trim())
+                    )
+                }
+                "inline" -> if (s.target.isNotBlank()) {
+                    cleanSources.put(
+                        JSONObject()
+                            .put("type", "inline")
+                            .put("content", s.content)
+                            .put("target", s.target.trim())
+                    )
+                }
+            }
+        }
+        return if (cleanSources.length() > 0) {
+            JSONObject()
+                .put("type", "remote")
+                .put("sources", cleanSources)
+        } else {
+            "remote"
+        }
+    }
+
     suspend fun createInteraction(
         payload: JSONObject,
         apiKey: String,
-        fallbackHistoryText: String? = null
+        fallbackHistoryText: String? = null,
+        fallbackSources: List<SourceItem> = emptyList()
     ): JSONObject = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) {
             throw IllegalArgumentException("Configure sua Gemini API Key no botão 🔑 API Key.")
@@ -415,8 +456,25 @@ if __name__ == "__main__":
         val currentPayload = JSONObject(payload.toString())
         val isAgent = currentPayload.has("agent")
         var droppedPrevId: String? = null
+        var droppedEnvId: String? = null
 
-        for (attempt in 0 until 4) {
+        fun injectFallbackHistory() {
+            if (fallbackHistoryText.isNullOrBlank()) return
+            val origInput = currentPayload.optString("input", "")
+            if (!origInput.contains("[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:")) {
+                currentPayload.put(
+                    "input",
+                    "[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n$fallbackHistoryText\n\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n$origInput"
+                )
+            }
+        }
+
+        fun hasCustomEnvironmentId(): Boolean {
+            val envObj = currentPayload.opt("environment")
+            return isAgent && envObj is String && envObj.trim().isNotEmpty() && envObj.trim() != "remote"
+        }
+
+        for (attempt in 0 until 5) {
             val reqBody = currentPayload.toString()
                 .toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
             val request = Request.Builder()
@@ -434,26 +492,32 @@ if __name__ == "__main__":
                         if (droppedPrevId != null) {
                             data.put("_dropped_previous_interaction_id", droppedPrevId)
                         }
+                        if (droppedEnvId != null) {
+                            data.put("_dropped_environment_id", droppedEnvId)
+                        }
                         return@withContext data
                     }
 
-                    // Se previous_interaction_id falhou com 400 ou 404, desvincula mantendo o mesmo environment_id
-                    if (resp.code in listOf(400, 404) && currentPayload.has("previous_interaction_id") && attempt < 3) {
-                        droppedPrevId = currentPayload.optString("previous_interaction_id")
-                        currentPayload.remove("previous_interaction_id")
-                        if (!fallbackHistoryText.isNullOrBlank()) {
-                            val origInput = currentPayload.optString("input", "")
-                            currentPayload.put(
-                                "input",
-                                "[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n$fallbackHistoryText\n\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n$origInput"
-                            )
+                    // Se previous_interaction_id e/ou environment_id falharam com 400 ou 404 (desalocados na nuvem)
+                    if (resp.code in listOf(400, 404) && attempt < 4) {
+                        if (currentPayload.has("previous_interaction_id")) {
+                            droppedPrevId = currentPayload.optString("previous_interaction_id")
+                            currentPayload.remove("previous_interaction_id")
+                            injectFallbackHistory()
+                            delay(600L)
+                            return@use
                         }
-                        delay(800L)
-                        return@use
+                        if (hasCustomEnvironmentId()) {
+                            droppedEnvId = currentPayload.optString("environment")
+                            currentPayload.put("environment", buildRemoteEnvironmentSpec(fallbackSources))
+                            injectFallbackHistory()
+                            delay(600L)
+                            return@use
+                        }
                     }
 
                     // Tratamento resiliente para HTTP 500 / 502 / 503 / 504
-                    if (resp.code in listOf(500, 502, 503, 504) && attempt < 3) {
+                    if (resp.code in listOf(500, 502, 503, 504) && attempt < 4) {
                         if (isAgent && !currentPayload.optBoolean("background", false)) {
                             currentPayload.put("background", true)
                             delay(1000L)
@@ -462,13 +526,14 @@ if __name__ == "__main__":
                         if (currentPayload.has("previous_interaction_id")) {
                             droppedPrevId = currentPayload.optString("previous_interaction_id")
                             currentPayload.remove("previous_interaction_id")
-                            if (!fallbackHistoryText.isNullOrBlank()) {
-                                val origInput = currentPayload.optString("input", "")
-                                currentPayload.put(
-                                    "input",
-                                    "[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n$fallbackHistoryText\n\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n$origInput"
-                                )
-                            }
+                            injectFallbackHistory()
+                            delay(1000L)
+                            return@use
+                        }
+                        if (hasCustomEnvironmentId()) {
+                            droppedEnvId = currentPayload.optString("environment")
+                            currentPayload.put("environment", buildRemoteEnvironmentSpec(fallbackSources))
+                            injectFallbackHistory()
                             delay(1000L)
                             return@use
                         }
@@ -479,11 +544,11 @@ if __name__ == "__main__":
                     throw IllegalStateException("Erro na Interactions API (HTTP ${resp.code}): $bodyStr")
                 }
             } catch (e: IOException) {
-                if (isAgent && !currentPayload.optBoolean("background", false) && attempt < 3) {
+                if (isAgent && !currentPayload.optBoolean("background", false) && attempt < 4) {
                     currentPayload.put("background", true)
                     continue
                 }
-                if (attempt < 3) {
+                if (attempt < 4) {
                     delay(1500L * (attempt + 1))
                     continue
                 }

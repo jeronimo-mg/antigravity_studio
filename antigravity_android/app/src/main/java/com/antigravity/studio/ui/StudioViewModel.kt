@@ -435,15 +435,17 @@ class StudioViewModel(
                 val resp = InteractionsClient.createInteraction(
                     payload = payload,
                     apiKey = apiKey,
-                    fallbackHistoryText = fallbackHistory
+                    fallbackHistoryText = fallbackHistory,
+                    fallbackSources = session.sources
                 )
                 if (proactivelyDroppedPrev) {
                     resp.put("_dropped_previous_interaction_id", true)
                 }
 
                 val newInteractionId = resp.optString("id", "turn_${System.currentTimeMillis()}")
+                val fallbackEnv = if (resp.has("_dropped_environment_id")) "" else envId
                 val returnedEnvId = InteractionsClient.cleanEnvironmentId(
-                    resp.optString("environment_id").ifBlank { envId }
+                    resp.optString("environment_id").ifBlank { fallbackEnv }
                 )
                 val effectivePrevId = if (resp.has("_dropped_previous_interaction_id")) "" else effectivePrevForRequest
                 val (_, outText) = InteractionsClient.extractTextsFromInteraction(resp, fallbackUserInput = prompt)
