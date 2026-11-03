@@ -554,13 +554,92 @@ class StudioViewModel(
             resp.optString("environment_id").ifBlank { session.environmentId }
         )
         val turnStatus = resp.optString("status", "completed")
+        val prevUsed = resp.optString("previous_interaction_id")
+            .ifBlank { existingTurn?.previousInteractionId.orEmpty() }
+            .trim()
+
+        if (turnStatus in listOf("failed", "cancelled") && outText.isBlank() && prevUsed.isNotBlank() && uText.isNotBlank()) {
+            val historyLines = session.turns
+                .filter { it.interactionId != interactionId && it.status in listOf("completed", "incomplete") }
+                .takeLast(6)
+                .mapNotNull { t ->
+                    if (t.userInputText.isNotBlank() || t.outputText.isNotBlank()) {
+                        "Usuário: ${t.userInputText.take(600)}\nAgente: ${t.outputText.take(1200)}"
+                    } else null
+                }
+            val fallbackHistory = historyLines.takeIf { it.isNotEmpty() }?.joinToString("\n---\n")
+            val recoveryPrompt = if (!fallbackHistory.isNullOrBlank()) {
+                "[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n$fallbackHistory\n\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n$uText"
+            } else {
+                uText
+            }
+            val uploadedFiles = session.uploadedFiles.ifEmpty {
+                repository.findUploadedFilesForEnvironment(returnedEnvId)
+            }
+            try {
+                val retryPayload = InteractionsClient.buildCreatePayload(
+                    prompt = recoveryPrompt,
+                    mode = session.mode,
+                    agentName = session.agentName,
+                    modelName = session.modelName,
+                    previousInteractionId = null,
+                    environmentId = returnedEnvId,
+                    maxTotalTokens = session.maxTotalTokens,
+                    systemInstruction = session.systemInstruction,
+                    background = true,
+                    sources = session.sources,
+                    uploadedFiles = uploadedFiles
+                )
+                val retryResp = InteractionsClient.createInteraction(
+                    payload = retryPayload,
+                    apiKey = apiKey,
+                    fallbackHistoryText = fallbackHistory
+                )
+                retryResp.put("_dropped_previous_interaction_id", prevUsed)
+                val newId = retryResp.optString("id", "turn_${System.currentTimeMillis()}")
+                val newEnv = InteractionsClient.cleanEnvironmentId(
+                    retryResp.optString("environment_id").ifBlank { returnedEnvId }
+                )
+                val (_, retryOut) = InteractionsClient.extractTextsFromInteraction(retryResp, fallbackUserInput = uText)
+                val retryStatus = retryResp.optString("status", "in_progress")
+
+                repository.deleteTurn(session.id, interactionId)
+                repository.upsertTurn(
+                    sessionId = session.id,
+                    interactionId = newId,
+                    turnIndex = turnIndex,
+                    previousInteractionId = "",
+                    environmentId = newEnv,
+                    userInputText = uText,
+                    outputText = retryOut,
+                    status = retryStatus,
+                    stepsJson = retryResp.optJSONArray("steps")?.toString() ?: "[]",
+                    usageJson = retryResp.optJSONObject("usage")?.toString() ?: "{}",
+                    rawJson = retryResp.toString(),
+                    createdAt = retryResp.optString("created").takeIf { it.isNotBlank() }
+                )
+                val updated = repository.updateSession(
+                    sessionId = session.id,
+                    environmentId = newEnv,
+                    lastInteractionId = if (retryStatus !in listOf("failed", "cancelled")) newId else ""
+                )
+                val all = repository.listSessions()
+                _uiState.update {
+                    it.copy(
+                        sessions = all,
+                        activeSession = updated
+                    )
+                }
+                return
+            } catch (_: Exception) {
+            }
+        }
 
         repository.upsertTurn(
             sessionId = session.id,
             interactionId = interactionId,
             turnIndex = turnIndex,
-            previousInteractionId = resp.optString("previous_interaction_id")
-                .ifBlank { existingTurn?.previousInteractionId.orEmpty() },
+            previousInteractionId = prevUsed,
             environmentId = returnedEnvId,
             userInputText = uText,
             outputText = outText,

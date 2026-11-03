@@ -14,6 +14,7 @@ import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
+import androidx.room.Update
 import com.antigravity.studio.data.model.SessionModel
 import com.antigravity.studio.data.model.SourceItem
 import com.antigravity.studio.data.model.TurnModel
@@ -102,8 +103,14 @@ interface StudioDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSession(session: SessionEntity)
 
+    @Update
+    suspend fun updateSessionEntity(session: SessionEntity)
+
     @Query("DELETE FROM turns WHERE session_id = :sessionId")
     suspend fun deleteTurnsForSession(sessionId: String)
+
+    @Query("DELETE FROM turns WHERE session_id = :sessionId AND interaction_id = :interactionId")
+    suspend fun deleteTurnById(sessionId: String, interactionId: String)
 
     @Query("DELETE FROM sessions WHERE id = :sessionId")
     suspend fun deleteSessionById(sessionId: String)
@@ -271,7 +278,7 @@ class StudioRepository(private val dao: StudioDao) {
                 ?: existing.uploadedFilesJson,
             updatedAt = nowIso()
         )
-        dao.insertSession(updated)
+        dao.updateSessionEntity(updated)
         return getSession(sessionId)
     }
 
@@ -279,6 +286,10 @@ class StudioRepository(private val dao: StudioDao) {
     suspend fun deleteSession(sessionId: String) {
         dao.deleteTurnsForSession(sessionId)
         dao.deleteSessionById(sessionId)
+    }
+
+    suspend fun deleteTurn(sessionId: String, interactionId: String) {
+        dao.deleteTurnById(sessionId, interactionId)
     }
 
     suspend fun findTurnByInteractionId(interactionId: String): TurnModel? {
