@@ -18,13 +18,17 @@ async function fetchWithRetry(url, options = {}, maxRetries = 3) {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
-  await checkApiKeyStatus();
+  const hasKey = await checkApiKeyStatus();
   await loadSessionsList();
 
   if (sessionsList.length > 0) {
     await selectSession(sessionsList[0].id);
   } else {
     await createNewSession();
+  }
+
+  if (hasKey) {
+    syncCloudSessions(true);
   }
 
   const promptEl = document.getElementById("promptInput");
@@ -54,11 +58,51 @@ async function checkApiKeyStatus() {
     const statusText = document.getElementById("apiKeyStatusText");
     if (data.has_api_key) {
       statusText.textContent = `Key (${data.masked_key})`;
+      return true;
     } else {
       statusText.textContent = "API Key (Proxy/Auto)";
+      return false;
     }
   } catch (err) {
     console.error("Erro ao verificar status da API Key:", err);
+    return false;
+  }
+}
+
+async function syncCloudSessions(silent = false) {
+  const btn = document.getElementById("syncCloudBtn");
+  const btnText = document.getElementById("syncCloudBtnText");
+  if (btn) btn.disabled = true;
+  if (btnText) btnText.textContent = "Sincronizando...";
+  try {
+    const res = await fetch("/api/sessions/sync", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) {
+      if (!silent) {
+        alert("Erro ao sincronizar com a Gemini Files API: " + (data.detail || res.statusText));
+      }
+      return;
+    }
+    sessionsList = data.sessions || [];
+    renderSessionsSidebar();
+    if (currentSession && (data.pulled > 0 || data.updated > 0)) {
+      await selectSession(currentSession.id);
+    }
+    if (!silent) {
+      alert(
+        `☁️ Sincronização na Nuvem (Gemini Files API) concluída!\n\n` +
+        `• Novas sessões baixadas: ${data.pulled || 0}\n` +
+        `• Sessões atualizadas da nuvem: ${data.updated || 0}\n` +
+        `• Sessões locais enviadas/atualizadas na nuvem: ${data.pushed || 0}`
+      );
+    }
+  } catch (err) {
+    if (!silent) {
+      alert("Erro de rede ao sincronizar sessões: " + err.message);
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+    if (btnText) btnText.textContent = "Sincronizar Nuvem (Files API)";
   }
 }
 
@@ -1052,7 +1096,10 @@ async function saveApiKey() {
   });
   document.getElementById("apiKeyInput").value = "";
   closeApiKeyModal();
-  await checkApiKeyStatus();
+  const hasKey = await checkApiKeyStatus();
+  if (hasKey) {
+    syncCloudSessions(true);
+  }
 }
 
 function exportCurrentSessionMarkdown() {

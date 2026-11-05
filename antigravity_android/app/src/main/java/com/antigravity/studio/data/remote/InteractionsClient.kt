@@ -1419,4 +1419,233 @@ print(interaction.output_text)
                 else -> "application/octet-stream"
             }
     }
+
+    // =========================================================================
+    // Sincronização na Nuvem via Gemini Files API (v1beta/files)
+    // =========================================================================
+
+    const val FILES_UPLOAD_BASE_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+    const val SYNC_DISPLAY_PREFIX = "AG_SYNC_V1|"
+
+    data class SyncedSessionMeta(
+        val id: String,
+        val title: String,
+        val lastInteractionId: String,
+        val environmentId: String,
+        val mode: String,
+        val agentName: String,
+        val modelName: String,
+        val updatedAt: String,
+        val cloudTime: String = ""
+    )
+
+    fun sessionToSyncFileName(sessionId: String): String {
+        val cleanSlug = sessionId.lowercase()
+            .replace(Regex("[^a-z0-9]+"), "-")
+            .trim('-')
+            .take(28)
+            .ifBlank { "default" }
+        return "files/ag-s-$cleanSlug"
+    }
+
+    fun encodeSessionSyncDisplayName(session: SessionModel): String {
+        var lastId = session.lastInteractionId.trim()
+        if (lastId.isBlank() && session.turns.isNotEmpty()) {
+            val validTurn = session.turns.lastOrNull {
+                it.status !in listOf("failed", "cancelled") && it.interactionId.isNotBlank()
+            }
+            if (validTurn != null) {
+                lastId = validTurn.interactionId.trim()
+            }
+        }
+        val envId = cleanEnvironmentId(session.environmentId)
+        if (lastId.isBlank() && envId.isBlank()) {
+            return ""
+        }
+        val meta = JSONObject().apply {
+            put("id", session.id.trim())
+            put("t", session.title.trim().take(64).ifBlank { "Conversa Antigravity" })
+            put("last", lastId)
+            put("env", envId)
+            put("m", session.mode.trim().ifBlank { "agent" })
+            put("ag", session.agentName.trim().ifBlank { "antigravity-preview-09-2026" })
+            put("md", session.modelName.trim().ifBlank { "gemini-3.8-flash" })
+            put("u", session.updatedAt.trim())
+        }
+        return SYNC_DISPLAY_PREFIX + meta.toString()
+    }
+
+    fun decodeSessionSyncDisplayName(displayName: String, cloudTime: String = ""): SyncedSessionMeta? {
+        val raw = displayName.trim()
+        if (!raw.startsWith(SYNC_DISPLAY_PREFIX)) return null
+        val jsonStr = raw.removePrefix(SYNC_DISPLAY_PREFIX).trim()
+        return try {
+            val obj = JSONObject(jsonStr)
+            val sid = obj.optString("id", "").trim()
+            if (sid.isBlank()) return null
+            SyncedSessionMeta(
+                id = sid,
+                title = obj.optString("t", "Conversa Antigravity").trim().ifBlank { "Conversa Antigravity" },
+                lastInteractionId = obj.optString("last", "").trim(),
+                environmentId = cleanEnvironmentId(obj.optString("env", "")),
+                mode = obj.optString("m", "agent").trim().ifBlank { "agent" },
+                agentName = obj.optString("ag", "antigravity-preview-09-2026").trim().ifBlank { "antigravity-preview-09-2026" },
+                modelName = obj.optString("md", "gemini-3.8-flash").trim().ifBlank { "gemini-3.8-flash" },
+                updatedAt = obj.optString("u", "").trim(),
+                cloudTime = cloudTime
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    suspend fun deleteSessionFromFilesApi(sessionId: String, apiKey: String): Boolean = withContext(Dispatchers.IO) {
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isBlank() || sessionId.isBlank()) return@withContext false
+        val shortName = sessionToSyncFileName(sessionId).removePrefix("files/")
+        val req = Request.Builder()
+            .url("$FILES_BASE_URL/$shortName")
+            .delete()
+            .addHeader("x-goog-api-key", cleanKey)
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                resp.code < 400 || resp.code == 404
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun pushSessionToFilesApi(session: SessionModel, apiKey: String): Boolean = withContext(Dispatchers.IO) {
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isBlank() || session.id.isBlank()) return@withContext false
+        val displayName = encodeSessionSyncDisplayName(session)
+        if (displayName.isBlank()) return@withContext false
+
+        val fileName = sessionToSyncFileName(session.id)
+        val shortName = fileName.removePrefix("files/")
+
+        // 1. Remove versão anterior se existir
+        try {
+            val delReq = Request.Builder()
+                .url("$FILES_BASE_URL/$shortName")
+                .delete()
+                .addHeader("x-goog-api-key", cleanKey)
+                .build()
+            httpClient.newCall(delReq).execute().close()
+        } catch (_: Exception) {
+        }
+
+        val bodyBytes = JSONObject().apply {
+            put("id", session.id)
+            put("title", session.title)
+            put("mode", session.mode)
+            put("agent_name", session.agentName)
+            put("model_name", session.modelName)
+            put("environment_id", cleanEnvironmentId(session.environmentId))
+            put("last_interaction_id", session.lastInteractionId)
+            put("updated_at", session.updatedAt)
+        }.toString().toByteArray(Charsets.UTF_8)
+
+        fun buildStartRequest(includeFixedName: Boolean): Request {
+            val fileObj = JSONObject().apply {
+                if (includeFixedName) put("name", fileName)
+                put("display_name", displayName)
+                put("mime_type", "application/json")
+            }
+            val metaBody = JSONObject().put("file", fileObj).toString()
+                .toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
+            return Request.Builder()
+                .url(FILES_UPLOAD_BASE_URL)
+                .post(metaBody)
+                .addHeader("x-goog-api-key", cleanKey)
+                .addHeader("Content-Type", "application/json")
+                .addHeader("X-Goog-Upload-Protocol", "resumable")
+                .addHeader("X-Goog-Upload-Command", "start")
+                .addHeader("X-Goog-Upload-Header-Content-Length", bodyBytes.size.toString())
+                .addHeader("X-Goog-Upload-Header-Content-Type", "application/json")
+                .build()
+        }
+
+        var uploadUrl = ""
+        try {
+            httpClient.newCall(buildStartRequest(includeFixedName = true)).execute().use { resp ->
+                if (resp.code < 400) {
+                    uploadUrl = (resp.header("x-goog-upload-url") ?: resp.header("X-Goog-Upload-URL") ?: "").trim()
+                }
+            }
+            if (uploadUrl.isBlank()) {
+                httpClient.newCall(buildStartRequest(includeFixedName = false)).execute().use { resp ->
+                    if (resp.code < 400) {
+                        uploadUrl = (resp.header("x-goog-upload-url") ?: resp.header("X-Goog-Upload-URL") ?: "").trim()
+                    }
+                }
+            }
+            if (uploadUrl.isBlank()) return@withContext false
+
+            val finReq = Request.Builder()
+                .url(uploadUrl)
+                .post(bodyBytes.toRequestBody("application/json".toMediaTypeOrNull()))
+                .addHeader("Content-Length", bodyBytes.size.toString())
+                .addHeader("X-Goog-Upload-Offset", "0")
+                .addHeader("X-Goog-Upload-Command", "upload, finalize")
+                .build()
+
+            httpClient.newCall(finReq).execute().use { finResp ->
+                finResp.code < 400
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun listSyncedSessionsFromFilesApi(apiKey: String): List<SyncedSessionMeta> = withContext(Dispatchers.IO) {
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isBlank()) {
+            throw IllegalArgumentException("Configure sua Gemini API Key antes de sincronizar com a nuvem.")
+        }
+        val bySessionId = mutableMapOf<String, SyncedSessionMeta>()
+        var pageToken: String? = null
+
+        for (page in 0 until 5) {
+            val urlBuilder = FILES_BASE_URL.toHttpUrl().newBuilder()
+                .addQueryParameter("pageSize", "100")
+            if (!pageToken.isNullOrBlank()) {
+                urlBuilder.addQueryParameter("pageToken", pageToken)
+            }
+            val req = Request.Builder()
+                .url(urlBuilder.build())
+                .get()
+                .addHeader("x-goog-api-key", cleanKey)
+                .build()
+
+            httpClient.newCall(req).execute().use { resp ->
+                val bodyStr = resp.body?.string() ?: "{}"
+                if (resp.code >= 400) {
+                    throw IllegalStateException("Erro ao consultar Gemini Files API (HTTP ${resp.code}): $bodyStr")
+                }
+                val data = JSONObject(bodyStr)
+                val filesArr = data.optJSONArray("files")
+                if (filesArr != null) {
+                    for (i in 0 until filesArr.length()) {
+                        val fobj = filesArr.optJSONObject(i) ?: continue
+                        val dname = fobj.optString("displayName").ifBlank { fobj.optString("display_name") }
+                        val fTime = fobj.optString("updateTime")
+                            .ifBlank { fobj.optString("createTime") }
+                        val parsed = decodeSessionSyncDisplayName(dname, cloudTime = fTime) ?: continue
+                        val existing = bySessionId[parsed.id]
+                        if (existing == null || (fTime.isNotBlank() && fTime > existing.cloudTime)) {
+                            bySessionId[parsed.id] = parsed
+                        }
+                    }
+                }
+                val nextToken = data.optString("nextPageToken", "").trim()
+                pageToken = nextToken.ifBlank { null }
+            }
+            if (pageToken == null) break
+        }
+
+        bySessionId.values.sortedByDescending { it.updatedAt.ifBlank { it.cloudTime } }
+    }
 }

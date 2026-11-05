@@ -210,6 +210,15 @@
           <span>🔄</span>
           <span>Recuperar com Interaction ID</span>
         </button>
+        <button
+          id="syncCloudBtn"
+          onclick="syncCloudSessions(false)"
+          class="w-full flex items-center justify-center gap-2 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 font-medium py-2 px-3 rounded-lg text-xs transition"
+          title="Sincronizar todas as sessões e últimos interaction_ids na nuvem via Gemini Files API usando sua GEMINI_API_KEY"
+        >
+          <span>☁️</span>
+          <span id="syncCloudBtnText">Sincronizar Nuvem (Files API)</span>
+        </button>
       </div>
 
       <div class="px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-gray-400 flex items-center justify-between">
@@ -1004,6 +1013,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=20261023_1"></script>
+  <script src="/app.js?v=20261105_1"></script>
 </body>
 </html>

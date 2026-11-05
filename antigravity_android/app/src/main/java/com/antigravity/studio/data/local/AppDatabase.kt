@@ -100,7 +100,7 @@ interface StudioDao {
     @Query("SELECT * FROM turns WHERE session_id = :sessionId ORDER BY turn_index ASC")
     suspend fun getTurnsForSession(sessionId: String): List<TurnEntity>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertSession(session: SessionEntity)
 
     @Update
@@ -211,10 +211,14 @@ class StudioRepository(private val dao: StudioDao) {
         maxTotalTokens: Int = 0,
         systemInstruction: String = "",
         sources: List<SourceItem> = emptyList(),
-        uploadedFiles: List<UploadedFileRecord>? = null
+        uploadedFiles: List<UploadedFileRecord>? = null,
+        customId: String? = null,
+        customUpdatedAt: String? = null
     ): SessionModel {
-        val sessionId = "sess_${UUID.randomUUID().toString().replace("-", "").take(12)}"
+        val sessionId = customId?.trim()?.takeIf { it.isNotEmpty() }
+            ?: "sess_${UUID.randomUUID().toString().replace("-", "").take(12)}"
         val ts = nowIso()
+        val effUpdated = customUpdatedAt?.trim()?.takeIf { it.isNotEmpty() } ?: ts
         val effectiveUploads = uploadedFiles ?: if (environmentId.isNotBlank()) {
             findUploadedFilesForEnvironment(environmentId)
         } else {
@@ -233,7 +237,7 @@ class StudioRepository(private val dao: StudioDao) {
             sourcesJson = encodeSourcesJson(sources),
             uploadedFilesJson = encodeUploadedFilesJson(effectiveUploads),
             createdAt = ts,
-            updatedAt = ts
+            updatedAt = effUpdated
         )
         dao.insertSession(entity)
         return getSession(sessionId)!!

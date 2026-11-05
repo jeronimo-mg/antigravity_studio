@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import os
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,12 +27,15 @@ from .interactions_client import (
     clean_environment_id,
     create_interaction,
     create_remote_environment,
+    delete_session_from_files_api,
     download_environment_snapshot,
     extract_texts_from_interaction,
     format_session_as_markdown,
     get_interaction,
     list_environment_files,
+    list_synced_sessions_from_files_api,
     pack_files_as_tar_gz,
+    push_session_to_files_api,
     recover_conversation_chain,
     resolve_api_key,
     upload_file_to_environment,
@@ -392,6 +396,7 @@ async def api_load_chain_into_existing_session(
         raise HTTPException(status_code=400, detail=str(exc))
 
     turns = (updated or {}).get("turns", [])
+    asyncio.create_task(_bg_push_session_sync(session_id, api_key=api_key))
     return {
         "session": updated,
         "imported_turns": len(turns),
@@ -399,9 +404,121 @@ async def api_load_chain_into_existing_session(
     }
 
 
+async def _bg_push_session_sync(session_id: str, api_key: Optional[str] = None) -> None:
+    """Envia silenciosamente o ponteiro da sessão para a Gemini Files API em background."""
+    try:
+        sess = get_session(session_id)
+        if sess:
+            await push_session_to_files_api(sess, api_key=api_key)
+    except Exception:
+        pass
+
+
+@app.post("/api/sessions/sync")
+async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Sincronização bidirecional de sessões via Gemini Files API (v1beta/files):
+    1. Pull: Busca todas as sessões publicadas na Files API (AG_SYNC_V1|...),
+       cria ou atualiza sessões locais e recupera os turnos automaticamente via last_interaction_id.
+    2. Push: Publica/atualiza na Files API todas as sessões locais que possuem
+       last_interaction_id ou environment_id e ainda não estão sincronizadas.
+    """
+    try:
+        remote_items = await list_synced_sessions_from_files_api(api_key=api_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    pulled_count = 0
+    updated_count = 0
+    pushed_count = 0
+
+    remote_by_id: Dict[str, Dict[str, Any]] = {r["id"]: r for r in remote_items if r.get("id")}
+
+    # 1. PULL: aplica sessões da nuvem localmente
+    for sid, rmeta in remote_by_id.items():
+        r_last_id = (rmeta.get("last_interaction_id") or "").strip()
+        r_env_id = clean_environment_id(rmeta.get("environment_id") or "")
+        r_title = (rmeta.get("title") or "Conversa Antigravity").strip()
+        r_mode = (rmeta.get("mode") or "agent").strip()
+        r_agent = (rmeta.get("agent_name") or "antigravity-preview-09-2026").strip()
+        r_model = (rmeta.get("model_name") or "gemini-3.8-flash").strip()
+        r_updated = (rmeta.get("updated_at") or "").strip()
+
+        local_sess = get_session(sid)
+        if not local_sess:
+            create_session(
+                title=r_title,
+                mode=r_mode,
+                agent_name=r_agent,
+                model_name=r_model,
+                environment_id=r_env_id,
+                last_interaction_id=r_last_id,
+                session_id=sid,
+                updated_at=r_updated,
+            )
+            if r_last_id:
+                try:
+                    await _load_chain_into_session(sid, r_last_id, api_key=api_key)
+                except Exception:
+                    pass
+            pulled_count += 1
+        else:
+            local_turns = local_sess.get("turns") or []
+            existing_turn_ids = {t.get("interaction_id") for t in local_turns}
+            local_last_id = (local_sess.get("last_interaction_id") or "").strip()
+            local_env_id = clean_environment_id(local_sess.get("environment_id") or "")
+
+            if r_last_id and (r_last_id != local_last_id and r_last_id not in existing_turn_ids or not local_turns):
+                update_session(
+                    sid,
+                    title=r_title if local_sess.get("title") in ("Nova Conversa Antigravity", "Nova Conversa") else None,
+                    environment_id=r_env_id or local_env_id or None,
+                    last_interaction_id=r_last_id,
+                )
+                try:
+                    await _load_chain_into_session(sid, r_last_id, api_key=api_key)
+                except Exception:
+                    pass
+                updated_count += 1
+            elif r_env_id and not local_env_id:
+                update_session(sid, environment_id=r_env_id)
+                updated_count += 1
+
+    # 2. PUSH: envia sessões locais que não estão na nuvem ou têm last_interaction_id mais novo
+    all_local = list_sessions()
+    for ls in all_local:
+        sid = ls["id"]
+        l_last = (ls.get("last_interaction_id") or "").strip()
+        l_env = clean_environment_id(ls.get("environment_id") or "")
+        if not l_last and not l_env and not ls.get("turn_count"):
+            continue
+        rmeta = remote_by_id.get(sid)
+        needs_push = (
+            rmeta is None
+            or (l_last and l_last != (rmeta.get("last_interaction_id") or "").strip())
+            or (l_env and l_env != clean_environment_id(rmeta.get("environment_id") or ""))
+            or (ls.get("title") or "").strip()[:64] != (rmeta.get("title") or "").strip()[:64]
+        )
+        if needs_push:
+            full_local = get_session(sid) or ls
+            res = await push_session_to_files_api(full_local, api_key=api_key)
+            if res:
+                pushed_count += 1
+
+    final_sessions = list_sessions()
+    return {
+        "pulled": pulled_count,
+        "updated": updated_count,
+        "pushed": pushed_count,
+        "remote_total": len(remote_by_id),
+        "sessions": final_sessions,
+    }
+
+
 @app.delete("/api/sessions/{session_id}")
-def api_delete_session(session_id: str) -> Dict[str, Any]:
+async def api_delete_session(session_id: str) -> Dict[str, Any]:
     delete_session(session_id)
+    asyncio.create_task(delete_session_from_files_api(session_id))
     return {"status": "deleted", "id": session_id}
 
 
@@ -429,6 +546,7 @@ async def api_import_chain(body: ImportChainRequest) -> Dict[str, Any]:
             environment_id=(body.environment_id or "").strip(),
             last_interaction_id=target_id,
         )
+        asyncio.create_task(_bg_push_session_sync(session["id"], api_key=body.api_key))
         return {
             "session": session,
             "imported_turns": 0,
@@ -500,6 +618,7 @@ async def api_import_chain(body: ImportChainRequest) -> Dict[str, Any]:
         )
 
     full_session = get_session(session["id"])
+    asyncio.create_task(_bg_push_session_sync(session["id"], api_key=body.api_key))
     return {
         "session": full_session,
         "imported_turns": len(chain),
@@ -723,6 +842,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         max_total_tokens=max_tokens,
         system_instruction=sys_inst,
     )
+    asyncio.create_task(_bg_push_session_sync(session_id, api_key=body.api_key))
 
     return {
         "session": get_session(session_id),
@@ -844,6 +964,7 @@ async def api_poll_turn(
                     environment_id=retry_env,
                     last_interaction_id=new_id if retry_status not in ("failed", "cancelled") else "",
                 )
+                asyncio.create_task(_bg_push_session_sync(session_id, api_key=api_key))
                 return {
                     "session": get_session(session_id),
                     "latest_interaction": retry_resp,
@@ -878,6 +999,11 @@ async def api_poll_turn(
         update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id="")
     elif returned_env_id:
         update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id=interaction_id)
+    else:
+        update_session(session_id, last_interaction_id=interaction_id)
+
+    if turn_status != "in_progress":
+        asyncio.create_task(_bg_push_session_sync(session_id, api_key=api_key))
 
     return {
         "session": get_session(session_id),

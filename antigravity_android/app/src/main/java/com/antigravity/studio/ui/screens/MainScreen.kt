@@ -180,6 +180,35 @@ fun MainScreen(viewModel: StudioViewModel) {
                         }
                     }
 
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.syncSessionsWithCloud(silent = false)
+                        },
+                        enabled = !uiState.isSyncing,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        if (uiState.isSyncing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(14.dp),
+                                strokeWidth = 2.dp,
+                                color = Emerald400
+                            )
+                        } else {
+                            Icon(
+                                Icons.Default.Refresh,
+                                contentDescription = null,
+                                tint = Emerald400,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            if (uiState.isSyncing) "Sincronizando Nuvem..." else "☁️ Sincronizar Nuvem (Files API)",
+                            fontSize = 12.sp,
+                            color = Emerald400
+                        )
+                    }
+
                     HorizontalDivider(color = Slate800)
 
                     Text(

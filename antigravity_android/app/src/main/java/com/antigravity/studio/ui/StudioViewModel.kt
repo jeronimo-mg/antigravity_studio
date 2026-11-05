@@ -36,6 +36,7 @@ data class StudioUiState(
     val backgroundMode: Boolean = true,
     val isSending: Boolean = false,
     val isImporting: Boolean = false,
+    val isSyncing: Boolean = false,
     val isUploading: Boolean = false,
     val isListingFiles: Boolean = false,
     val isDownloadingSnapshot: Boolean = false,
@@ -62,6 +63,9 @@ class StudioViewModel(
             val savedKey = repository.getApiKey()
             updateKeyState(savedKey)
             refreshSessions(selectFirstIfNone = true)
+            if (savedKey.isNotBlank()) {
+                syncSessionsWithCloud(silent = true)
+            }
         }
     }
 
@@ -88,6 +92,138 @@ class StudioViewModel(
             repository.setApiKey(newKey)
             updateKeyState(newKey)
             showStatus("Chave de API salva no banco SQLite local!")
+            if (newKey.trim().isNotBlank()) {
+                syncSessionsWithCloud(silent = true)
+            }
+        }
+    }
+
+    private fun pushSessionToCloudBg(sessionId: String) {
+        val key = _uiState.value.apiKey
+        if (key.isBlank() || sessionId.isBlank()) return
+        viewModelScope.launch {
+            try {
+                val sess = repository.getSession(sessionId) ?: return@launch
+                InteractionsClient.pushSessionToFilesApi(sess, key)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun syncSessionsWithCloud(silent: Boolean = false) {
+        val apiKey = _uiState.value.apiKey
+        if (apiKey.isBlank()) {
+            if (!silent) {
+                showError("Configure sua Gemini API Key para sincronizar na nuvem.")
+            }
+            return
+        }
+        if (_uiState.value.isSyncing) return
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isSyncing = true, errorMessage = if (silent) it.errorMessage else null) }
+            try {
+                val remoteItems = InteractionsClient.listSyncedSessionsFromFilesApi(apiKey)
+                val remoteById = remoteItems.associateBy { it.id }
+
+                var pulled = 0
+                var updatedCount = 0
+                var pushed = 0
+
+                // 1. PULL: aplica sessões da nuvem no banco local
+                for ((sid, rmeta) in remoteById) {
+                    val local = repository.getSession(sid)
+                    if (local == null) {
+                        repository.createSession(
+                            title = rmeta.title,
+                            mode = rmeta.mode,
+                            agentName = rmeta.agentName,
+                            modelName = rmeta.modelName,
+                            environmentId = rmeta.environmentId,
+                            lastInteractionId = rmeta.lastInteractionId,
+                            customId = sid,
+                            customUpdatedAt = rmeta.updatedAt
+                        )
+                        if (rmeta.lastInteractionId.isNotBlank()) {
+                            try {
+                                populateChainIntoSession(sid, rmeta.lastInteractionId, apiKey)
+                            } catch (_: Exception) {
+                            }
+                        }
+                        pulled++
+                    } else {
+                        val existingTurnIds = local.turns.map { it.interactionId }.toSet()
+                        val rLast = rmeta.lastInteractionId.trim()
+                        val lLast = local.lastInteractionId.trim()
+                        val rEnv = InteractionsClient.cleanEnvironmentId(rmeta.environmentId)
+                        val lEnv = InteractionsClient.cleanEnvironmentId(local.environmentId)
+
+                        if (rLast.isNotBlank() && ((rLast != lLast && rLast !in existingTurnIds) || local.turns.isEmpty())) {
+                            repository.updateSession(
+                                sessionId = sid,
+                                title = if (local.title in listOf("Nova Conversa Antigravity", "Nova Conversa")) rmeta.title else null,
+                                environmentId = rEnv.ifBlank { lEnv }.takeIf { it.isNotBlank() },
+                                lastInteractionId = rLast
+                            )
+                            try {
+                                populateChainIntoSession(sid, rLast, apiKey)
+                            } catch (_: Exception) {
+                            }
+                            updatedCount++
+                        } else if (rEnv.isNotBlank() && lEnv.isBlank()) {
+                            repository.updateSession(sessionId = sid, environmentId = rEnv)
+                            updatedCount++
+                        }
+                    }
+                }
+
+                // 2. PUSH: publica sessões locais que ainda não estão na nuvem ou têm lastInteractionId mais novo
+                val allLocal = repository.listSessions()
+                for (ls in allLocal) {
+                    val sid = ls.id
+                    val lLast = ls.lastInteractionId.trim()
+                    val lEnv = InteractionsClient.cleanEnvironmentId(ls.environmentId)
+                    if (lLast.isBlank() && lEnv.isBlank() && ls.turnCount == 0) continue
+
+                    val rmeta = remoteById[sid]
+                    val needsPush = rmeta == null ||
+                        (lLast.isNotBlank() && lLast != rmeta.lastInteractionId.trim()) ||
+                        (lEnv.isNotBlank() && lEnv != InteractionsClient.cleanEnvironmentId(rmeta.environmentId)) ||
+                        ls.title.trim().take(64) != rmeta.title.trim().take(64)
+
+                    if (needsPush) {
+                        val fullLocal = repository.getSession(sid) ?: ls
+                        if (InteractionsClient.pushSessionToFilesApi(fullLocal, apiKey)) {
+                            pushed++
+                        }
+                    }
+                }
+
+                val finalSessions = repository.listSessions()
+                val curActiveId = _uiState.value.activeSession?.id
+                val refreshedActive = curActiveId?.let { repository.getSession(it) }
+                    ?: finalSessions.firstOrNull()?.let { repository.getSession(it.id) }
+
+                _uiState.update {
+                    it.copy(
+                        isSyncing = false,
+                        sessions = finalSessions,
+                        activeSession = refreshedActive,
+                        statusMessage = if (!silent || pulled > 0 || updatedCount > 0) {
+                            "☁️ Nuvem sincronizada: +$pulled nova(s), $updatedCount atualizada(s), $pushed enviada(s)!"
+                        } else {
+                            it.statusMessage
+                        }
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isSyncing = false,
+                        errorMessage = if (!silent) (e.message ?: "Erro ao sincronizar na nuvem.") else it.errorMessage
+                    )
+                }
+            }
         }
     }
 
@@ -273,6 +409,7 @@ class StudioViewModel(
                         statusMessage = "${loaded?.turns?.size ?: 0} turno(s) carregado(s) na tela!"
                     )
                 }
+                pushSessionToCloudBg(current.id)
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(
@@ -330,6 +467,7 @@ class StudioViewModel(
                     activeSession = updated
                 )
             }
+            pushSessionToCloudBg(current.id)
             showStatus(
                 if (newLastId.isNotBlank() && newLastId !in existingIds && (updated?.turns?.isNotEmpty() == true)) {
                     "Conversa anterior (${updated?.turns?.size} turno(s)) carregada na tela!"
@@ -341,8 +479,17 @@ class StudioViewModel(
     }
 
     fun deleteSession(sessionId: String) {
+        val key = _uiState.value.apiKey
         viewModelScope.launch {
             repository.deleteSession(sessionId)
+            if (key.isNotBlank()) {
+                launch {
+                    try {
+                        InteractionsClient.deleteSessionFromFilesApi(sessionId, key)
+                    } catch (_: Exception) {
+                    }
+                }
+            }
             val remaining = repository.listSessions()
             val nextActive = if (remaining.isNotEmpty()) {
                 repository.getSession(remaining.first().id)
@@ -490,6 +637,7 @@ class StudioViewModel(
                     )
                 }
 
+                pushSessionToCloudBg(session.id)
                 checkAndStartPollingIfNeeded(updatedSession)
             } catch (e: Exception) {
                 _uiState.update {
@@ -630,6 +778,7 @@ class StudioViewModel(
                         activeSession = updated
                     )
                 }
+                pushSessionToCloudBg(session.id)
                 return
             } catch (_: Exception) {
             }
@@ -667,6 +816,9 @@ class StudioViewModel(
                 sessions = all,
                 activeSession = updated
             )
+        }
+        if (turnStatus != "in_progress") {
+            pushSessionToCloudBg(session.id)
         }
     }
 
@@ -736,6 +888,7 @@ class StudioViewModel(
                     statusMessage = "Conversa ramificada (Fork) com sucesso!"
                 )
             }
+            pushSessionToCloudBg(forked.id)
         }
     }
 
@@ -776,6 +929,7 @@ class StudioViewModel(
                             statusMessage = "Sessão vinculada ao ID $targetId!"
                         )
                     }
+                    pushSessionToCloudBg(created.id)
                     return@launch
                 }
 
@@ -847,6 +1001,7 @@ class StudioViewModel(
                         statusMessage = "${chain.size} turno(s) recuperado(s) com sucesso!"
                     )
                 }
+                pushSessionToCloudBg(created.id)
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(

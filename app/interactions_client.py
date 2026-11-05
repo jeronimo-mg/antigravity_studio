@@ -1603,3 +1603,259 @@ async def download_environment_snapshot(
     )
 
 
+# ==============================================================================
+# Sincronização na Nuvem via Gemini Files API (v1beta/files)
+# ==============================================================================
+
+FILES_UPLOAD_BASE_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+SYNC_DISPLAY_PREFIX = "AG_SYNC_V1|"
+
+
+def session_to_sync_file_name(session_id: str) -> str:
+    """Converte o session_id em um identificador válido para a Gemini Files API (files/ag-s-...)."""
+    clean_slug = re.sub(r"[^a-z0-9]+", "-", (session_id or "").lower()).strip("-")[:28]
+    if not clean_slug:
+        clean_slug = "default"
+    return f"files/ag-s-{clean_slug}"
+
+
+def encode_session_sync_display_name(session: Dict[str, Any]) -> str:
+    """Codifica os metadados essenciais da sessão no campo displayName (limite de 512 chars da Files API)."""
+    import json as _json
+
+    last_id = (session.get("last_interaction_id") or "").strip()
+    if not last_id and session.get("turns"):
+        for t in reversed(session["turns"]):
+            if t.get("status") not in ("failed", "cancelled") and t.get("interaction_id"):
+                last_id = str(t["interaction_id"]).strip()
+                break
+
+    env_id = clean_environment_id(session.get("environment_id") or "")
+    if not last_id and not env_id:
+        return ""
+
+    meta = {
+        "id": (session.get("id") or "").strip(),
+        "t": (session.get("title") or "Conversa Antigravity").strip()[:64],
+        "last": last_id,
+        "env": env_id,
+        "m": (session.get("mode") or "agent").strip(),
+        "ag": (session.get("agent_name") or "antigravity-preview-09-2026").strip(),
+        "md": (session.get("model_name") or "gemini-3.8-flash").strip(),
+        "u": (session.get("updated_at") or "").strip(),
+    }
+    return SYNC_DISPLAY_PREFIX + _json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+
+
+def decode_session_sync_display_name(display_name: str) -> Optional[Dict[str, Any]]:
+    """Decodifica os metadados da sessão a partir do displayName retornado por GET /v1beta/files."""
+    import json as _json
+
+    raw = (display_name or "").strip()
+    if not raw.startswith(SYNC_DISPLAY_PREFIX):
+        return None
+    payload_str = raw[len(SYNC_DISPLAY_PREFIX) :].strip()
+    try:
+        data = _json.loads(payload_str)
+        if not isinstance(data, dict) or not data.get("id"):
+            return None
+        return {
+            "id": str(data.get("id") or "").strip(),
+            "title": str(data.get("t") or "Conversa Antigravity").strip(),
+            "last_interaction_id": str(data.get("last") or "").strip(),
+            "environment_id": clean_environment_id(str(data.get("env") or "")),
+            "mode": str(data.get("m") or "agent").strip(),
+            "agent_name": str(data.get("ag") or "antigravity-preview-09-2026").strip(),
+            "model_name": str(data.get("md") or "gemini-3.8-flash").strip(),
+            "updated_at": str(data.get("u") or "").strip(),
+        }
+    except Exception:
+        return None
+
+
+async def delete_session_from_files_api(
+    session_id: str,
+    api_key: Optional[str] = None,
+) -> bool:
+    """Remove o ponteiro de sincronização da sessão na Gemini Files API."""
+    key = resolve_api_key(api_key)
+    if not key or not session_id:
+        return False
+    file_name = session_to_sync_file_name(session_id)
+    short_name = file_name.removeprefix("files/")
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            resp = await client.delete(
+                f"{FILES_BASE_URL}/{short_name}",
+                headers={"x-goog-api-key": key},
+            )
+            return resp.status_code < 400 or resp.status_code == 404
+        except Exception:
+            return False
+
+
+async def push_session_to_files_api(
+    session: Dict[str, Any],
+    api_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Publica/atualiza o ponteiro da sessão na Gemini Files API (v1beta/files) usando protocolo resumable.
+    O ponteiro guarda id, title, last_interaction_id, environment_id, mode, agent_name e model_name
+    diretamente em `displayName` para leitura instantânea via `GET /v1beta/files`.
+    """
+    import json as _json
+
+    key = resolve_api_key(api_key)
+    if not key or not session or not session.get("id"):
+        return None
+
+    display_name = encode_session_sync_display_name(session)
+    if not display_name:
+        return None
+
+    file_name = session_to_sync_file_name(session["id"])
+    short_name = file_name.removeprefix("files/")
+
+    body_bytes = _json.dumps(
+        {
+            "id": session.get("id"),
+            "title": session.get("title"),
+            "mode": session.get("mode"),
+            "agent_name": session.get("agent_name"),
+            "model_name": session.get("model_name"),
+            "environment_id": clean_environment_id(session.get("environment_id") or ""),
+            "last_interaction_id": session.get("last_interaction_id") or "",
+            "updated_at": session.get("updated_at") or "",
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # 1. Remove versão anterior se existir (para atualizar o displayName com o mesmo name)
+        try:
+            await client.delete(
+                f"{FILES_BASE_URL}/{short_name}",
+                headers={"x-goog-api-key": key},
+            )
+        except Exception:
+            pass
+
+        # 2. Inicia upload resumable na Gemini Files API
+        start_headers = {
+            "x-goog-api-key": key,
+            "Content-Type": "application/json",
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(len(body_bytes)),
+            "X-Goog-Upload-Header-Content-Type": "application/json",
+        }
+        meta_payload = {
+            "file": {
+                "name": file_name,
+                "display_name": display_name,
+                "mime_type": "application/json",
+            }
+        }
+        start_resp = await client.post(
+            FILES_UPLOAD_BASE_URL,
+            headers=start_headers,
+            json=meta_payload,
+        )
+        if start_resp.status_code >= 400:
+            # Caso o nome ainda esteja em exclusão ou conflito, cria sem name fixo (displayName identifica o id)
+            meta_payload_fallback = {
+                "file": {
+                    "display_name": display_name,
+                    "mime_type": "application/json",
+                }
+            }
+            start_resp = await client.post(
+                FILES_UPLOAD_BASE_URL,
+                headers=start_headers,
+                json=meta_payload_fallback,
+            )
+            if start_resp.status_code >= 400:
+                return None
+
+        upload_url = (
+            start_resp.headers.get("x-goog-upload-url")
+            or start_resp.headers.get("X-Goog-Upload-URL")
+            or ""
+        ).strip()
+        if not upload_url:
+            return None
+
+        # 3. Envia os bytes e finaliza
+        fin_headers = {
+            "Content-Length": str(len(body_bytes)),
+            "X-Goog-Upload-Offset": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+        }
+        fin_resp = await client.post(
+            upload_url,
+            headers=fin_headers,
+            content=body_bytes,
+        )
+        if fin_resp.status_code >= 400:
+            return None
+        try:
+            return fin_resp.json()
+        except Exception:
+            return {"status": "ok"}
+
+
+async def list_synced_sessions_from_files_api(
+    api_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Lista todas as sessões sincronizadas na Gemini Files API via `GET /v1beta/files`,
+    mesclando pelo `updated_at` mais recente caso haja múltiplos registros para o mesmo session_id.
+    """
+    key = resolve_api_key(api_key)
+    if not key:
+        raise ValueError("Configure sua GEMINI_API_KEY antes de sincronizar com a nuvem.")
+
+    by_session_id: Dict[str, Dict[str, Any]] = {}
+    page_token: Optional[str] = None
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for _ in range(5):
+            params: Dict[str, Any] = {"pageSize": 100}
+            if page_token:
+                params["pageToken"] = page_token
+            resp = await client.get(
+                FILES_BASE_URL,
+                headers={"x-goog-api-key": key},
+                params=params,
+            )
+            if resp.status_code >= 400:
+                raise ValueError(
+                    f"Erro ao listar arquivos na Gemini Files API (HTTP {resp.status_code}): {resp.text}"
+                )
+            data = resp.json() if resp.content else {}
+            files_list = data.get("files") or []
+            for fobj in files_list:
+                if not isinstance(fobj, dict):
+                    continue
+                dname = fobj.get("displayName") or fobj.get("display_name") or ""
+                parsed = decode_session_sync_display_name(dname)
+                if not parsed:
+                    continue
+                sid = parsed["id"]
+                f_time = str(fobj.get("updateTime") or fobj.get("createTime") or parsed.get("updated_at") or "")
+                parsed["_cloud_file_name"] = fobj.get("name") or ""
+                parsed["_cloud_time"] = f_time
+                existing = by_session_id.get(sid)
+                if not existing or (f_time and f_time > existing.get("_cloud_time", "")):
+                    by_session_id[sid] = parsed
+
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+
+    results = list(by_session_id.values())
+    results.sort(key=lambda x: x.get("updated_at") or x.get("_cloud_time") or "", reverse=True)
+    return results
+
+
+

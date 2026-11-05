@@ -119,23 +119,26 @@ def create_session(
     system_instruction: str = "",
     sources: Optional[List[Dict[str, Any]]] = None,
     uploaded_files: Optional[List[Dict[str, Any]]] = None,
+    session_id: Optional[str] = None,
+    updated_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    session_id = f"sess_{uuid.uuid4().hex[:12]}"
+    effective_id = (session_id or "").strip() or f"sess_{uuid.uuid4().hex[:12]}"
     ts = now_iso()
+    eff_updated = (updated_at or "").strip() or ts
     sources_data = json.dumps(sources or [])
     uploaded_files_data = json.dumps(uploaded_files or [])
     conn = get_connection()
     with conn:
         conn.execute(
             """
-            INSERT INTO sessions (
+            INSERT OR IGNORE INTO sessions (
                 id, title, mode, agent_name, model_name,
                 environment_id, last_interaction_id, max_total_tokens,
                 system_instruction, sources_json, uploaded_files_json, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                session_id,
+                effective_id,
                 title,
                 mode,
                 agent_name,
@@ -147,11 +150,11 @@ def create_session(
                 sources_data,
                 uploaded_files_data,
                 ts,
-                ts,
+                eff_updated,
             ),
         )
     conn.close()
-    return get_session(session_id)  # type: ignore
+    return get_session(effective_id)  # type: ignore
 
 
 def update_session(session_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
