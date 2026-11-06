@@ -110,6 +110,21 @@ class StudioViewModel(
         }
     }
 
+    private fun mergeUploadedFiles(
+        localUploads: List<UploadedFileRecord>,
+        remoteUploads: List<UploadedFileRecord>
+    ): List<UploadedFileRecord> {
+        val merged = mutableListOf<UploadedFileRecord>()
+        val seenPaths = mutableSetOf<String>()
+        for (uf in (localUploads + remoteUploads)) {
+            val tp = uf.targetPath.trim()
+            if (tp.isNotEmpty() && seenPaths.add(tp)) {
+                merged.add(uf)
+            }
+        }
+        return merged
+    }
+
     fun syncSessionsWithCloud(silent: Boolean = false) {
         val apiKey = _uiState.value.apiKey
         if (apiKey.isBlank()) {
@@ -141,6 +156,7 @@ class StudioViewModel(
                             modelName = rmeta.modelName,
                             environmentId = rmeta.environmentId,
                             lastInteractionId = rmeta.lastInteractionId,
+                            uploadedFiles = rmeta.uploadedFiles,
                             customId = sid,
                             customUpdatedAt = rmeta.updatedAt
                         )
@@ -157,39 +173,59 @@ class StudioViewModel(
                         val lLast = local.lastInteractionId.trim()
                         val rEnv = InteractionsClient.cleanEnvironmentId(rmeta.environmentId)
                         val lEnv = InteractionsClient.cleanEnvironmentId(local.environmentId)
+                        val mergedUploads = mergeUploadedFiles(local.uploadedFiles, rmeta.uploadedFiles)
+                        val uploadsChanged = mergedUploads.size != local.uploadedFiles.size
 
                         if (rLast.isNotBlank() && ((rLast != lLast && rLast !in existingTurnIds) || local.turns.isEmpty())) {
                             repository.updateSession(
                                 sessionId = sid,
                                 title = if (local.title in listOf("Nova Conversa Antigravity", "Nova Conversa")) rmeta.title else null,
                                 environmentId = rEnv.ifBlank { lEnv }.takeIf { it.isNotBlank() },
-                                lastInteractionId = rLast
+                                lastInteractionId = rLast,
+                                uploadedFiles = if (uploadsChanged) mergedUploads else null
                             )
                             try {
                                 populateChainIntoSession(sid, rLast, apiKey)
                             } catch (_: Exception) {
                             }
                             updatedCount++
-                        } else if (rEnv.isNotBlank() && lEnv.isBlank()) {
-                            repository.updateSession(sessionId = sid, environmentId = rEnv)
+                        } else if ((rEnv.isNotBlank() && lEnv.isBlank()) || uploadsChanged) {
+                            repository.updateSession(
+                                sessionId = sid,
+                                environmentId = rEnv.ifBlank { lEnv }.takeIf { it.isNotBlank() },
+                                uploadedFiles = if (uploadsChanged) mergedUploads else null
+                            )
                             updatedCount++
                         }
                     }
                 }
 
-                // 2. PUSH: publica sessões locais que ainda não estão na nuvem ou têm lastInteractionId mais novo
+                // 2. PUSH + AUTO-RENOVAÇÃO DE TTL (48h): envia sessões locais mais novas ou próximas de expirar
                 val allLocal = repository.listSessions()
                 for (ls in allLocal) {
                     val sid = ls.id
                     val lLast = ls.lastInteractionId.trim()
                     val lEnv = InteractionsClient.cleanEnvironmentId(ls.environmentId)
-                    if (lLast.isBlank() && lEnv.isBlank() && ls.turnCount == 0) continue
+                    val lTc = ls.turnCount.coerceAtLeast(0)
+                    if (lLast.isBlank() && lEnv.isBlank() && lTc == 0 && ls.uploadedFiles.isEmpty()) continue
 
                     val rmeta = remoteById[sid]
+                    val rTc = rmeta?.turnCount ?: 0
+                    // Trava anti-regressão: não sobrescreve se a nuvem tiver mais turnos que o local
+                    if (rmeta != null && rTc > lTc && rmeta.lastInteractionId.isNotBlank()) continue
+
+                    val rUploadPaths = rmeta?.uploadedFiles?.map { it.targetPath.trim() }?.toSet() ?: emptySet()
+                    val lUploadPaths = ls.uploadedFiles.map { it.targetPath.trim() }.filter { it.isNotEmpty() }.toSet()
+                    val hasNewUploads = (lUploadPaths - rUploadPaths).isNotEmpty()
+                    val needsTtlRenewal = rmeta?.needsTtlRenewal == true
+
                     val needsPush = rmeta == null ||
                         (lLast.isNotBlank() && lLast != rmeta.lastInteractionId.trim()) ||
                         (lEnv.isNotBlank() && lEnv != InteractionsClient.cleanEnvironmentId(rmeta.environmentId)) ||
-                        ls.title.trim().take(64) != rmeta.title.trim().take(64)
+                        ls.title.trim().take(56) != rmeta.title.trim().take(56) ||
+                        lTc > rTc ||
+                        hasNewUploads ||
+                        needsTtlRenewal
 
                     if (needsPush) {
                         val fullLocal = repository.getSession(sid) ?: ls
@@ -520,7 +556,49 @@ class StudioViewModel(
         viewModelScope.launch {
             _uiState.update { it.copy(isSending = true, errorMessage = null) }
             try {
-                val prevId = _uiState.value.effectivePreviousInteractionId
+                val customPrev = _uiState.value.customPrevInteractionId?.trim().orEmpty()
+                val initialLocalLast = session.lastInteractionId.trim()
+                val isManualFork = customPrev.isNotEmpty() && initialLocalLast.isNotEmpty() && customPrev != initialLocalLast
+
+                // PROTEÇÃO PRE-FLIGHT CONTRA DESSINCRONIZAÇÃO (SPLIT-BRAIN):
+                // Antes de enviar o prompt, verifica na Gemini Files API se outro dispositivo avançou esta sessão.
+                if (!isManualFork) {
+                    try {
+                        val cloudMeta = InteractionsClient.getSyncedSessionFromFilesApi(session.id, apiKey)
+                        if (cloudMeta != null) {
+                            val cLast = cloudMeta.lastInteractionId.trim()
+                            val cEnv = InteractionsClient.cleanEnvironmentId(cloudMeta.environmentId)
+                            val existingIds = session.turns.map { it.interactionId }.toSet()
+                            val mergedUploads = mergeUploadedFiles(session.uploadedFiles, cloudMeta.uploadedFiles)
+                            val uploadsChanged = mergedUploads.size != session.uploadedFiles.size
+
+                            if (cLast.isNotBlank() && cLast != session.lastInteractionId.trim() && cLast !in existingIds) {
+                                repository.updateSession(
+                                    sessionId = session.id,
+                                    environmentId = cEnv.ifBlank { session.environmentId }.takeIf { it.isNotBlank() },
+                                    lastInteractionId = cLast,
+                                    uploadedFiles = if (uploadsChanged) mergedUploads else null
+                                )
+                                val loaded = populateChainIntoSession(session.id, cLast, apiKey)
+                                if (loaded != null) {
+                                    session = loaded
+                                }
+                            } else if (uploadsChanged || (cEnv.isNotBlank() && session.environmentId.isBlank())) {
+                                val updated = repository.updateSession(
+                                    sessionId = session.id,
+                                    environmentId = cEnv.ifBlank { session.environmentId }.takeIf { it.isNotBlank() },
+                                    uploadedFiles = if (uploadsChanged) mergedUploads else null
+                                )
+                                if (updated != null) {
+                                    session = updated
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+
+                val prevId = if (isManualFork) customPrev else session.lastInteractionId.trim()
                 if (prevId.isNotBlank() && session.turns.isEmpty()) {
                     try {
                         val loaded = populateChainIntoSession(session.id, prevId, apiKey)
@@ -1034,6 +1112,7 @@ class StudioViewModel(
                         statusMessage = "Ambiente provisionado: $newEnvId"
                     )
                 }
+                pushSessionToCloudBg(session.id)
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(
@@ -1149,6 +1228,7 @@ class StudioViewModel(
                         statusMessage = "Upload concluído em ${record.targetPath} ($envId)!"
                     )
                 }
+                pushSessionToCloudBg(session.id)
                 loadEnvironmentFiles(path = "workspace")
             } catch (e: Exception) {
                 _uiState.update {
@@ -1237,6 +1317,7 @@ class StudioViewModel(
                         statusMessage = "Pasta '$folderName' extraída em ${record.targetPath}!"
                     )
                 }
+                pushSessionToCloudBg(session.id)
                 loadEnvironmentFiles(path = targetPath.trimStart('/').ifBlank { "workspace" })
             } catch (e: Exception) {
                 _uiState.update {

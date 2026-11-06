@@ -93,7 +93,8 @@ async function syncCloudSessions(silent = false) {
         `☁️ Sincronização na Nuvem (Gemini Files API) concluída!\n\n` +
         `• Novas sessões baixadas: ${data.pulled || 0}\n` +
         `• Sessões atualizadas da nuvem: ${data.updated || 0}\n` +
-        `• Sessões locais enviadas/atualizadas na nuvem: ${data.pushed || 0}`
+        `• Sessões locais enviadas/atualizadas na nuvem: ${data.pushed || 0}\n` +
+        `• Ponteiros com TTL de 48h renovado: ${data.renewed_ttl || 0}`
       );
     }
   } catch (err) {

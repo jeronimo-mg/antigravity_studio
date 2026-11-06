@@ -1436,7 +1436,10 @@ print(interaction.output_text)
         val agentName: String,
         val modelName: String,
         val updatedAt: String,
-        val cloudTime: String = ""
+        val turnCount: Int = 0,
+        val uploadedFiles: List<UploadedFileRecord> = emptyList(),
+        val cloudTime: String = "",
+        val needsTtlRenewal: Boolean = false
     )
 
     fun sessionToSyncFileName(sessionId: String): String {
@@ -1446,6 +1449,37 @@ print(interaction.output_text)
             .take(28)
             .ifBlank { "default" }
         return "files/ag-s-$cleanSlug"
+    }
+
+    fun computeSessionTurnCount(session: SessionModel): Int {
+        if (session.turns.isNotEmpty()) {
+            val valid = session.turns.count { it.status !in listOf("failed", "cancelled") }
+            return if (valid > 0) valid else session.turns.size
+        }
+        return session.turnCount.coerceAtLeast(0)
+    }
+
+    private fun checkFileNeedsTtlRenewal(fobj: JSONObject): Boolean {
+        val nowEpochSec = System.currentTimeMillis() / 1000L
+        val expStr = fobj.optString("expirationTime", fobj.optString("expiration_time", "")).trim()
+        if (expStr.isNotEmpty()) {
+            try {
+                val expSec = java.time.Instant.parse(expStr).epochSecond
+                val remainingHours = (expSec - nowEpochSec) / 3600.0
+                if (remainingHours < 30.0) return true
+            } catch (_: Exception) {
+            }
+        }
+        val createStr = fobj.optString("createTime", fobj.optString("create_time", "")).trim()
+        if (createStr.isNotEmpty()) {
+            try {
+                val createSec = java.time.Instant.parse(createStr).epochSecond
+                val ageHours = (nowEpochSec - createSec) / 3600.0
+                if (ageHours > 18.0) return true
+            } catch (_: Exception) {
+            }
+        }
+        return false
     }
 
     fun encodeSessionSyncDisplayName(session: SessionModel): String {
@@ -1459,23 +1493,49 @@ print(interaction.output_text)
             }
         }
         val envId = cleanEnvironmentId(session.environmentId)
-        if (lastId.isBlank() && envId.isBlank()) {
+        val tc = computeSessionTurnCount(session)
+        val uploadPaths = session.uploadedFiles
+            .map { it.targetPath.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+        if (lastId.isBlank() && envId.isBlank() && uploadPaths.isEmpty()) {
             return ""
         }
         val meta = JSONObject().apply {
             put("id", session.id.trim())
-            put("t", session.title.trim().take(64).ifBlank { "Conversa Antigravity" })
+            put("t", session.title.trim().take(56).ifBlank { "Conversa Antigravity" })
             put("last", lastId)
             put("env", envId)
             put("m", session.mode.trim().ifBlank { "agent" })
             put("ag", session.agentName.trim().ifBlank { "antigravity-preview-09-2026" })
             put("md", session.modelName.trim().ifBlank { "gemini-3.8-flash" })
             put("u", session.updatedAt.trim())
+            put("tc", tc)
+        }
+        if (uploadPaths.isNotEmpty()) {
+            val fitted = JSONArray()
+            for (p in uploadPaths.takeLast(8)) {
+                val testArr = JSONArray(fitted.toString()).apply { put(p) }
+                val testObj = JSONObject(meta.toString()).apply { put("up", testArr) }
+                if ((SYNC_DISPLAY_PREFIX + testObj.toString()).length <= 500) {
+                    fitted.put(p)
+                } else {
+                    break
+                }
+            }
+            if (fitted.length() > 0) {
+                meta.put("up", fitted)
+            }
         }
         return SYNC_DISPLAY_PREFIX + meta.toString()
     }
 
-    fun decodeSessionSyncDisplayName(displayName: String, cloudTime: String = ""): SyncedSessionMeta? {
+    fun decodeSessionSyncDisplayName(
+        displayName: String,
+        cloudTime: String = "",
+        needsTtlRenewal: Boolean = false
+    ): SyncedSessionMeta? {
         val raw = displayName.trim()
         if (!raw.startsWith(SYNC_DISPLAY_PREFIX)) return null
         val jsonStr = raw.removePrefix(SYNC_DISPLAY_PREFIX).trim()
@@ -1483,20 +1543,76 @@ print(interaction.output_text)
             val obj = JSONObject(jsonStr)
             val sid = obj.optString("id", "").trim()
             if (sid.isBlank()) return null
+            val envId = cleanEnvironmentId(obj.optString("env", ""))
+            val upArr = obj.optJSONArray("up")
+            val uploaded = mutableListOf<UploadedFileRecord>()
+            if (upArr != null) {
+                for (i in 0 until upArr.length()) {
+                    val p = upArr.optString(i, "").trim()
+                    if (p.isNotEmpty()) {
+                        val label = p.trimEnd('/').substringAfterLast('/').ifBlank { p }
+                        uploaded.add(
+                            UploadedFileRecord(
+                                label = label,
+                                summary = label,
+                                targetPath = p,
+                                environmentId = envId
+                            )
+                        )
+                    }
+                }
+            }
             SyncedSessionMeta(
                 id = sid,
                 title = obj.optString("t", "Conversa Antigravity").trim().ifBlank { "Conversa Antigravity" },
                 lastInteractionId = obj.optString("last", "").trim(),
-                environmentId = cleanEnvironmentId(obj.optString("env", "")),
+                environmentId = envId,
                 mode = obj.optString("m", "agent").trim().ifBlank { "agent" },
                 agentName = obj.optString("ag", "antigravity-preview-09-2026").trim().ifBlank { "antigravity-preview-09-2026" },
                 modelName = obj.optString("md", "gemini-3.8-flash").trim().ifBlank { "gemini-3.8-flash" },
                 updatedAt = obj.optString("u", "").trim(),
-                cloudTime = cloudTime
+                turnCount = obj.optInt("tc", 0).coerceAtLeast(0),
+                uploadedFiles = uploaded,
+                cloudTime = cloudTime,
+                needsTtlRenewal = needsTtlRenewal
             )
         } catch (_: Exception) {
             null
         }
+    }
+
+    suspend fun getSyncedSessionFromFilesApi(
+        sessionId: String,
+        apiKey: String
+    ): SyncedSessionMeta? = withContext(Dispatchers.IO) {
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isBlank() || sessionId.isBlank()) return@withContext null
+        val shortName = sessionToSyncFileName(sessionId).removePrefix("files/")
+        val req = Request.Builder()
+            .url("$FILES_BASE_URL/$shortName")
+            .get()
+            .addHeader("x-goog-api-key", cleanKey)
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (resp.code == 200) {
+                    val bodyStr = resp.body?.string() ?: "{}"
+                    val fobj = JSONObject(bodyStr)
+                    val dname = fobj.optString("displayName").ifBlank { fobj.optString("display_name") }
+                    val fTime = fobj.optString("updateTime").ifBlank { fobj.optString("createTime") }
+                    val parsed = decodeSessionSyncDisplayName(
+                        displayName = dname,
+                        cloudTime = fTime,
+                        needsTtlRenewal = checkFileNeedsTtlRenewal(fobj)
+                    )
+                    if (parsed != null && parsed.id == sessionId) {
+                        return@withContext parsed
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+        null
     }
 
     suspend fun deleteSessionFromFilesApi(sessionId: String, apiKey: String): Boolean = withContext(Dispatchers.IO) {
@@ -1517,14 +1633,53 @@ print(interaction.output_text)
         }
     }
 
-    suspend fun pushSessionToFilesApi(session: SessionModel, apiKey: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun pushSessionToFilesApi(
+        session: SessionModel,
+        apiKey: String,
+        force: Boolean = false
+    ): Boolean = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isBlank() || session.id.isBlank()) return@withContext false
-        val displayName = encodeSessionSyncDisplayName(session)
-        if (displayName.isBlank()) return@withContext false
-
         val fileName = sessionToSyncFileName(session.id)
         val shortName = fileName.removePrefix("files/")
+        val localTc = computeSessionTurnCount(session)
+        var effectiveSession = session
+
+        // 0. Verifica se a nuvem já tem turnCount maior (trava anti-regressão) e preserva uploadedFiles
+        try {
+            val checkReq = Request.Builder()
+                .url("$FILES_BASE_URL/$shortName")
+                .get()
+                .addHeader("x-goog-api-key", cleanKey)
+                .build()
+            httpClient.newCall(checkReq).execute().use { checkResp ->
+                if (checkResp.code == 200) {
+                    val fobj = JSONObject(checkResp.body?.string() ?: "{}")
+                    val dname = fobj.optString("displayName").ifBlank { fobj.optString("display_name") }
+                    val existingMeta = decodeSessionSyncDisplayName(dname)
+                    if (existingMeta != null && existingMeta.id == session.id) {
+                        if (!force && existingMeta.turnCount > localTc && existingMeta.lastInteractionId.isNotBlank()) {
+                            return@withContext false
+                        }
+                        if (existingMeta.uploadedFiles.isNotEmpty()) {
+                            val mergedUploads = session.uploadedFiles.toMutableList()
+                            val knownPaths = mergedUploads.map { it.targetPath.trim() }.toMutableSet()
+                            for (ru in existingMeta.uploadedFiles) {
+                                val rp = ru.targetPath.trim()
+                                if (rp.isNotEmpty() && knownPaths.add(rp)) {
+                                    mergedUploads.add(ru)
+                                }
+                            }
+                            effectiveSession = session.copy(uploadedFiles = mergedUploads)
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        val displayName = encodeSessionSyncDisplayName(effectiveSession)
+        if (displayName.isBlank()) return@withContext false
 
         // 1. Remove versão anterior se existir
         try {
@@ -1537,15 +1692,20 @@ print(interaction.output_text)
         } catch (_: Exception) {
         }
 
+        val uploadsArr = JSONArray().apply {
+            effectiveSession.uploadedFiles.forEach { put(it.toJson()) }
+        }
         val bodyBytes = JSONObject().apply {
-            put("id", session.id)
-            put("title", session.title)
-            put("mode", session.mode)
-            put("agent_name", session.agentName)
-            put("model_name", session.modelName)
-            put("environment_id", cleanEnvironmentId(session.environmentId))
-            put("last_interaction_id", session.lastInteractionId)
-            put("updated_at", session.updatedAt)
+            put("id", effectiveSession.id)
+            put("title", effectiveSession.title)
+            put("mode", effectiveSession.mode)
+            put("agent_name", effectiveSession.agentName)
+            put("model_name", effectiveSession.modelName)
+            put("environment_id", cleanEnvironmentId(effectiveSession.environmentId))
+            put("last_interaction_id", effectiveSession.lastInteractionId)
+            put("updated_at", effectiveSession.updatedAt)
+            put("turn_count", localTc)
+            put("uploaded_files", uploadsArr)
         }.toString().toByteArray(Charsets.UTF_8)
 
         fun buildStartRequest(includeFixedName: Boolean): Request {
@@ -1633,9 +1793,16 @@ print(interaction.output_text)
                         val dname = fobj.optString("displayName").ifBlank { fobj.optString("display_name") }
                         val fTime = fobj.optString("updateTime")
                             .ifBlank { fobj.optString("createTime") }
-                        val parsed = decodeSessionSyncDisplayName(dname, cloudTime = fTime) ?: continue
+                        val parsed = decodeSessionSyncDisplayName(
+                            displayName = dname,
+                            cloudTime = fTime,
+                            needsTtlRenewal = checkFileNeedsTtlRenewal(fobj)
+                        ) ?: continue
                         val existing = bySessionId[parsed.id]
-                        if (existing == null || (fTime.isNotBlank() && fTime > existing.cloudTime)) {
+                        if (existing == null ||
+                            parsed.turnCount > existing.turnCount ||
+                            (parsed.turnCount == existing.turnCount && fTime.isNotBlank() && fTime > existing.cloudTime)
+                        ) {
                             bySessionId[parsed.id] = parsed
                         }
                     }

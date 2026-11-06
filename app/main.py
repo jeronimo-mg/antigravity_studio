@@ -32,6 +32,7 @@ from .interactions_client import (
     extract_texts_from_interaction,
     format_session_as_markdown,
     get_interaction,
+    get_synced_session_from_files_api,
     list_environment_files,
     list_synced_sessions_from_files_api,
     pack_files_as_tar_gz,
@@ -404,6 +405,24 @@ async def api_load_chain_into_existing_session(
     }
 
 
+def _merge_uploaded_files(
+    local_uploads: Optional[List[Dict[str, Any]]],
+    remote_uploads: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Mescla listas de arquivos enviados (uploaded_files) sem duplicar target_path."""
+    merged: List[Dict[str, Any]] = []
+    seen_paths = set()
+    for item in list(local_uploads or []) + list(remote_uploads or []):
+        if not isinstance(item, dict):
+            continue
+        tp = str(item.get("target_path") or "").strip()
+        if not tp or tp in seen_paths:
+            continue
+        seen_paths.add(tp)
+        merged.append(item)
+    return merged
+
+
 async def _bg_push_session_sync(session_id: str, api_key: Optional[str] = None) -> None:
     """Envia silenciosamente o ponteiro da sessão para a Gemini Files API em background."""
     try:
@@ -419,9 +438,10 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
     """
     Sincronização bidirecional de sessões via Gemini Files API (v1beta/files):
     1. Pull: Busca todas as sessões publicadas na Files API (AG_SYNC_V1|...),
-       cria ou atualiza sessões locais e recupera os turnos automaticamente via last_interaction_id.
-    2. Push: Publica/atualiza na Files API todas as sessões locais que possuem
-       last_interaction_id ou environment_id e ainda não estão sincronizadas.
+       cria ou atualiza sessões locais, sincroniza uploaded_files e recupera os turnos
+       automaticamente via last_interaction_id respeitando a trava de turn_count.
+    2. Push + Auto-Renovação de TTL (48h): Publica/atualiza na Files API todas as sessões locais
+       que possuem estado mais recente (ou cujo ponteiro na nuvem está próximo de expirar as 48h).
     """
     try:
         remote_items = await list_synced_sessions_from_files_api(api_key=api_key)
@@ -431,6 +451,7 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
     pulled_count = 0
     updated_count = 0
     pushed_count = 0
+    renewed_ttl_count = 0
 
     remote_by_id: Dict[str, Dict[str, Any]] = {r["id"]: r for r in remote_items if r.get("id")}
 
@@ -443,6 +464,7 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
         r_agent = (rmeta.get("agent_name") or "antigravity-preview-09-2026").strip()
         r_model = (rmeta.get("model_name") or "gemini-3.8-flash").strip()
         r_updated = (rmeta.get("updated_at") or "").strip()
+        r_uploads = rmeta.get("uploaded_files") or []
 
         local_sess = get_session(sid)
         if not local_sess:
@@ -453,6 +475,7 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
                 model_name=r_model,
                 environment_id=r_env_id,
                 last_interaction_id=r_last_id,
+                uploaded_files=r_uploads,
                 session_id=sid,
                 updated_at=r_updated,
             )
@@ -467,49 +490,83 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
             existing_turn_ids = {t.get("interaction_id") for t in local_turns}
             local_last_id = (local_sess.get("last_interaction_id") or "").strip()
             local_env_id = clean_environment_id(local_sess.get("environment_id") or "")
+            local_uploads = local_sess.get("uploaded_files") or []
+            merged_uploads = _merge_uploaded_files(local_uploads, r_uploads)
+            uploads_changed = len(merged_uploads) != len(local_uploads)
 
-            if r_last_id and (r_last_id != local_last_id and r_last_id not in existing_turn_ids or not local_turns):
+            if r_last_id and ((r_last_id != local_last_id and r_last_id not in existing_turn_ids) or not local_turns):
                 update_session(
                     sid,
                     title=r_title if local_sess.get("title") in ("Nova Conversa Antigravity", "Nova Conversa") else None,
                     environment_id=r_env_id or local_env_id or None,
                     last_interaction_id=r_last_id,
+                    uploaded_files=merged_uploads if uploads_changed else None,
                 )
                 try:
                     await _load_chain_into_session(sid, r_last_id, api_key=api_key)
                 except Exception:
                     pass
                 updated_count += 1
-            elif r_env_id and not local_env_id:
-                update_session(sid, environment_id=r_env_id)
+            elif (r_env_id and not local_env_id) or uploads_changed:
+                update_session(
+                    sid,
+                    environment_id=r_env_id or local_env_id or None,
+                    uploaded_files=merged_uploads if uploads_changed else None,
+                )
                 updated_count += 1
 
-    # 2. PUSH: envia sessões locais que não estão na nuvem ou têm last_interaction_id mais novo
+    # 2. PUSH + AUTO-RENOVAÇÃO DE TTL (48h): envia sessões locais mais novas ou próximas de expirar
     all_local = list_sessions()
     for ls in all_local:
         sid = ls["id"]
         l_last = (ls.get("last_interaction_id") or "").strip()
         l_env = clean_environment_id(ls.get("environment_id") or "")
-        if not l_last and not l_env and not ls.get("turn_count"):
+        l_tc = int(ls.get("turn_count") or 0)
+        l_uploads = ls.get("uploaded_files") or []
+        if not l_last and not l_env and not l_tc and not l_uploads:
             continue
         rmeta = remote_by_id.get(sid)
+        r_tc = int((rmeta or {}).get("turn_count") or 0)
+        # Trava anti-regressão: não sobrescreve a nuvem se a nuvem tiver mais turnos que o local
+        if rmeta is not None and r_tc > l_tc and (rmeta.get("last_interaction_id") or "").strip():
+            continue
+
+        r_upload_paths = {
+            str(u.get("target_path") or "").strip()
+            for u in ((rmeta or {}).get("uploaded_files") or [])
+            if isinstance(u, dict)
+        }
+        l_upload_paths = {
+            str(u.get("target_path") or "").strip()
+            for u in l_uploads
+            if isinstance(u, dict) and u.get("target_path")
+        }
+        has_new_uploads = bool(l_upload_paths - r_upload_paths)
+        needs_ttl_renewal = bool((rmeta or {}).get("_needs_ttl_renewal"))
+
         needs_push = (
             rmeta is None
             or (l_last and l_last != (rmeta.get("last_interaction_id") or "").strip())
             or (l_env and l_env != clean_environment_id(rmeta.get("environment_id") or ""))
-            or (ls.get("title") or "").strip()[:64] != (rmeta.get("title") or "").strip()[:64]
+            or (ls.get("title") or "").strip()[:56] != (rmeta.get("title") or "").strip()[:56]
+            or l_tc > r_tc
+            or has_new_uploads
+            or needs_ttl_renewal
         )
         if needs_push:
             full_local = get_session(sid) or ls
             res = await push_session_to_files_api(full_local, api_key=api_key)
-            if res:
+            if res and res.get("status") != "skipped_outdated":
                 pushed_count += 1
+                if needs_ttl_renewal:
+                    renewed_ttl_count += 1
 
     final_sessions = list_sessions()
     return {
         "pulled": pulled_count,
         "updated": updated_count,
         "pushed": pushed_count,
+        "renewed_ttl": renewed_ttl_count,
         "remote_total": len(remote_by_id),
         "sessions": final_sessions,
     }
@@ -681,6 +738,8 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
     Envia uma nova mensagem na sessão encadeando automaticamente:
     - previous_interaction_id (da sessão ou sobrescrito manualmente)
     - environment (environment_id da sessão para manter o mesmo container Linux do Antigravity)
+    - Verificação Pre-Flight na Gemini Files API: antes de enviar, checa se outro dispositivo
+      avançou a conversa na nuvem e puxa os turnos/uploads faltantes automaticamente.
     """
     session = get_session(session_id)
     if not session:
@@ -690,17 +749,67 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
     if not prompt:
         raise HTTPException(status_code=400, detail="A mensagem não pode estar vazia.")
 
+    # PROTEÇÃO PRE-FLIGHT CONTRA DESSINCRONIZAÇÃO (SPLIT-BRAIN):
+    # Mesmo que a UI tenha preenchido previous_interaction_id com o last_interaction_id local,
+    # se não for um fork manual explícito para um turno antigo, consulta o ponteiro da sessão
+    # na Gemini Files API antes de enviar o prompt para puxar eventuais turnos feitos em outro PC/celular.
+    pre_flight_synced_turns = 0
+    requested_prev = (body.previous_interaction_id or "").strip()
+    initial_local_last = (session.get("last_interaction_id") or "").strip()
+    is_manual_fork = bool(requested_prev and initial_local_last and requested_prev != initial_local_last)
+
+    if not is_manual_fork:
+        try:
+            cloud_meta = await get_synced_session_from_files_api(session_id, api_key=body.api_key)
+            if cloud_meta:
+                c_last = (cloud_meta.get("last_interaction_id") or "").strip()
+                c_env = clean_environment_id(cloud_meta.get("environment_id") or "")
+                c_uploads = cloud_meta.get("uploaded_files") or []
+                local_turns_now = session.get("turns") or []
+                existing_ids = {t.get("interaction_id") for t in local_turns_now if t.get("interaction_id")}
+                local_last = (session.get("last_interaction_id") or "").strip()
+                local_uploads = session.get("uploaded_files") or []
+                merged_uploads = _merge_uploaded_files(local_uploads, c_uploads)
+                uploads_changed = len(merged_uploads) != len(local_uploads)
+
+                if c_last and (c_last != local_last and c_last not in existing_ids):
+                    update_session(
+                        session_id,
+                        environment_id=c_env or session.get("environment_id") or None,
+                        last_interaction_id=c_last,
+                        uploaded_files=merged_uploads if uploads_changed else None,
+                    )
+                    loaded = await _load_chain_into_session(session_id, c_last, api_key=body.api_key)
+                    if loaded:
+                        session = loaded
+                        pre_flight_synced_turns = max(
+                            0, len(session.get("turns") or []) - len(local_turns_now)
+                        )
+                    else:
+                        session = get_session(session_id) or session
+                elif uploads_changed or (c_env and not session.get("environment_id")):
+                    session = (
+                        update_session(
+                            session_id,
+                            environment_id=c_env or session.get("environment_id") or None,
+                            uploaded_files=merged_uploads if uploads_changed else None,
+                        )
+                        or session
+                    )
+        except Exception:
+            pass
+
     mode = body.mode or session.get("mode", "agent")
     agent_name = body.agent_name or session.get("agent_name", "antigravity-preview-09-2026")
     model_name = body.model_name or session.get("model_name", "gemini-3.8-flash")
     prev_id = (
-        body.previous_interaction_id
-        if body.previous_interaction_id is not None
-        else session.get("last_interaction_id", "")
+        requested_prev
+        if is_manual_fork
+        else (session.get("last_interaction_id") or requested_prev)
     )
     env_id = (
         body.environment_id
-        if body.environment_id is not None
+        if (body.environment_id and body.environment_id.strip())
         else session.get("environment_id", "")
     )
     max_tokens = (
@@ -848,6 +957,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         "session": get_session(session_id),
         "latest_interaction": interaction_resp,
         "sent_payload": payload,
+        "pre_flight_synced_turns": pre_flight_synced_turns,
     }
 
 
@@ -1359,6 +1469,7 @@ async def api_provision_session_environment(
         )
 
     updated_session = update_session(session_id, environment_id=new_env_id)
+    asyncio.create_task(_bg_push_session_sync(session_id, api_key=api_key))
     return {
         "environment": env_data,
         "environment_id": new_env_id,
@@ -1507,6 +1618,7 @@ async def api_upload_to_session_environment(
         environment_id=env_id,
         uploaded_files=current_uploaded,
     )
+    asyncio.create_task(_bg_push_session_sync(session_id, api_key=parsed["api_key"]))
 
     return {
         "status": "uploaded",

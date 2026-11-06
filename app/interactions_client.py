@@ -1619,6 +1619,53 @@ def session_to_sync_file_name(session_id: str) -> str:
     return f"files/ag-s-{clean_slug}"
 
 
+def _compute_session_turn_count(session: Dict[str, Any]) -> int:
+    """Retorna a quantidade de turnos válidos da sessão para trava anti-regressão."""
+    turns = session.get("turns")
+    if isinstance(turns, list) and turns:
+        valid = [
+            t
+            for t in turns
+            if isinstance(t, dict) and t.get("status") not in ("failed", "cancelled")
+        ]
+        return len(valid) if valid else len(turns)
+    try:
+        return int(session.get("turn_count") or 0)
+    except Exception:
+        return 0
+
+
+def _check_file_needs_ttl_renewal(fobj: Dict[str, Any]) -> bool:
+    """
+    A Gemini Files API expira arquivos após 48 horas.
+    Retorna True se faltarem menos de 30 horas para expirar (ou se o arquivo tiver mais de 18h),
+    permitindo renovar automaticamente o ciclo de 48h sempre que o usuário abrir/sincronizar o app.
+    """
+    from datetime import datetime, timezone
+
+    now_utc = datetime.now(timezone.utc)
+    exp_str = str(fobj.get("expirationTime") or fobj.get("expiration_time") or "").strip()
+    if exp_str:
+        try:
+            exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+            remaining_hours = (exp_dt - now_utc).total_seconds() / 3600.0
+            if remaining_hours < 30.0:
+                return True
+        except Exception:
+            pass
+
+    create_str = str(fobj.get("createTime") or fobj.get("create_time") or "").strip()
+    if create_str:
+        try:
+            create_dt = datetime.fromisoformat(create_str.replace("Z", "+00:00"))
+            age_hours = (now_utc - create_dt).total_seconds() / 3600.0
+            if age_hours > 18.0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def encode_session_sync_display_name(session: Dict[str, Any]) -> str:
     """Codifica os metadados essenciais da sessão no campo displayName (limite de 512 chars da Files API)."""
     import json as _json
@@ -1631,19 +1678,44 @@ def encode_session_sync_display_name(session: Dict[str, Any]) -> str:
                 break
 
     env_id = clean_environment_id(session.get("environment_id") or "")
-    if not last_id and not env_id:
+    turn_count = _compute_session_turn_count(session)
+    raw_uploads = session.get("uploaded_files") or []
+    upload_paths: List[str] = []
+    for uf in raw_uploads:
+        if isinstance(uf, dict):
+            tp = str(uf.get("target_path") or "").strip()
+            if tp and tp not in upload_paths:
+                upload_paths.append(tp)
+
+    if not last_id and not env_id and not upload_paths:
         return ""
 
-    meta = {
+    meta: Dict[str, Any] = {
         "id": (session.get("id") or "").strip(),
-        "t": (session.get("title") or "Conversa Antigravity").strip()[:64],
+        "t": (session.get("title") or "Conversa Antigravity").strip()[:56],
         "last": last_id,
         "env": env_id,
         "m": (session.get("mode") or "agent").strip(),
         "ag": (session.get("agent_name") or "antigravity-preview-09-2026").strip(),
         "md": (session.get("model_name") or "gemini-3.8-flash").strip(),
         "u": (session.get("updated_at") or "").strip(),
+        "tc": turn_count,
     }
+    if upload_paths:
+        fitted_paths: List[str] = []
+        for p in upload_paths[-8:]:
+            candidate = dict(meta)
+            candidate["up"] = fitted_paths + [p]
+            encoded_candidate = SYNC_DISPLAY_PREFIX + _json.dumps(
+                candidate, ensure_ascii=False, separators=(",", ":")
+            )
+            if len(encoded_candidate) <= 500:
+                fitted_paths.append(p)
+            else:
+                break
+        if fitted_paths:
+            meta["up"] = fitted_paths
+
     return SYNC_DISPLAY_PREFIX + _json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -1659,18 +1731,77 @@ def decode_session_sync_display_name(display_name: str) -> Optional[Dict[str, An
         data = _json.loads(payload_str)
         if not isinstance(data, dict) or not data.get("id"):
             return None
+        env_id = clean_environment_id(str(data.get("env") or ""))
+        raw_up = data.get("up")
+        uploaded_files: List[Dict[str, Any]] = []
+        if isinstance(raw_up, list):
+            for p in raw_up:
+                p_str = str(p or "").strip()
+                if p_str:
+                    label = p_str.rstrip("/").rsplit("/", 1)[-1] or p_str
+                    uploaded_files.append(
+                        {
+                            "label": label,
+                            "summary": label,
+                            "target_path": p_str,
+                            "environment_id": env_id,
+                        }
+                    )
+        try:
+            tc_val = int(data.get("tc") or 0)
+        except Exception:
+            tc_val = 0
         return {
             "id": str(data.get("id") or "").strip(),
             "title": str(data.get("t") or "Conversa Antigravity").strip(),
             "last_interaction_id": str(data.get("last") or "").strip(),
-            "environment_id": clean_environment_id(str(data.get("env") or "")),
+            "environment_id": env_id,
             "mode": str(data.get("m") or "agent").strip(),
             "agent_name": str(data.get("ag") or "antigravity-preview-09-2026").strip(),
             "model_name": str(data.get("md") or "gemini-3.8-flash").strip(),
             "updated_at": str(data.get("u") or "").strip(),
+            "turn_count": tc_val,
+            "uploaded_files": uploaded_files,
         }
     except Exception:
         return None
+
+
+async def get_synced_session_from_files_api(
+    session_id: str,
+    api_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Consulta rápida O(1) do ponteiro de uma sessão específica na Gemini Files API (`GET /v1beta/files/{short_name}`).
+    Usada na verificação Pre-Flight antes de enviar mensagens para evitar dessincronização ("split-brain").
+    """
+    key = resolve_api_key(api_key)
+    if not key or not session_id:
+        return None
+    file_name = session_to_sync_file_name(session_id)
+    short_name = file_name.removeprefix("files/")
+    async with httpx.AsyncClient(timeout=4.5) as client:
+        try:
+            resp = await client.get(
+                f"{FILES_BASE_URL}/{short_name}",
+                headers={"x-goog-api-key": key},
+            )
+            if resp.status_code == 200 and resp.content:
+                fobj = resp.json()
+                if isinstance(fobj, dict):
+                    dname = fobj.get("displayName") or fobj.get("display_name") or ""
+                    parsed = decode_session_sync_display_name(dname)
+                    if parsed and parsed.get("id") == session_id:
+                        parsed["_cloud_file_name"] = fobj.get("name") or ""
+                        parsed["_cloud_time"] = str(
+                            fobj.get("updateTime") or fobj.get("createTime") or parsed.get("updated_at") or ""
+                        )
+                        parsed["_expiration_time"] = str(fobj.get("expirationTime") or "")
+                        parsed["_needs_ttl_renewal"] = _check_file_needs_ttl_renewal(fobj)
+                        return parsed
+        except Exception:
+            pass
+    return None
 
 
 async def delete_session_from_files_api(
@@ -1697,11 +1828,12 @@ async def delete_session_from_files_api(
 async def push_session_to_files_api(
     session: Dict[str, Any],
     api_key: Optional[str] = None,
+    force: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Publica/atualiza o ponteiro da sessão na Gemini Files API (v1beta/files) usando protocolo resumable.
-    O ponteiro guarda id, title, last_interaction_id, environment_id, mode, agent_name e model_name
-    diretamente em `displayName` para leitura instantânea via `GET /v1beta/files`.
+    Inclui trava anti-regressão (`turn_count`): se a nuvem já possuir mais turnos concluídos para esta
+    mesma sessão e `force=False`, não sobrescreve o ponteiro mais recente da nuvem.
     """
     import json as _json
 
@@ -1709,34 +1841,81 @@ async def push_session_to_files_api(
     if not key or not session or not session.get("id"):
         return None
 
-    display_name = encode_session_sync_display_name(session)
-    if not display_name:
-        return None
-
     file_name = session_to_sync_file_name(session["id"])
     short_name = file_name.removeprefix("files/")
-
-    body_bytes = _json.dumps(
-        {
-            "id": session.get("id"),
-            "title": session.get("title"),
-            "mode": session.get("mode"),
-            "agent_name": session.get("agent_name"),
-            "model_name": session.get("model_name"),
-            "environment_id": clean_environment_id(session.get("environment_id") or ""),
-            "last_interaction_id": session.get("last_interaction_id") or "",
-            "updated_at": session.get("updated_at") or "",
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+    local_tc = _compute_session_turn_count(session)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # 1. Remove versão anterior se existir (para atualizar o displayName com o mesmo name)
+        # 0. Verifica se já existe versão na nuvem com turn_count maior (trava anti-regressão)
+        #    e preserva caminhos de uploaded_files já registrados na nuvem
         try:
-            await client.delete(
+            check_resp = await client.get(
                 f"{FILES_BASE_URL}/{short_name}",
                 headers={"x-goog-api-key": key},
             )
+            if check_resp.status_code == 200 and check_resp.content:
+                existing_fobj = check_resp.json()
+                if isinstance(existing_fobj, dict):
+                    existing_dname = (
+                        existing_fobj.get("displayName") or existing_fobj.get("display_name") or ""
+                    )
+                    existing_meta = decode_session_sync_display_name(existing_dname)
+                    if existing_meta and existing_meta.get("id") == session["id"]:
+                        remote_tc = int(existing_meta.get("turn_count") or 0)
+                        remote_last = (existing_meta.get("last_interaction_id") or "").strip()
+                        if not force and remote_tc > local_tc and remote_last:
+                            return {
+                                "status": "skipped_outdated",
+                                "remote_meta": existing_meta,
+                            }
+                        # Mescla uploaded_files da nuvem se não estiverem na sessão local
+                        remote_uploads = existing_meta.get("uploaded_files") or []
+                        if remote_uploads:
+                            merged_up = list(session.get("uploaded_files") or [])
+                            known_paths = {
+                                str(u.get("target_path") or "").strip()
+                                for u in merged_up
+                                if isinstance(u, dict)
+                            }
+                            for ru in remote_uploads:
+                                rp = str(ru.get("target_path") or "").strip()
+                                if rp and rp not in known_paths:
+                                    merged_up.append(ru)
+                                    known_paths.add(rp)
+                            session = dict(session)
+                            session["uploaded_files"] = merged_up
+        except Exception:
+            pass
+
+        display_name = encode_session_sync_display_name(session)
+        if not display_name:
+            return None
+
+        body_bytes = _json.dumps(
+            {
+                "id": session.get("id"),
+                "title": session.get("title"),
+                "mode": session.get("mode"),
+                "agent_name": session.get("agent_name"),
+                "model_name": session.get("model_name"),
+                "environment_id": clean_environment_id(session.get("environment_id") or ""),
+                "last_interaction_id": session.get("last_interaction_id") or "",
+                "updated_at": session.get("updated_at") or "",
+                "turn_count": local_tc,
+                "uploaded_files": session.get("uploaded_files") or [],
+                "sources": session.get("sources") or [],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        # 1. Remove versão anterior se existir (para atualizar o displayName com o mesmo name)
+        try:
+            del_resp = await client.delete(
+                f"{FILES_BASE_URL}/{short_name}",
+                headers={"x-goog-api-key": key},
+            )
+            if del_resp.status_code < 400:
+                await asyncio.sleep(0.2)
         except Exception:
             pass
 
@@ -1809,7 +1988,8 @@ async def list_synced_sessions_from_files_api(
 ) -> List[Dict[str, Any]]:
     """
     Lista todas as sessões sincronizadas na Gemini Files API via `GET /v1beta/files`,
-    mesclando pelo `updated_at` mais recente caso haja múltiplos registros para o mesmo session_id.
+    mesclando pelo maior `turn_count` / `updated_at` mais recente e sinalizando `_needs_ttl_renewal`
+    quando o arquivo estiver próximo de expirar o ciclo de 48h da Files API.
     """
     key = resolve_api_key(api_key)
     if not key:
@@ -1845,9 +2025,18 @@ async def list_synced_sessions_from_files_api(
                 f_time = str(fobj.get("updateTime") or fobj.get("createTime") or parsed.get("updated_at") or "")
                 parsed["_cloud_file_name"] = fobj.get("name") or ""
                 parsed["_cloud_time"] = f_time
+                parsed["_expiration_time"] = str(fobj.get("expirationTime") or "")
+                parsed["_needs_ttl_renewal"] = _check_file_needs_ttl_renewal(fobj)
                 existing = by_session_id.get(sid)
-                if not existing or (f_time and f_time > existing.get("_cloud_time", "")):
+                if not existing:
                     by_session_id[sid] = parsed
+                else:
+                    ex_tc = int(existing.get("turn_count") or 0)
+                    new_tc = int(parsed.get("turn_count") or 0)
+                    if new_tc > ex_tc or (
+                        new_tc == ex_tc and f_time and f_time > existing.get("_cloud_time", "")
+                    ):
+                        by_session_id[sid] = parsed
 
             page_token = data.get("nextPageToken")
             if not page_token:
@@ -1856,6 +2045,7 @@ async def list_synced_sessions_from_files_api(
     results = list(by_session_id.values())
     results.sort(key=lambda x: x.get("updated_at") or x.get("_cloud_time") or "", reverse=True)
     return results
+
 
 
 
