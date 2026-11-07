@@ -317,7 +317,7 @@ fun RunSettingsSheet(
             )
 
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.5-flash").forEach { preset ->
+                listOf("gemini-4-argon").forEach { preset ->
                     AssistChip(
                         onClick = { modelName = preset },
                         label = { Text(preset, fontSize = 11.sp) }

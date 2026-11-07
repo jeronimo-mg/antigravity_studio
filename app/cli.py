@@ -259,7 +259,7 @@ def run_cli_main(argv: Optional[List[str]] = None) -> int:
         default="local",
         help="Modo de execução: 'local' (Máquina Local) ou 'remote' (Sandbox Remoto Google).",
     )
-    parser.add_argument("--model", default="gemini-3.8-flash", help="Modelo Gemini a utilizar.")
+    parser.add_argument("--model", default="gemini-4-argon", help="Modelo Gemini a utilizar.")
     parser.add_argument("--session", default="", help="ID de sessão existente para continuar.")
     parser.add_argument("--api-key", default="", help="Chave GEMINI_API_KEY opcional.")
 
@@ -330,7 +330,7 @@ def run_cli_main(argv: Optional[List[str]] = None) -> int:
                 "  /ls              Lista os arquivos da pasta local atual\n"
                 "  /local           Alterna para Modo: Máquina Local\n"
                 "  /remote          Alterna para Modo: Sandbox Remoto (Google)\n"
-                "  /model <nome>    Altera o modelo (ex: gemini-3.8-flash, gemini-2.5-pro)\n"
+                "  /model <nome>    Altera o modelo (padrão: gemini-4-argon)\n"
                 "  /exit            Sai do CLI\n"
             )
             continue

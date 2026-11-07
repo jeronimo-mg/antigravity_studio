@@ -289,7 +289,7 @@ def build_create_payload(
     prompt: str,
     mode: str = "agent",
     agent_name: str = "antigravity-preview-09-2026",
-    model_name: str = "gemini-3.8-flash",
+    model_name: str = "gemini-4-argon",
     previous_interaction_id: Optional[str] = None,
     environment_id: Optional[str] = None,
     max_total_tokens: int = 0,
@@ -327,13 +327,13 @@ def build_create_payload(
         if "antigravity" in payload["agent"]:
             agent_cfg: Dict[str, Any] = {
                 "type": "antigravity",
-                "model": model_name or "gemini-3.8-flash",
+                "model": "gemini-4-argon",
             }
             if max_total_tokens and int(max_total_tokens) > 0:
                 agent_cfg["max_total_tokens"] = int(max_total_tokens)
             payload["agent_config"] = agent_cfg
     else:
-        payload["model"] = model_name or "gemini-3.8-flash"
+        payload["model"] = "gemini-4-argon"
         if system_instruction and system_instruction.strip():
             payload["system_instruction"] = system_instruction.strip()
 
@@ -1697,7 +1697,7 @@ def encode_session_sync_display_name(session: Dict[str, Any]) -> str:
         "env": env_id,
         "m": (session.get("mode") or "agent").strip(),
         "ag": (session.get("agent_name") or "antigravity-preview-09-2026").strip(),
-        "md": (session.get("model_name") or "gemini-3.8-flash").strip(),
+        "md": "gemini-4-argon",
         "u": (session.get("updated_at") or "").strip(),
         "tc": turn_count,
     }
@@ -1758,7 +1758,7 @@ def decode_session_sync_display_name(display_name: str) -> Optional[Dict[str, An
             "environment_id": env_id,
             "mode": str(data.get("m") or "agent").strip(),
             "agent_name": str(data.get("ag") or "antigravity-preview-09-2026").strip(),
-            "model_name": str(data.get("md") or "gemini-3.8-flash").strip(),
+            "model_name": "gemini-4-argon",
             "updated_at": str(data.get("u") or "").strip(),
             "turn_count": tc_val,
             "uploaded_files": uploaded_files,

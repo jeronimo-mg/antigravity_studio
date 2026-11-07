@@ -87,7 +87,7 @@ class SessionCreateRequest(BaseModel):
     execution_mode: Optional[str] = "remote"
     local_workdir: Optional[str] = ""
     agent_name: Optional[str] = "antigravity-preview-09-2026"
-    model_name: Optional[str] = "gemini-3.8-flash"
+    model_name: Optional[str] = "gemini-4-argon"
     environment_id: Optional[str] = ""
     last_interaction_id: Optional[str] = ""
     max_total_tokens: Optional[int] = 0
@@ -119,7 +119,7 @@ class ImportChainRequest(BaseModel):
     execution_mode: Optional[str] = "remote"
     local_workdir: Optional[str] = ""
     agent_name: Optional[str] = "antigravity-preview-09-2026"
-    model_name: Optional[str] = "gemini-3.8-flash"
+    model_name: Optional[str] = "gemini-4-argon"
     api_key: Optional[str] = None
     fetch_history: bool = True
 
@@ -178,7 +178,7 @@ def list_models_compat() -> Dict[str, Any]:
         "object": "list",
         "data": [
             {"id": "antigravity-preview-09-2026", "object": "model", "owned_by": "google"},
-            {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google"},
+            {"id": "gemini-4-argon", "object": "model", "owned_by": "google"},
         ],
     }
 
@@ -261,7 +261,7 @@ async def _load_chain_into_session(
         last_item.get("model")
         or (last_item.get("agent_config") or {}).get("model")
         or existing.get("model_name")
-        or "gemini-3.8-flash"
+        or "gemini-4-argon"
     )
     detected_mode = "agent" if last_item.get("agent") else (existing.get("mode") or "model")
     detected_env = clean_environment_id(
@@ -336,7 +336,7 @@ async def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
         execution_mode=eff_exec_mode,
         local_workdir=eff_workdir,
         agent_name=body.agent_name or "antigravity-preview-09-2026",
-        model_name=body.model_name or "gemini-3.8-flash",
+        model_name=body.model_name or "gemini-4-argon",
         environment_id=body.environment_id or (f"local:{eff_workdir}" if eff_exec_mode == "local" else ""),
         last_interaction_id=body.last_interaction_id or "",
         max_total_tokens=body.max_total_tokens or 0,
@@ -487,7 +487,7 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
         r_title = (rmeta.get("title") or "Conversa Antigravity").strip()
         r_mode = (rmeta.get("mode") or "agent").strip()
         r_agent = (rmeta.get("agent_name") or "antigravity-preview-09-2026").strip()
-        r_model = (rmeta.get("model_name") or "gemini-3.8-flash").strip()
+        r_model = (rmeta.get("model_name") or "gemini-4-argon").strip()
         r_updated = (rmeta.get("updated_at") or "").strip()
         r_uploads = rmeta.get("uploaded_files") or []
 
@@ -624,7 +624,7 @@ async def api_import_chain(body: ImportChainRequest) -> Dict[str, Any]:
             title=title,
             mode=body.mode or "agent",
             agent_name=body.agent_name or "antigravity-preview-09-2026",
-            model_name=body.model_name or "gemini-3.8-flash",
+            model_name=body.model_name or "gemini-4-argon",
             environment_id=(body.environment_id or "").strip(),
             last_interaction_id=target_id,
         )
@@ -652,7 +652,7 @@ async def api_import_chain(body: ImportChainRequest) -> Dict[str, Any]:
         last_item.get("model")
         or (last_item.get("agent_config") or {}).get("model")
         or body.model_name
-        or "gemini-3.8-flash"
+        or "gemini-4-argon"
     )
     detected_mode = "agent" if last_item.get("agent") else (body.mode or "model")
     detected_env = (
@@ -733,7 +733,7 @@ def api_fork_session(session_id: str, body: ForkSessionRequest) -> Dict[str, Any
         execution_mode=source.get("execution_mode", "remote"),
         local_workdir=source.get("local_workdir", ""),
         agent_name=source.get("agent_name", "antigravity-preview-09-2026"),
-        model_name=source.get("model_name", "gemini-3.8-flash"),
+        model_name=source.get("model_name", "gemini-4-argon"),
         environment_id=target_env,
         last_interaction_id=body.up_to_interaction_id,
         max_total_tokens=source.get("max_total_tokens", 0),
@@ -841,7 +841,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
 
     mode = body.mode or session.get("mode", "agent")
     agent_name = body.agent_name or session.get("agent_name", "antigravity-preview-09-2026")
-    model_name = body.model_name or session.get("model_name", "gemini-3.8-flash")
+    model_name = body.model_name or session.get("model_name", "gemini-4-argon")
     prev_id = (
         requested_prev
         if is_manual_fork
@@ -1284,7 +1284,7 @@ async def api_poll_turn(
             prompt=recovery_prompt,
             mode=session.get("mode", "agent"),
             agent_name=session.get("agent_name", "antigravity-preview-09-2026"),
-            model_name=session.get("model_name", "gemini-3.8-flash"),
+            model_name=session.get("model_name", "gemini-4-argon"),
             previous_interaction_id="",
             environment_id=clean_env,
             max_total_tokens=session.get("max_total_tokens", 0),

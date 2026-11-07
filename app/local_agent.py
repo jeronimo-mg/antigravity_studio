@@ -1012,34 +1012,41 @@ def build_local_agent_system_instruction(
     hw = get_local_machine_summary(abs_workdir)
 
     base_lines = [
-        "Você é o Agente Antigravity operando em Modo Máquina Local (CLI / Local OS Agent).",
-        "Você está executando DIRETAMENTE no computador do usuário com acesso real ao terminal/shell e ao sistema de arquivos da máquina.",
+        "[DIRETIVA CRÍTICA DE MODO MÁQUINA LOCAL — LEIA COM ATENÇÃO]",
+        "Você está operando em MODO MÁQUINA LOCAL conectado diretamente ao computador real do usuário através do ponte de execução local do Antigravity Studio.",
+        "ATENÇÃO: Suas ferramentas nativas internas (`default_api:*`) rodam em um container Ubuntu remoto na nuvem do Google e NÃO correspondem à máquina do usuário.",
+        "PORTANTO, É ESTRITAMENTE PROIBIDO chamar qualquer ferramenta interna `default_api:*` neste turno!",
         "",
-        "Dados Reais da Máquina Local Detectados Agora:",
-        f"- Sistema Operacional: {hw.get('os')} ({hw.get('architecture')})",
-        f"- Hostname / Usuário: {hw.get('hostname', 'N/A')} / {hw.get('username', 'N/A')}",
+        "Dados Reais da Máquina Local do Usuário Detectados Agora:",
+        f"- Sistema Operacional Real do Usuário: {hw.get('os')} ({hw.get('architecture')})",
+        f"- Hostname / Usuário Local: {hw.get('hostname', 'N/A')} / {hw.get('username', 'N/A')}",
         f"- Processador / Núcleos Lógicos: {hw.get('processor', 'N/A')} ({hw.get('cpu_cores_logical', 'N/A')} núcleos)",
-        f"- Memória RAM: {hw.get('ram_total_gb', 'N/A')} GB total ({hw.get('ram_available_gb', 'N/A')} GB disponível)",
+        f"- Memória RAM Local: {hw.get('ram_total_gb', 'N/A')} GB total ({hw.get('ram_available_gb', 'N/A')} GB disponível)",
         f"- Disco Local: {hw.get('disk_total_gb', 'N/A')} GB total ({hw.get('disk_free_gb', 'N/A')} GB livre)",
         f"- Python Local: {hw.get('Python')}",
         f"- Diretório de Trabalho Atual do Projeto (`local_workdir`): {abs_workdir}",
         "",
-        "Suas Capabilities e Supported Tools ativas na máquina local:",
-        "1. `execute_bash`: executa qualquer comando diretamente no terminal do sistema operacional local (Windows CMD/PowerShell ou Linux/macOS bash).",
-        "2. `view_file`: lê qualquer arquivo local do computador (caminhos relativos ao projeto ou caminhos absolutos em qualquer pasta do disco).",
-        "3. `write_to_file`: cria novos arquivos ou sobrescreve arquivos e pastas no disco local.",
-        "4. `replace_file_content`: edita blocos específicos de código/texto em arquivos locais.",
-        "5. `list_dir`: lista arquivos e subpastas de qualquer diretório local.",
-        "6. `find_by_name`: localiza arquivos por nome, padrão glob ou extensão.",
-        "7. `grep_search`: busca código, funções ou textos dentro dos arquivos locais.",
-        "8. `web_search` e `browse_url`: pesquisa na web e extrai conteúdo de páginas.",
+        "COMO EXECUTAR COMANDOS E ACESSAR ARQUIVOS NA MÁQUINA LOCAL DO USUÁRIO:",
+        "Sempre que você precisar executar um comando no terminal do usuário, ler/criar/editar arquivos locais, listar pastas ou inspecionar detalhes adicionais de hardware/SO/rede/processos, você DEVE responder APENAS com um ou mais blocos XML `<local_tool_call>` contendo um JSON válido no formato:",
+        "<local_tool_call>",
+        '{"name": "execute_bash", "arguments": {"command": "COMANDO_AQUI", "Cwd": "."}}',
+        "</local_tool_call>",
         "",
-        "Regras Fundamentais de Execução na Máquina Local:",
-        "- Você TEM acesso direto às configurações, hardware, sistema operacional, processos, rede e arquivos do computador do usuário através de `execute_bash`, `view_file` e `list_dir`.",
-        "- Quando o usuário perguntar sobre configurações do computador, hardware (CPU, GPU, placa de vídeo, memória RAM, discos, placa-mãe, bateria, drivers), rede, processos em execução, variáveis de ambiente ou softwares instalados, SEMPRE execute comandos via `execute_bash` (ex: no Windows use `Get-CimInstance Win32_Processor`, `Get-CimInstance Win32_VideoController`, `systeminfo`, `ipconfig`; no Linux use `lscpu`, `free -h`, `df -h`, `lspci`) para coletar os detalhes reais em tempo real.",
-        "- REGRA DE EFICIÊNCIA DE COTA (CRÍTICO): Sempre que precisar executar mais de um comando de diagnóstico ou inspeção (por exemplo, consultar CPU, memória RAM, discos, placa de vídeo e placa-mãe), COMBINE todos em UMA ÚNICA chamada `execute_bash` separados por `;` (no PowerShell) ou `&&` (no Linux/bash). Exemplo no Windows: `Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum; Get-CimInstance Win32_DiskDrive | Select-Object Model,Size; Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM; Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product`. Isso reduz o número de requisições à API em 80%.",
-        "- Comandos `sudo` e privilégios de administrador no Linux/macOS: Você PODE executar comandos `sudo` que exigem senha de forma 100% não-interativa usando a flag `-S` via pipe (`stdin`): `printf '%s\\n' 'SENHA_DO_USUARIO' | sudo -S -p '' <comando>` (por exemplo, se a senha for `1903`: `printf '%s\\n' '1903' | sudo -S -p '' apt-get update`). NUNCA diga que não consegue fornecer senhas para prompts `sudo`. Se um comando `sudo` falhar pedindo senha e você ainda não souber a senha, peça a senha ao usuário; assim que ele informar a senha no chat, execute imediatamente o comando usando `printf '%s\\n' 'SENHA' | sudo -S -p '' <comando>`.",
-        "- Caminhos relativos são resolvidos a partir de `local_workdir`, mas você também pode acessar qualquer caminho absoluto do computador quando solicitado pelo usuário.",
+        "Ferramentas Locais Disponíveis via `<local_tool_call>`:",
+        '1. `execute_bash`: `{"name": "execute_bash", "arguments": {"command": "...", "Cwd": "."}}` — executa comandos no terminal real do usuário (Windows PowerShell/CMD ou Linux/macOS bash).',
+        '2. `view_file`: `{"name": "view_file", "arguments": {"AbsolutePath": "...", "StartLine": 1, "EndLine": 200}}` — lê arquivos do disco local do usuário.',
+        '3. `write_to_file`: `{"name": "write_to_file", "arguments": {"TargetFile": "...", "CodeContent": "...", "Overwrite": true}}` — cria ou sobrescreve arquivos no disco local do usuário.',
+        '4. `replace_file_content`: `{"name": "replace_file_content", "arguments": {"TargetFile": "...", "TargetContent": "...", "ReplacementContent": "..."}}` — edita trechos de arquivos locais.',
+        '5. `list_dir`: `{"name": "list_dir", "arguments": {"DirectoryPath": "."}}` — lista arquivos e pastas locais do computador do usuário.',
+        '6. `find_by_name`: `{"name": "find_by_name", "arguments": {"SearchDirectory": ".", "Pattern": "*"}}` — busca arquivos locais por nome/glob.',
+        '7. `grep_search`: `{"name": "grep_search", "arguments": {"SearchPath": ".", "Query": "..."}}` — busca texto ou regex dentro dos arquivos locais.',
+        '8. `web_search` / `browse_url`: `{"name": "web_search", "arguments": {"queries": ["..."]}}` / `{"name": "browse_url", "arguments": {"urls": ["..."]}}`.',
+        "",
+        "REGRAS OBRIGATÓRIAS DO PROTOCOLO `<local_tool_call>`:",
+        "- NUNCA invoque `default_api:execute_bash`, `default_api:view_file` etc., pois eles olham para o container remoto e não para o PC do usuário.",
+        "- Quando precisar rodar uma ferramenta local, emita SOMENTE o(s) bloco(s) `<local_tool_call>{...}</local_tool_call>` e pare sua resposta imediatamente. O Antigravity Studio executará a ferramenta no PC do usuário e enviará o resultado real no próximo passo para você formular a resposta final.",
+        "- Quando o usuário perguntar sobre configurações do computador, hardware (CPU, GPU, placa de vídeo, memória RAM, discos, placa-mãe, bateria, drivers), rede, processos ou arquivos locais, emita um `<local_tool_call>` com `execute_bash` (ex: no Windows `Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM; Get-CimInstance Win32_DiskDrive | Select-Object Model,Size; Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product`; no Linux `lscpu && free -h && df -h && lspci`).",
+        "- Para comandos `sudo` no Linux que pedem senha, você PODE passar a senha de forma 100% não-interativa via pipe `stdin`: `printf '%s\\n' 'SENHA_DO_USUARIO' | sudo -S -p '' <comando>`. NUNCA diga que não consegue fornecer senhas para prompts `sudo`. Se um comando `sudo` falhar pedindo senha e você ainda não souber a senha, pergunte ao usuário; assim que ele informar a senha, execute imediatamente via `<local_tool_call>` com `printf '%s\\n' 'SENHA' | sudo -S -p '' <comando>`.",
     ]
     if custom_instruction and custom_instruction.strip():
         base_lines.extend(["", "Instruções Adicionais do Usuário:", custom_instruction.strip()])
@@ -1259,319 +1266,133 @@ def _format_turn_history_snippet(t: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _sanitize_contents_for_model_switch(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Remove campos específicos de pensamento (`thought` / `thoughtSignature`) ao alternar entre modelos em caso de HTTP 429."""
-    cleaned: List[Dict[str, Any]] = []
-    for msg in contents:
-        role = msg.get("role", "user")
-        raw_parts = msg.get("parts") or []
-        new_parts: List[Dict[str, Any]] = []
-        for p in raw_parts:
-            if not isinstance(p, dict):
-                continue
-            if p.get("thought"):
-                continue
-            if "functionCall" in p:
-                new_parts.append({"functionCall": p["functionCall"]})
-            elif "functionResponse" in p:
-                new_parts.append({"functionResponse": p["functionResponse"]})
-            elif "text" in p:
-                new_parts.append({"text": p["text"]})
-        if new_parts:
-            cleaned.append({"role": role, "parts": new_parts})
-    return cleaned
+_LOCAL_TOOL_CALL_RE = re.compile(
+    r"<local_tool_call>\s*(.*?)\s*</local_tool_call>",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
-def _synthesize_local_results_on_quota_exhausted(
-    accumulated_steps: List[Dict[str, Any]],
-    workdir: str,
-) -> Optional[str]:
+def _extract_local_tool_calls_from_text(text: str) -> Tuple[List[Dict[str, Any]], str]:
     """
-    Caso TODAS as cotas de modelos Gemini da chave gratuita atinjam HTTP 429 *após* as ferramentas
-    locais (`execute_bash`, `view_file`, `list_dir`, etc.) já terem sido executadas na máquina do usuário,
-    formata e entrega os resultados reais coletados para não perder a resposta do turno.
+    Extrai blocos `<local_tool_call>{...}</local_tool_call>` emitidos pelo `gemini-4-argon`
+    e retorna (lista_de_chamadas, texto_limpo_sem_os_blocos).
     """
-    tool_results = [
-        s for s in accumulated_steps
-        if isinstance(s, dict) and s.get("type") == "function_result"
-    ]
-    if not tool_results:
-        return None
+    if not text or "<local_tool_call>" not in text.lower():
+        return [], (text or "").strip()
 
-    hw = get_local_machine_summary(workdir)
-    lines: List[str] = [
-        "### 📊 Dados Coletados Diretamente da Sua Máquina Local",
-        "",
-        f"- **Sistema Operacional:** {hw.get('os')} ({hw.get('architecture')})",
-        f"- **Processador / Núcleos Lógicos:** {hw.get('processor', 'N/A')} ({hw.get('cpu_cores_logical', 'N/A')} núcleos)",
-        f"- **Memória RAM:** {hw.get('ram_total_gb', 'N/A')} GB total ({hw.get('ram_available_gb', 'N/A')} GB disponível)",
-        f"- **Armazenamento (Disco):** {hw.get('disk_total_gb', 'N/A')} GB total ({hw.get('disk_free_gb', 'N/A')} GB livre)",
-        f"- **Hostname / Usuário:** `{hw.get('hostname', 'N/A')}` / `{hw.get('username', 'N/A')}`",
-        "",
-        "#### 🔧 Saída dos Comandos Executados Localmente:",
-    ]
-    for idx, tr in enumerate(tool_results, 1):
-        tname = tr.get("name") or "tool"
-        res = tr.get("result") if isinstance(tr.get("result"), dict) else {"output": str(tr.get("result") or "")}
-        cmd = res.get("command") or res.get("path") or res.get("directory") or tname
-        stdout = (res.get("stdout") or res.get("content") or "").strip()
-        stderr = (res.get("stderr") or res.get("error") or "").strip()
-        if not stdout and not stderr and "children" in res:
-            stdout = json.dumps(res.get("children"), ensure_ascii=False, indent=2)
-        lines.append(f"\n**{idx}. `{cmd}`**")
-        if stdout:
-            lines.append(f"```text\n{stdout[:4000]}\n```")
-        if stderr:
-            lines.append(f"*(Aviso/Stderr)*:\n```text\n{stderr[:1500]}\n```")
+    calls: List[Dict[str, Any]] = []
+    for match in _LOCAL_TOOL_CALL_RE.finditer(text):
+        raw_inner = (match.group(1) or "").strip()
+        if raw_inner.startswith("```"):
+            raw_inner = re.sub(r"^```(?:json)?\s*", "", raw_inner, flags=re.IGNORECASE)
+            raw_inner = re.sub(r"\s*```$", "", raw_inner)
+        try:
+            parsed = json.loads(raw_inner)
+        except Exception:
+            continue
+        items = parsed if isinstance(parsed, list) else [parsed]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tname = (item.get("name") or item.get("tool") or "").strip()
+            targs = item.get("arguments") if isinstance(item.get("arguments"), dict) else (
+                item.get("args") if isinstance(item.get("args"), dict) else {}
+            )
+            if tname:
+                calls.append({
+                    "id": item.get("id") or f"call_{uuid.uuid4().hex[:10]}",
+                    "name": tname,
+                    "arguments": targs,
+                })
 
-    lines.append(
-        "\n> 💡 *Nota: Os comandos acima foram executados com sucesso na sua máquina local. "
-        "A síntese final de texto foi gerada localmente porque sua chave atingiu temporariamente o limite de requisições do Free Tier (HTTP 429) nos modelos consultados.*"
-    )
-    return "\n".join(lines)
+    cleaned_text = _LOCAL_TOOL_CALL_RE.sub("", text).strip()
+    return calls, cleaned_text
 
 
-async def _run_local_agent_via_generate_content(
-    prompt: str,
+async def _run_antigravity_agent_hop(
+    client: httpx.AsyncClient,
+    headers: Dict[str, str],
     model_name: str,
-    sys_instruction: str,
-    workdir: str,
-    history_turns: Optional[List[Dict[str, Any]]],
-    accumulated_steps: List[Dict[str, Any]],
-    accumulated_usage: Dict[str, int],
+    hop_input: str,
+    previous_interaction_id: Optional[str],
     run_state: Dict[str, Any],
-    on_progress: Optional[Callable[[List[Dict[str, Any]], str, str], None]],
-    max_iterations: int,
-    api_key: Optional[str],
-) -> Tuple[str, str]:
+) -> Dict[str, Any]:
     """
-    Executa o loop de Function Calling do Agente Local usando o endpoint padrão
-    `POST /v1beta/models/{model}:generateContent` com rotação automática entre modelos
-    em caso de HTTP 429 (cota excedida por modelo no Free Tier) ou HTTP 404/503.
+    Executa um turno (hop) usando SEMPRE o agente `antigravity-preview-09-2026`
+    com `agent_config.model = "gemini-4-argon"` (ou o modelo configurado em `agent_config.model`)
+    na Interactions API (`POST /v1beta/interactions`), realizando polling até concluir.
     """
-    effective_model = (model_name or "gemini-2.5-flash").strip()
-    if effective_model.startswith("models/"):
-        effective_model = effective_model.replace("models/", "", 1)
+    underlying_model = "gemini-4-argon"
+    payload: Dict[str, Any] = {
+        "agent": "antigravity-preview-09-2026",
+        "environment": "remote",
+        "agent_config": {
+            "type": "antigravity",
+            "model": underlying_model,
+        },
+        "input": hop_input,
+        "background": True,
+        "store": True,
+    }
+    if previous_interaction_id and previous_interaction_id.startswith("v1_"):
+        payload["previous_interaction_id"] = previous_interaction_id
 
-    contents: List[Dict[str, Any]] = []
-    for t in (history_turns or [])[-8:]:
-        if t.get("status") in ("completed", "incomplete"):
-            ut = (t.get("user_input_text") or "").strip()
-            ot = (t.get("output_text") or "").strip()
-            steps = t.get("steps") if isinstance(t.get("steps"), list) else []
-            if ut:
-                contents.append({"role": "user", "parts": [{"text": ut}]})
-            # Reconstruir chamadas e respostas de ferramentas do turno anterior para que o modelo
-            # saiba que tem acesso ativo às ferramentas locais
-            for s in steps:
-                if not isinstance(s, dict):
-                    continue
-                if s.get("type") == "function_call" and s.get("name"):
-                    contents.append({
-                        "role": "model",
-                        "parts": [{
-                            "functionCall": {
-                                "name": s["name"],
-                                "args": s.get("arguments") if isinstance(s.get("arguments"), dict) else {},
-                            }
-                        }],
-                    })
-                elif s.get("type") == "function_result" and s.get("name"):
-                    res_obj = s.get("result")
-                    if not isinstance(res_obj, dict):
-                        res_obj = {"output": str(res_obj or "")}
-                    contents.append({
-                        "role": "user",
-                        "parts": [{
-                            "functionResponse": {
-                                "name": s["name"],
-                                "response": res_obj,
-                            }
-                        }],
-                    })
-            if ot:
-                contents.append({"role": "model", "parts": [{"text": ot}]})
+    resp = await client.post(INTERACTIONS_BASE_URL, json=payload, headers=headers)
+    if resp.status_code in (400, 404) and payload.get("previous_interaction_id"):
+        payload.pop("previous_interaction_id", None)
+        resp = await client.post(INTERACTIONS_BASE_URL, json=payload, headers=headers)
 
-    contents.append({"role": "user", "parts": [{"text": prompt}]})
-    tools_payload = get_generate_content_tools()
-    headers = build_headers(api_key)
-    final_texts: List[str] = []
+    if resp.status_code >= 400:
+        raise ValueError(
+            f"Erro na Interactions API ({underlying_model}, HTTP {resp.status_code}): {resp.text}"
+        )
 
-    # Modelos internos exclusivos do agente remoto não existem no endpoint :generateContent público
-    internal_aliases = {"gemini-4-argon", "gemini-3.8-flash", "antigravity-preview-09-2026"}
-    fallback_models: List[str] = []
-    if effective_model and effective_model not in internal_aliases:
-        fallback_models.append(effective_model)
-    for candidate in (
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-3-flash-preview",
-        "gemini-2.5-pro",
-        "gemini-1.5-flash",
-    ):
-        if candidate not in fallback_models:
-            fallback_models.append(candidate)
+    data = resp.json()
+    interaction_id = data.get("id")
+    status = data.get("status", "")
 
-    active_model = fallback_models[0]
-    exhausted_models: set = set()
+    poll_count = 0
+    while status == "in_progress" and interaction_id and poll_count < 150:
+        if run_state.get("cancelled"):
+            try:
+                await client.post(f"{INTERACTIONS_BASE_URL}/{interaction_id}/cancel", headers=headers)
+            except Exception:
+                pass
+            data["status"] = "cancelled"
+            return data
+        await asyncio.sleep(1.5)
+        poll_count += 1
+        poll_resp = await client.get(f"{INTERACTIONS_BASE_URL}/{interaction_id}", headers=headers)
+        if poll_resp.status_code < 400:
+            data = poll_resp.json()
+            status = data.get("status", "")
+        else:
+            break
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        for iteration in range(max_iterations):
-            if run_state.get("cancelled"):
-                return "\n\n".join(final_texts).strip(), "cancelled"
-
-            # Ordena modelos priorizando o active_model seguido dos demais que ainda não falharam com 404/429
-            models_to_try = [active_model] + [m for m in fallback_models if m != active_model]
-            avail_models = [m for m in models_to_try if m not in exhausted_models] or models_to_try
-
-            resp = None
-            switched_model = False
-            for m_idx, m_try in enumerate(avail_models):
-                cur_contents = _sanitize_contents_for_model_switch(contents) if (m_try != active_model or switched_model) else contents
-                req_body: Dict[str, Any] = {
-                    "contents": cur_contents,
-                    "tools": tools_payload,
-                    "systemInstruction": {"parts": [{"text": sys_instruction}]},
-                }
-                url = f"{GENERATE_CONTENT_BASE_URL}/{m_try}:generateContent"
-                resp = await client.post(url, json=req_body, headers=headers)
-                if resp.status_code < 400:
-                    if m_try != active_model:
-                        contents = cur_contents
-                    active_model = m_try
-                    break
-                if resp.status_code in (400, 404, 429, 500, 502, 503, 504):
-                    if resp.status_code in (404, 429):
-                        exhausted_models.add(m_try)
-                    switched_model = True
-                    if m_idx < len(avail_models) - 1:
-                        continue
-
-            if resp is None or resp.status_code >= 400:
-                # Se já executamos ferramentas locais neste turno e todos os modelos retornaram 429,
-                # entregamos os resultados coletados localmente sem perder a resposta!
-                synthesized = _synthesize_local_results_on_quota_exhausted(accumulated_steps, workdir)
-                if synthesized:
-                    accumulated_steps.append({
-                        "type": "model_output",
-                        "content": [{"type": "text", "text": synthesized}],
-                    })
-                    if on_progress:
-                        on_progress(accumulated_steps, synthesized, "completed")
-                    return synthesized, "completed"
-                err_txt = resp.text if resp is not None else "Sem resposta HTTP"
-                code = resp.status_code if resp is not None else 500
-                raise ValueError(f"Erro na API Gemini ({active_model}, HTTP {code}): {err_txt}")
-
-            data = resp.json()
-            u_meta = data.get("usageMetadata") or {}
-            if u_meta:
-                accumulated_usage["total_tokens"] = accumulated_usage.get("total_tokens", 0) + int(u_meta.get("totalTokenCount", 0))
-                accumulated_usage["total_input_tokens"] = accumulated_usage.get("total_input_tokens", 0) + int(u_meta.get("promptTokenCount", 0))
-                accumulated_usage["total_output_tokens"] = accumulated_usage.get("total_output_tokens", 0) + int(u_meta.get("candidatesTokenCount", 0))
-
-            candidates = data.get("candidates") or []
-            if not candidates:
-                break
-            cand_content = (candidates[0].get("content") or {})
-            parts = cand_content.get("parts") or []
-            contents.append({"role": "model", "parts": parts})
-
-            func_calls: List[Dict[str, Any]] = []
-            step_texts: List[str] = []
-
-            for p in parts:
-                if not isinstance(p, dict):
-                    continue
-                if p.get("thought") and p.get("text"):
-                    accumulated_steps.append({
-                        "type": "thought",
-                        "content": [{"type": "text", "text": p["text"]}],
-                    })
-                elif "functionCall" in p:
-                    fc = p["functionCall"]
-                    call_id = fc.get("id") or f"call_{uuid.uuid4().hex[:10]}"
-                    fc_name = fc.get("name") or ""
-                    fc_args = fc.get("args") if isinstance(fc.get("args"), dict) else {}
-                    func_calls.append({"id": call_id, "name": fc_name, "arguments": fc_args})
-                    accumulated_steps.append({
-                        "type": "function_call",
-                        "id": call_id,
-                        "name": fc_name,
-                        "arguments": fc_args,
-                    })
-                elif p.get("text"):
-                    step_texts.append(p["text"])
-
-            if step_texts:
-                joined_t = "\n".join(step_texts).strip()
-                if joined_t:
-                    final_texts = [joined_t]
-                    accumulated_steps.append({
-                        "type": "model_output",
-                        "content": [{"type": "text", "text": joined_t}],
-                    })
-
-            if on_progress:
-                on_progress(accumulated_steps, "\n\n".join(final_texts).strip(), "in_progress")
-
-            if not func_calls:
-                break
-
-            response_parts: List[Dict[str, Any]] = []
-            for fc in func_calls:
-                if run_state.get("cancelled"):
-                    return "\n\n".join(final_texts).strip(), "cancelled"
-                tool_res, is_err = await execute_local_tool_call(
-                    tool_name=fc["name"],
-                    arguments=fc["arguments"],
-                    workdir=workdir,
-                )
-                accumulated_steps.append({
-                    "type": "function_result",
-                    "call_id": fc["id"],
-                    "name": fc["name"],
-                    "result": tool_res,
-                    "is_error": is_err,
-                })
-                response_parts.append({
-                    "functionResponse": {
-                        "name": fc["name"],
-                        "response": tool_res,
-                    }
-                })
-                if on_progress:
-                    on_progress(accumulated_steps, "\n\n".join(final_texts).strip(), "in_progress")
-
-            contents.append({"role": "user", "parts": response_parts})
-
-    return "\n\n".join(final_texts).strip(), "completed"
+    return data
 
 
 async def run_local_agent_turn(
     prompt: str,
     workdir: str,
-    model_name: str = "gemini-3.8-flash",
+    model_name: str = "gemini-4-argon",
     previous_interaction_id: Optional[str] = None,
     system_instruction: Optional[str] = None,
     history_turns: Optional[List[Dict[str, Any]]] = None,
     api_key: Optional[str] = None,
-    max_iterations: int = 25,
+    max_iterations: int = 12,
     interaction_id_override: Optional[str] = None,
     on_progress: Optional[Callable[[List[Dict[str, Any]], str, str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Executa um turno completo do Agente Local na máquina do usuário:
-    - Tenta primeiramente via Interactions API (`POST /v1beta/interactions`) com `model`,
-      `previous_interaction_id` (se for um ID válido da Interactions API `v1_...`),
-      `system_instruction` e as ferramentas locais (`execute_bash`, `view_file`, `write_to_file`,
-      `replace_file_content`, `list_dir`, `find_by_name`, `grep_search`, `web_search`, `browse_url`).
-    - A cada `function_call` retornada pelo modelo, executa a ferramenta localmente no disco/terminal
-      do usuário (`workdir`) e devolve `function_result` para a API até concluir a resposta.
-    - Caso a Interactions API retorne erro para o modelo ou o `previous_interaction_id` seja local,
-      faz fallback transparente para `generateContent` mantendo todo o histórico e ferramentas.
+    - Usa SEMPRE o modelo subjacente `gemini-4-argon` (`agent_config.model`) através do agente
+      `antigravity-preview-09-2026` na Interactions API (`POST /v1beta/interactions`).
+    - Injeta as informações reais da máquina local do usuário e o protocolo `<local_tool_call>`
+      para que todas as ferramentas (`execute_bash`, `view_file`, `write_to_file`,
+      `replace_file_content`, `list_dir`, `find_by_name`, `grep_search`, `web_search`, `browse_url`)
+      sejam executadas diretamente no computador do usuário (`workdir`) e seus resultados reais
+      sejam devolvidos ao `gemini-4-argon` até concluir a resposta final.
     """
     abs_workdir = resolve_local_path(".", workdir or get_default_local_workdir())
     os.makedirs(abs_workdir, exist_ok=True)
@@ -1612,8 +1433,7 @@ async def run_local_agent_turn(
             except Exception:
                 pass
 
-    # Verifica se previous_interaction_id é um ID remoto da Interactions API (ex: v1_...)
-    # ou se podemos resolver um ID local_... para o _api_interaction_id (v1_...) correspondente
+    # Resolve previous_interaction_id para o ID real `v1_...` da Interactions API se disponível
     clean_prev = (previous_interaction_id or "").strip()
     if clean_prev.startswith("local_") and history_turns:
         for t in reversed(history_turns):
@@ -1624,7 +1444,7 @@ async def run_local_agent_turn(
                 break
     can_chain_prev_id = clean_prev.startswith("v1_")
 
-    effective_prompt = prompt
+    history_block = ""
     if not can_chain_prev_id and history_turns:
         hist_snippets: List[str] = []
         for t in history_turns[-6:]:
@@ -1633,164 +1453,160 @@ async def run_local_agent_turn(
                 if snippet.strip():
                     hist_snippets.append(snippet)
         if hist_snippets:
-            effective_prompt = (
-                "[HISTÓRICO DE TURNOS E FERRAMENTAS EXECUTADAS NA SESSÃO LOCAL]:\n"
+            history_block = (
+                "\n\n[HISTÓRICO DE TURNOS E FERRAMENTAS EXECUTADAS NA SESSÃO LOCAL]:\n"
                 + "\n---\n".join(hist_snippets)
-                + "\n\n[LEMBRETE]: Você está no MODO MÁQUINA LOCAL com acesso total às ferramentas `execute_bash`, `view_file`, `write_to_file`, `replace_file_content`, `list_dir`, `find_by_name` e `grep_search` para inspecionar o computador, hardware, SO e arquivos do usuário.\n"
-                + f"\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
             )
 
-    tools_decl = get_interactions_api_tools()
+    initial_hop_input = (
+        f"{sys_inst}"
+        f"{history_block}\n\n"
+        f"[PEDIDO ATUAL DO USUÁRIO NA MÁQUINA LOCAL]:\n{prompt}"
+    )
+
     headers = build_headers(api_key)
-    internal_aliases = {"gemini-4-argon", "gemini-3.8-flash", "antigravity-preview-09-2026"}
-    clean_model_name = (model_name or "gemini-2.5-flash").strip()
-    used_fallback = clean_model_name in internal_aliases
+    underlying_model = "gemini-4-argon"
 
     try:
-        if not used_fallback:
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                current_input: Any = effective_prompt
-                current_prev_id: Optional[str] = clean_prev if can_chain_prev_id else None
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            current_hop_input = initial_hop_input
+            current_prev_id: Optional[str] = clean_prev if can_chain_prev_id else None
 
-                for hop in range(max_iterations):
+            for hop in range(max_iterations):
+                if run_state.get("cancelled"):
+                    final_status = "cancelled"
+                    break
+
+                hop_data = await _run_antigravity_agent_hop(
+                    client=client,
+                    headers=headers,
+                    model_name=underlying_model,
+                    hop_input=current_hop_input,
+                    previous_interaction_id=current_prev_id,
+                    run_state=run_state,
+                )
+
+                if hop_data.get("id"):
+                    final_api_id = str(hop_data["id"])
+                    current_prev_id = final_api_id
+
+                _sum_usage_dicts(accumulated_usage, hop_data.get("usage") or {})
+
+                hop_steps = hop_data.get("steps") or []
+                hop_text_candidates: List[str] = []
+                for s in hop_steps:
+                    if not isinstance(s, dict):
+                        continue
+                    stype = s.get("type", "")
+                    if stype == "user_input":
+                        continue
+                    if stype == "thought":
+                        accumulated_steps.append(s)
+                    elif stype == "model_output":
+                        txts = [
+                            c.get("text", "")
+                            for c in (s.get("content") or [])
+                            if isinstance(c, dict) and c.get("type") == "text" and c.get("text")
+                        ]
+                        if txts:
+                            hop_text_candidates.append("\n\n".join(txts).strip())
+
+                raw_hop_output = (
+                    hop_text_candidates[-1]
+                    if hop_text_candidates
+                    else (hop_data.get("output_text") or "").strip()
+                )
+                if not raw_hop_output:
+                    outputs_arr = hop_data.get("outputs") or []
+                    out_txts = [
+                        o.get("text", "")
+                        for o in outputs_arr
+                        if isinstance(o, dict) and o.get("type") == "text" and o.get("text")
+                    ]
+                    if out_txts:
+                        raw_hop_output = "\n\n".join(out_txts).strip()
+
+                local_calls, cleaned_output = _extract_local_tool_calls_from_text(raw_hop_output)
+
+                # Caso o modelo tenha chamado por engano alguma tool interna no 1º hop em vez de <local_tool_call>,
+                # interceptamos os argumentos dessas function_calls e as executamos na máquina local do usuário!
+                if not local_calls and hop == 0:
+                    internal_fcs = _extract_function_calls_from_steps(hop_steps)
+                    if internal_fcs:
+                        local_calls = internal_fcs
+
+                if not local_calls:
+                    final_output_text = cleaned_output or raw_hop_output
+                    if final_output_text:
+                        accumulated_steps.append({
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": final_output_text}],
+                        })
+                    final_status = hop_data.get("status") or "completed"
+                    if final_status in ("requires_action", "in_progress"):
+                        final_status = "completed"
+                    _notify(accumulated_steps, final_output_text, final_status)
+                    break
+
+                if cleaned_output:
+                    accumulated_steps.append({
+                        "type": "thought",
+                        "content": [{"type": "text", "text": cleaned_output}],
+                    })
+
+                tool_results_feedback: List[str] = []
+                for fc in local_calls:
                     if run_state.get("cancelled"):
                         final_status = "cancelled"
                         break
-
-                    hop_payload: Dict[str, Any] = {
-                        "model": clean_model_name,
-                        "input": current_input,
-                        "system_instruction": sys_inst,
-                        "tools": tools_decl,
-                        "store": True,
-                    }
-                    if current_prev_id:
-                        hop_payload["previous_interaction_id"] = current_prev_id
-
-                    resp = await client.post(
-                        INTERACTIONS_BASE_URL,
-                        json=hop_payload,
-                        headers=headers,
-                    )
-
-                    # Se previous_interaction_id expirou ou era de um agente remoto incompatível com model+tools,
-                    # tenta novamente sem previous_interaction_id injetando o histórico com ferramentas
-                    if resp.status_code in (400, 404) and current_prev_id and hop == 0:
-                        current_prev_id = None
-                        hop_payload.pop("previous_interaction_id", None)
-                        if history_turns:
-                            hist_snippets = [
-                                _format_turn_history_snippet(t)
-                                for t in history_turns[-6:]
-                                if t.get("status") in ("completed", "incomplete")
-                            ]
-                            if hist_snippets:
-                                hop_payload["input"] = (
-                                    "[HISTÓRICO DE TURNOS E FERRAMENTAS EXECUTADAS NA SESSÃO LOCAL]:\n"
-                                    + "\n---\n".join(hist_snippets)
-                                    + "\n\n[LEMBRETE]: Você está no MODO MÁQUINA LOCAL com acesso total às ferramentas `execute_bash`, `view_file`, `write_to_file`, `replace_file_content`, `list_dir`, `find_by_name` e `grep_search` para inspecionar o computador, hardware, SO e arquivos do usuário.\n"
-                                    + f"\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
-                                )
-                        resp = await client.post(
-                            INTERACTIONS_BASE_URL,
-                            json=hop_payload,
-                            headers=headers,
-                        )
-
-                    if resp.status_code >= 400:
-                        used_fallback = True
-                        break
-
-                    hop_data = resp.json()
-                    if hop_data.get("id"):
-                        final_api_id = str(hop_data["id"])
-                        current_prev_id = final_api_id
-
-                    _sum_usage_dicts(accumulated_usage, hop_data.get("usage") or {})
-
-                    hop_steps = hop_data.get("steps") or []
-                    for s in hop_steps:
-                        if not isinstance(s, dict):
-                            continue
-                        stype = s.get("type", "")
-                        if stype == "user_input":
-                            continue
-                        accumulated_steps.append(s)
-                        if stype == "model_output":
-                            txts = [
-                                c.get("text", "")
-                                for c in (s.get("content") or [])
-                                if isinstance(c, dict) and c.get("type") == "text" and c.get("text")
-                            ]
-                            if txts:
-                                final_output_text = "\n\n".join(txts).strip()
-
-                    if not final_output_text and isinstance(hop_data.get("output_text"), str) and hop_data["output_text"].strip():
-                        final_output_text = hop_data["output_text"].strip()
-
+                    accumulated_steps.append({
+                        "type": "function_call",
+                        "id": fc["id"],
+                        "name": fc["name"],
+                        "arguments": fc["arguments"],
+                    })
                     _notify(accumulated_steps, final_output_text, "in_progress")
 
-                    func_calls = _extract_function_calls_from_steps(hop_steps)
-                    if not func_calls:
-                        final_status = hop_data.get("status") or "completed"
-                        if final_status == "requires_action":
-                            final_status = "completed"
-                        break
+                    tool_res, is_err = await execute_local_tool_call(
+                        tool_name=fc["name"],
+                        arguments=fc["arguments"],
+                        workdir=abs_workdir,
+                    )
+                    accumulated_steps.append({
+                        "type": "function_result",
+                        "call_id": fc["id"],
+                        "name": fc["name"],
+                        "result": tool_res,
+                        "is_error": is_err,
+                    })
+                    _notify(accumulated_steps, final_output_text, "in_progress")
 
-                    # Executa cada ferramenta solicitada localmente na máquina do usuário
-                    result_steps: List[Dict[str, Any]] = []
-                    for fc in func_calls:
-                        if run_state.get("cancelled"):
-                            final_status = "cancelled"
-                            break
-                        tool_res, is_err = await execute_local_tool_call(
-                            tool_name=fc["name"],
-                            arguments=fc["arguments"],
-                            workdir=abs_workdir,
-                        )
-                        res_str = json.dumps(tool_res, ensure_ascii=False)
-                        step_record = {
-                            "type": "function_result",
-                            "call_id": fc["id"],
-                            "name": fc["name"],
-                            "result": tool_res,
-                            "is_error": is_err,
-                        }
-                        accumulated_steps.append(step_record)
-                        result_steps.append({
-                            "type": "function_result",
-                            "call_id": fc["id"],
-                            "name": fc["name"],
-                            "result": res_str,
-                            "is_error": is_err,
-                        })
-                        _notify(accumulated_steps, final_output_text, "in_progress")
+                    res_json_str = json.dumps(tool_res, ensure_ascii=False)
+                    if len(res_json_str) > 24000:
+                        res_json_str = res_json_str[:24000] + "... [truncado]"
+                    tool_results_feedback.append(
+                        f"<local_tool_result name=\"{fc['name']}\" is_error=\"{str(is_err).lower()}\">\n"
+                        f"{res_json_str}\n"
+                        f"</local_tool_result>"
+                    )
 
-                    if run_state.get("cancelled"):
-                        final_status = "cancelled"
-                        break
+                if run_state.get("cancelled"):
+                    final_status = "cancelled"
+                    break
 
-                    current_input = result_steps
-
-        if used_fallback and not run_state.get("cancelled"):
-            final_output_text, final_status = await _run_local_agent_via_generate_content(
-                prompt=prompt,
-                model_name=model_name,
-                sys_instruction=sys_inst,
-                workdir=abs_workdir,
-                history_turns=history_turns,
-                accumulated_steps=accumulated_steps,
-                accumulated_usage=accumulated_usage,
-                run_state=run_state,
-                on_progress=_notify,
-                max_iterations=max_iterations,
-                api_key=api_key,
-            )
+                current_hop_input = (
+                    "[RESULTADO REAL DA EXECUÇÃO NA MÁQUINA LOCAL DO USUÁRIO]:\n"
+                    + "\n\n".join(tool_results_feedback)
+                    + "\n\n[INSTRUÇÃO]: Se precisar executar mais alguma ferramenta local na máquina do usuário, "
+                    "emita apenas o próximo bloco `<local_tool_call>{...}</local_tool_call>`. "
+                    "Caso já tenha todos os dados necessários, apresente a resposta final completa e detalhada "
+                    "ao usuário com base exclusivamente nos resultados reais acima (NÃO chame ferramentas internas `default_api:*`)."
+                )
 
     except Exception as exc:
         final_status = "failed"
         if not final_output_text:
-            final_output_text = f"❌ Erro durante a execução do Agente Local: {exc}"
+            final_output_text = f"❌ Erro durante a execução do Agente Local ({underlying_model}): {exc}"
         accumulated_steps.append({
             "type": "model_output",
             "content": [{"type": "text", "text": final_output_text}],
@@ -1812,3 +1628,4 @@ async def run_local_agent_turn(
     }
     ACTIVE_LOCAL_RUNS[local_turn_id] = {**run_state, **result_payload}
     return result_payload
+

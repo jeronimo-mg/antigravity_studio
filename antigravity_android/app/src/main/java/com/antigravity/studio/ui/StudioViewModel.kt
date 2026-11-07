@@ -321,7 +321,7 @@ class StudioViewModel(
         title: String = "Nova Conversa Antigravity",
         mode: String = "agent",
         agentName: String = "antigravity-preview-09-2026",
-        modelName: String = "gemini-3.8-flash",
+        modelName: String = "gemini-4-argon",
         environmentId: String = ""
     ) {
         viewModelScope.launch {
@@ -1050,7 +1050,7 @@ class StudioViewModel(
         title: String = "",
         mode: String = "agent",
         agentName: String = "antigravity-preview-09-2026",
-        modelName: String = "gemini-3.8-flash",
+        modelName: String = "gemini-4-argon",
         fetchHistory: Boolean = true
     ) {
         val targetId = interactionId.trim()

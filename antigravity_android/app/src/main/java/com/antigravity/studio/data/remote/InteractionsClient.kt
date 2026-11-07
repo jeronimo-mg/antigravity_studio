@@ -215,7 +215,7 @@ if __name__ == "__main__":
         prompt: String,
         mode: String = "agent",
         agentName: String = "antigravity-preview-09-2026",
-        modelName: String = "gemini-3.8-flash",
+        modelName: String = "gemini-4-argon",
         previousInteractionId: String? = null,
         environmentId: String? = null,
         maxTotalTokens: Int = 0,
@@ -294,14 +294,14 @@ if __name__ == "__main__":
             if (effAgent.contains("antigravity")) {
                 val agentCfg = JSONObject()
                     .put("type", "antigravity")
-                    .put("model", modelName.ifBlank { "gemini-3.8-flash" })
+                    .put("model", "gemini-4-argon")
                 if (maxTotalTokens > 0) {
                     agentCfg.put("max_total_tokens", maxTotalTokens)
                 }
                 payload.put("agent_config", agentCfg)
             }
         } else {
-            payload.put("model", modelName.ifBlank { "gemini-3.8-flash" })
+            payload.put("model", "gemini-4-argon")
             if (!systemInstruction.isNullOrBlank()) {
                 payload.put("system_instruction", systemInstruction.trim())
             }
@@ -1363,7 +1363,7 @@ interaction = client.interactions.create(
 $prevLine    environment="$envVal",
     agent_config={
         "type": "antigravity",
-        "model": "${session.modelName.ifBlank { "gemini-3.8-flash" }}",
+        "model": "${session.modelName.ifBlank { "gemini-4-argon" }}",
     },
     store=True,
 )
@@ -1378,7 +1378,7 @@ print(interaction.output_text)
 client = genai.Client(api_key="SUA_GEMINI_API_KEY")
 
 interaction = client.interactions.create(
-    model="${session.modelName.ifBlank { "gemini-3.8-flash" }}",
+    model="${session.modelName.ifBlank { "gemini-4-argon" }}",
     input="Sua mensagem aqui...",
 $prevLine    store=True,
 )
@@ -1509,7 +1509,7 @@ print(interaction.output_text)
             put("env", envId)
             put("m", session.mode.trim().ifBlank { "agent" })
             put("ag", session.agentName.trim().ifBlank { "antigravity-preview-09-2026" })
-            put("md", session.modelName.trim().ifBlank { "gemini-3.8-flash" })
+            put("md", session.modelName.trim().ifBlank { "gemini-4-argon" })
             put("u", session.updatedAt.trim())
             put("tc", tc)
         }
@@ -1569,7 +1569,7 @@ print(interaction.output_text)
                 environmentId = envId,
                 mode = obj.optString("m", "agent").trim().ifBlank { "agent" },
                 agentName = obj.optString("ag", "antigravity-preview-09-2026").trim().ifBlank { "antigravity-preview-09-2026" },
-                modelName = obj.optString("md", "gemini-3.8-flash").trim().ifBlank { "gemini-3.8-flash" },
+                modelName = obj.optString("md", "gemini-4-argon").trim().ifBlank { "gemini-4-argon" },
                 updatedAt = obj.optString("u", "").trim(),
                 turnCount = obj.optInt("tc", 0).coerceAtLeast(0),
                 uploadedFiles = uploaded,

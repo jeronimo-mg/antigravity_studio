@@ -38,7 +38,7 @@ def init_db() -> None:
                 execution_mode TEXT NOT NULL DEFAULT 'remote',
                 local_workdir TEXT DEFAULT '',
                 agent_name TEXT DEFAULT 'antigravity-preview-09-2026',
-                model_name TEXT DEFAULT 'gemini-3.8-flash',
+                model_name TEXT DEFAULT 'gemini-4-argon',
                 environment_id TEXT DEFAULT '',
                 last_interaction_id TEXT DEFAULT '',
                 max_total_tokens INTEGER DEFAULT 0,
@@ -64,6 +64,10 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE sessions ADD COLUMN local_workdir TEXT DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            conn.execute("UPDATE sessions SET model_name = 'gemini-4-argon' WHERE model_name != 'gemini-4-argon' OR model_name IS NULL OR model_name = ''")
         except Exception:
             pass
         conn.execute(
@@ -122,7 +126,7 @@ def create_session(
     title: str = "Nova Conversa Antigravity",
     mode: str = "agent",
     agent_name: str = "antigravity-preview-09-2026",
-    model_name: str = "gemini-3.8-flash",
+    model_name: str = "gemini-4-argon",
     environment_id: str = "",
     last_interaction_id: str = "",
     max_total_tokens: int = 0,

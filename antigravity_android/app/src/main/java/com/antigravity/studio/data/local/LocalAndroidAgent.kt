@@ -5,6 +5,7 @@ import android.os.Environment
 import android.os.StatFs
 import com.antigravity.studio.data.model.TurnModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
@@ -19,7 +20,7 @@ import java.util.concurrent.TimeUnit
 
 object LocalAndroidAgent {
 
-    private const val GENERATE_CONTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+    private const val INTERACTIONS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -95,8 +96,10 @@ object LocalAndroidAgent {
     fun buildSystemInstruction(workdir: String, customInstruction: String = ""): String {
         val hw = getAndroidHardwareSummary(workdir)
         val sb = StringBuilder()
-        sb.appendLine("Você é o Agente Antigravity operando em Modo Máquina Local no Celular Android (Local Mobile OS Agent).")
-        sb.appendLine("Você está executando DIRETAMENTE no smartphone/tablet Android do usuário com acesso real ao shell Linux/Toybox (/system/bin/sh) e ao sistema de arquivos local do aparelho.")
+        sb.appendLine("[DIRETIVA CRÍTICA DE MODO MÁQUINA LOCAL NO CELULAR ANDROID — LEIA COM ATENÇÃO]")
+        sb.appendLine("Você está operando em MODO MÁQUINA LOCAL conectado diretamente ao smartphone/tablet Android real do usuário.")
+        sb.appendLine("ATENÇÃO: Suas ferramentas nativas internas (`default_api:*`) rodam em um container remoto na nuvem e NÃO correspondem ao celular do usuário.")
+        sb.appendLine("PORTANTO, É ESTRITAMENTE PROIBIDO chamar qualquer ferramenta interna `default_api:*` neste turno!")
         sb.appendLine()
         sb.appendLine("Dados Reais do Dispositivo Android Detectados Agora:")
         sb.appendLine("- Aparelho / Modelo: ${hw["device"]}")
@@ -111,19 +114,21 @@ object LocalAndroidAgent {
         }
         sb.appendLine("- Diretório de Trabalho Local (`local_workdir`): $workdir")
         sb.appendLine()
-        sb.appendLine("Suas Capabilities e Supported Tools ativas no celular Android:")
-        sb.appendLine("1. `execute_bash`: executa comandos diretamente no shell local do Android (`/system/bin/sh`, Toybox: `uname -a`, `getprop`, `df -h`, `cat /proc/cpuinfo`, `cat /proc/meminfo`, `ps`, `ls -la`, `ip addr`, `ping`, `pm list packages`, etc.).")
-        sb.appendLine("2. `view_file`: lê qualquer arquivo local no diretório do projeto ou em caminhos acessíveis do Android.")
-        sb.appendLine("3. `write_to_file`: cria novos arquivos ou sobrescreve arquivos no armazenamento local do celular.")
-        sb.appendLine("4. `replace_file_content`: edita blocos de código/texto em arquivos locais.")
-        sb.appendLine("5. `list_dir`: lista arquivos e subpastas de qualquer diretório local.")
-        sb.appendLine("6. `find_by_name`: busca arquivos por nome ou extensão.")
-        sb.appendLine("7. `grep_search`: pesquisa texto ou expressões regulares dentro dos arquivos locais.")
-        sb.appendLine("8. `web_search` e `browse_url`: pesquisa na internet e lê conteúdo de páginas web.")
+        sb.appendLine("COMO EXECUTAR COMANDOS E ACESSAR ARQUIVOS NO CELULAR ANDROID DO USUÁRIO:")
+        sb.appendLine("Sempre que precisar executar comandos no shell do Android (`/system/bin/sh`), ler/criar/editar arquivos locais ou listar pastas, responda APENAS com um ou mais blocos XML `<local_tool_call>` contendo JSON válido:")
+        sb.appendLine("<local_tool_call>")
+        sb.appendLine("{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"uname -a && getprop ro.product.model\", \"Cwd\": \".\"}}")
+        sb.appendLine("</local_tool_call>")
         sb.appendLine()
-        sb.appendLine("Regras Fundamentais:")
-        sb.appendLine("- Você TEM acesso direto às informações de hardware, propriedades do sistema Android (`getprop`), CPU, memória, armazenamento e arquivos locais do celular através de `execute_bash`, `view_file` e `list_dir`.")
-        sb.appendLine("- Quando o usuário perguntar sobre configurações do celular, processador, memória, bateria, rede ou sistema Android, SEMPRE execute `execute_bash` combinando os comandos em UMA ÚNICA chamada (ex: `uname -a && cat /proc/cpuinfo | head -n 30 && cat /proc/meminfo | head -n 15 && df -h`) para economizar requisições à API.")
+        sb.appendLine("Ferramentas Locais Disponíveis via `<local_tool_call>`:")
+        sb.appendLine("1. `execute_bash`: `{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"...\", \"Cwd\": \".\"}}`")
+        sb.appendLine("2. `view_file`: `{\"name\": \"view_file\", \"arguments\": {\"AbsolutePath\": \"...\", \"StartLine\": 1, \"EndLine\": 200}}`")
+        sb.appendLine("3. `write_to_file`: `{\"name\": \"write_to_file\", \"arguments\": {\"TargetFile\": \"...\", \"CodeContent\": \"...\", \"Overwrite\": true}}`")
+        sb.appendLine("4. `replace_file_content`: `{\"name\": \"replace_file_content\", \"arguments\": {\"TargetFile\": \"...\", \"TargetContent\": \"...\", \"ReplacementContent\": \"...\"}}`")
+        sb.appendLine("5. `list_dir`: `{\"name\": \"list_dir\", \"arguments\": {\"DirectoryPath\": \".\"}}`")
+        sb.appendLine("6. `find_by_name`: `{\"name\": \"find_by_name\", \"arguments\": {\"SearchDirectory\": \".\", \"Pattern\": \"*\"}}`")
+        sb.appendLine("7. `grep_search`: `{\"name\": \"grep_search\", \"arguments\": {\"SearchPath\": \".\", \"Query\": \"...\"}}`")
+        sb.appendLine("8. `web_search` / `browse_url`: `{\"name\": \"web_search\", \"arguments\": {\"queries\": [\"...\"]}}` / `{\"name\": \"browse_url\", \"arguments\": {\"urls\": [\"...\"]}}`")
         if (customInstruction.isNotBlank()) {
             sb.appendLine()
             sb.appendLine("Instruções Adicionais do Usuário:")
@@ -481,6 +486,103 @@ object LocalAndroidAgent {
         }
     }
 
+    private val localToolCallRegex = Regex(
+        "<local_tool_call>\\s*([\\s\\S]*?)\\s*</local_tool_call>",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun extractLocalToolCalls(text: String): Pair<List<Pair<String, JSONObject>>, String> {
+        if (!text.contains("<local_tool_call>", ignoreCase = true)) {
+            return emptyList<Pair<String, JSONObject>>() to text.trim()
+        }
+        val calls = mutableListOf<Pair<String, JSONObject>>()
+        for (match in localToolCallRegex.findAll(text)) {
+            var inner = match.groupValues[1].trim()
+            if (inner.startsWith("```")) {
+                inner = inner.replace(Regex("^```(?:json)?\\s*", RegexOption.IGNORE_CASE), "")
+                    .replace(Regex("\\s*```$"), "")
+            }
+            try {
+                val obj = JSONObject(inner)
+                val tName = obj.optString("name", obj.optString("tool", "")).trim()
+                val tArgs = obj.optJSONObject("arguments") ?: obj.optJSONObject("args") ?: JSONObject()
+                if (tName.isNotEmpty()) {
+                    calls.add(tName to tArgs)
+                }
+            } catch (_: Exception) {
+            }
+        }
+        val cleaned = localToolCallRegex.replace(text, "").trim()
+        return calls to cleaned
+    }
+
+    private suspend fun executeAntigravityAgentHop(
+        hopInput: String,
+        modelName: String,
+        previousInteractionId: String?,
+        apiKey: String
+    ): JSONObject {
+        val underlyingModel = "gemini-4-argon"
+        val payload = JSONObject()
+            .put("agent", "antigravity-preview-09-2026")
+            .put("environment", "remote")
+            .put(
+                "agent_config",
+                JSONObject()
+                    .put("type", "antigravity")
+                    .put("model", underlyingModel)
+            )
+            .put("input", hopInput)
+            .put("background", true)
+            .put("store", true)
+
+        if (!previousInteractionId.isNullOrBlank() && previousInteractionId.startsWith("v1_")) {
+            payload.put("previous_interaction_id", previousInteractionId)
+        }
+
+        val postUrl = "$INTERACTIONS_BASE_URL?key=${URLEncoder.encode(apiKey.trim(), "UTF-8")}"
+        val postReq = Request.Builder()
+            .url(postUrl)
+            .header("x-goog-api-key", apiKey.trim())
+            .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+            .build()
+
+        var data: JSONObject
+        httpClient.newCall(postReq).execute().use { resp ->
+            val bodyStr = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) {
+                throw IllegalStateException("Erro na Interactions API ($underlyingModel, HTTP ${resp.code}): $bodyStr")
+            }
+            data = JSONObject(bodyStr)
+        }
+
+        val interactionId = data.optString("id", "")
+        var status = data.optString("status", "")
+        var polls = 0
+        while (status == "in_progress" && interactionId.isNotEmpty() && polls < 120) {
+            delay(1500)
+            polls++
+            val pollUrl = "$INTERACTIONS_BASE_URL/$interactionId?key=${URLEncoder.encode(apiKey.trim(), "UTF-8")}"
+            val pollReq = Request.Builder()
+                .url(pollUrl)
+                .header("x-goog-api-key", apiKey.trim())
+                .get()
+                .build()
+            httpClient.newCall(pollReq).execute().use { pResp ->
+                if (pResp.isSuccessful) {
+                    val pBody = pResp.body?.string().orEmpty()
+                    if (pBody.isNotBlank()) {
+                        data = JSONObject(pBody)
+                        status = data.optString("status", "")
+                    }
+                } else {
+                    status = "completed"
+                }
+            }
+        }
+        return data
+    }
+
     suspend fun runLocalAndroidTurn(
         prompt: String,
         workdir: String,
@@ -492,74 +594,30 @@ object LocalAndroidAgent {
         val localDir = File(workdir).apply { if (!exists()) mkdirs() }.absolutePath
         val localTurnId = "local_${UUID.randomUUID().toString().replace("-", "").take(16)}"
         val sysInst = buildSystemInstruction(localDir, systemInstruction)
-        val toolsPayload = getToolsDeclaration()
+        val underlyingModel = "gemini-4-argon"
 
-        val contents = JSONArray()
-        historyTurns.takeLast(8).filter { it.status in listOf("completed", "incomplete") }.forEach { t ->
+        val historySnippets = mutableListOf<String>()
+        historyTurns.takeLast(6).filter { it.status in listOf("completed", "incomplete") }.forEach { t ->
+            val sb = StringBuilder()
             if (t.userInputText.isNotBlank()) {
-                contents.put(
-                    JSONObject()
-                        .put("role", "user")
-                        .put("parts", JSONArray().put(JSONObject().put("text", t.userInputText)))
-                )
-            }
-            // Inclui chamadas e respostas de ferramentas do turno anterior
-            try {
-                val stepsArr = JSONArray(t.stepsJson.ifBlank { "[]" })
-                for (i in 0 until stepsArr.length()) {
-                    val s = stepsArr.optJSONObject(i) ?: continue
-                    val st = s.optString("type")
-                    val sName = s.optString("name")
-                    if (st == "function_call" && sName.isNotEmpty()) {
-                        contents.put(
-                            JSONObject()
-                                .put("role", "model")
-                                .put(
-                                    "parts",
-                                    JSONArray().put(
-                                        JSONObject().put(
-                                            "functionCall",
-                                            JSONObject()
-                                                .put("name", sName)
-                                                .put("args", s.optJSONObject("arguments") ?: JSONObject())
-                                        )
-                                    )
-                                )
-                        )
-                    } else if (st == "function_result" && sName.isNotEmpty()) {
-                        contents.put(
-                            JSONObject()
-                                .put("role", "user")
-                                .put(
-                                    "parts",
-                                    JSONArray().put(
-                                        JSONObject().put(
-                                            "functionResponse",
-                                            JSONObject()
-                                                .put("name", sName)
-                                                .put("response", s.optJSONObject("result") ?: JSONObject())
-                                        )
-                                    )
-                                )
-                        )
-                    }
-                }
-            } catch (_: Exception) {
+                sb.appendLine("Usuário: ${t.userInputText.take(600)}")
             }
             if (t.outputText.isNotBlank()) {
-                contents.put(
-                    JSONObject()
-                        .put("role", "model")
-                        .put("parts", JSONArray().put(JSONObject().put("text", t.outputText)))
-                )
+                sb.appendLine("Agente Local: ${t.outputText.take(900)}")
+            }
+            if (sb.isNotEmpty()) {
+                historySnippets.add(sb.toString().trim())
             }
         }
 
-        contents.put(
-            JSONObject()
-                .put("role", "user")
-                .put("parts", JSONArray().put(JSONObject().put("text", prompt)))
-        )
+        val historyBlock = if (historySnippets.isNotEmpty()) {
+            "\n\n[HISTÓRICO DE TURNOS NA SESSÃO LOCAL]:\n" + historySnippets.joinToString("\n---\n")
+        } else {
+            ""
+        }
+
+        var currentHopInput = "$sysInst$historyBlock\n\n[PEDIDO ATUAL DO USUÁRIO NO DISPOSITIVO LOCAL]:\n$prompt"
+        var currentPrevId: String? = null
 
         val stepsRecorded = JSONArray()
         stepsRecorded.put(
@@ -568,143 +626,93 @@ object LocalAndroidAgent {
                 .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", prompt)))
         )
 
-        val internalAliases = setOf("gemini-4-argon", "gemini-3.8-flash", "antigravity-preview-09-2026")
-        val candidateModels = mutableListOf<String>()
-        val cleanModel = modelName.removePrefix("models/").trim().ifBlank { "gemini-2.5-flash" }
-        if (cleanModel !in internalAliases) {
-            candidateModels.add(cleanModel)
-        }
-        for (fallback in listOf(
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-            "gemini-3-flash-preview",
-            "gemini-2.5-pro",
-            "gemini-1.5-flash"
-        )) {
-            if (fallback !in candidateModels) candidateModels.add(fallback)
-        }
-        var activeModel = candidateModels.first()
-        val exhaustedModels = mutableSetOf<String>()
         var finalOutputText = ""
         var totalIn = 0
         var totalOut = 0
         var totalTok = 0
 
-        for (iteration in 0 until 15) {
-            val ordered = listOf(activeModel) + candidateModels.filter { it != activeModel }
-            val modelsToTry = ordered.filter { it !in exhaustedModels }.ifEmpty { ordered }
+        for (hop in 0 until 10) {
+            val hopData = executeAntigravityAgentHop(
+                hopInput = currentHopInput,
+                modelName = underlyingModel,
+                previousInteractionId = currentPrevId,
+                apiKey = apiKey
+            )
 
-            var respJson: JSONObject? = null
-            var lastErr = ""
-            for (mTry in modelsToTry) {
-                val reqBody = JSONObject()
-                    .put("contents", contents)
-                    .put("tools", toolsPayload)
-                    .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysInst))))
-                val url = "$GENERATE_CONTENT_BASE_URL/$mTry:generateContent?key=${URLEncoder.encode(apiKey.trim(), "UTF-8")}"
-                val req = Request.Builder()
-                    .url(url)
-                    .post(reqBody.toString().toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
-                    .build()
-                httpClient.newCall(req).execute().use { resp ->
-                    val bodyStr = resp.body?.string().orEmpty()
-                    if (resp.isSuccessful) {
-                        activeModel = mTry
-                        respJson = JSONObject(bodyStr)
-                    } else {
-                        if (resp.code == 404 || resp.code == 429) {
-                            exhaustedModels.add(mTry)
-                        }
-                        lastErr = "HTTP ${resp.code}: $bodyStr"
-                    }
-                }
-                if (respJson != null) break
+            val hopId = hopData.optString("id", "")
+            if (hopId.startsWith("v1_")) {
+                currentPrevId = hopId
             }
 
-            if (respJson == null) {
-                // Se ferramentas locais já foram executadas e todos os modelos retornaram 429, entrega os resultados coletados
-                val toolOutputs = mutableListOf<String>()
-                for (i in 0 until stepsRecorded.length()) {
-                    val s = stepsRecorded.optJSONObject(i) ?: continue
-                    if (s.optString("type") == "function_result") {
-                        val r = s.optJSONObject("result") ?: continue
-                        val cmd = r.optString("command", s.optString("name", "tool"))
-                        val out = r.optString("stdout", r.optString("content", "")).trim()
-                        if (out.isNotEmpty()) {
-                            toolOutputs.add("**`$cmd`**:\n```text\n${out.take(3000)}\n```")
+            val usageObj = hopData.optJSONObject("usage")
+            if (usageObj != null) {
+                totalIn += usageObj.optInt("total_input_tokens", usageObj.optInt("input_tokens", 0))
+                totalOut += usageObj.optInt("total_output_tokens", usageObj.optInt("output_tokens", 0))
+                totalTok += usageObj.optInt("total_tokens", 0)
+            }
+
+            val hopSteps = hopData.optJSONArray("steps") ?: JSONArray()
+            val hopTexts = mutableListOf<String>()
+            for (i in 0 until hopSteps.length()) {
+                val s = hopSteps.optJSONObject(i) ?: continue
+                when (s.optString("type")) {
+                    "thought" -> stepsRecorded.put(s)
+                    "model_output" -> {
+                        val contentArr = s.optJSONArray("content") ?: JSONArray()
+                        for (j in 0 until contentArr.length()) {
+                            val c = contentArr.optJSONObject(j) ?: continue
+                            if (c.optString("type") == "text") {
+                                val t = c.optString("text", "").trim()
+                                if (t.isNotEmpty()) hopTexts.add(t)
+                            }
                         }
                     }
                 }
-                if (toolOutputs.isNotEmpty()) {
-                    finalOutputText = "### 📊 Dados Coletados no Seu Dispositivo Local\n\n" +
-                        toolOutputs.joinToString("\n\n") +
-                        "\n\n> 💡 *Nota: Os comandos locais foram executados com sucesso, mas a cota gratuita da API (HTTP 429) foi atingida na etapa final de síntese.*"
+            }
+
+            var rawHopOutput = hopTexts.lastOrNull() ?: hopData.optString("output_text", "").trim()
+            if (rawHopOutput.isEmpty()) {
+                val outputsArr = hopData.optJSONArray("outputs") ?: JSONArray()
+                val outTxts = mutableListOf<String>()
+                for (i in 0 until outputsArr.length()) {
+                    val o = outputsArr.optJSONObject(i) ?: continue
+                    if (o.optString("type") == "text") {
+                        val t = o.optString("text", "").trim()
+                        if (t.isNotEmpty()) outTxts.add(t)
+                    }
+                }
+                rawHopOutput = outTxts.joinToString("\n\n").trim()
+            }
+
+            val (localCalls, cleanedOutput) = extractLocalToolCalls(rawHopOutput)
+            if (localCalls.isEmpty()) {
+                finalOutputText = cleanedOutput.ifBlank { rawHopOutput }
+                if (finalOutputText.isNotEmpty()) {
                     stepsRecorded.put(
                         JSONObject()
                             .put("type", "model_output")
                             .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", finalOutputText)))
                     )
-                    break
                 }
-                throw IllegalStateException("Erro na API Gemini ($activeModel): $lastErr")
-            }
-            val data = respJson!!
-            val uMeta = data.optJSONObject("usageMetadata")
-            if (uMeta != null) {
-                totalIn += uMeta.optInt("promptTokenCount", 0)
-                totalOut += uMeta.optInt("candidatesTokenCount", 0)
-                totalTok += uMeta.optInt("totalTokenCount", 0)
+                break
             }
 
-            val candidates = data.optJSONArray("candidates") ?: break
-            if (candidates.length() == 0) break
-            val candContent = candidates.optJSONObject(0)?.optJSONObject("content") ?: break
-            val parts = candContent.optJSONArray("parts") ?: break
-            contents.put(JSONObject().put("role", "model").put("parts", parts))
-
-            val funcCalls = mutableListOf<Pair<String, JSONObject>>()
-            val stepTexts = mutableListOf<String>()
-
-            for (i in 0 until parts.length()) {
-                val p = parts.optJSONObject(i) ?: continue
-                if (p.optBoolean("thought", false) && p.has("text")) {
-                    stepsRecorded.put(
-                        JSONObject()
-                            .put("type", "thought")
-                            .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", p.optString("text"))))
-                    )
-                } else if (p.has("functionCall")) {
-                    val fc = p.optJSONObject("functionCall") ?: continue
-                    val fcName = fc.optString("name", "")
-                    val fcArgs = fc.optJSONObject("args") ?: JSONObject()
-                    funcCalls.add(fcName to fcArgs)
-                    stepsRecorded.put(
-                        JSONObject()
-                            .put("type", "function_call")
-                            .put("name", fcName)
-                            .put("arguments", fcArgs)
-                    )
-                } else if (p.has("text")) {
-                    val t = p.optString("text", "")
-                    if (t.isNotBlank()) stepTexts.add(t)
-                }
-            }
-
-            if (stepTexts.isNotEmpty()) {
-                finalOutputText = stepTexts.joinToString("\n").trim()
+            if (cleanedOutput.isNotEmpty()) {
                 stepsRecorded.put(
                     JSONObject()
-                        .put("type", "model_output")
-                        .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", finalOutputText)))
+                        .put("type", "thought")
+                        .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", cleanedOutput)))
                 )
             }
 
-            if (funcCalls.isEmpty()) break
-
-            val responseParts = JSONArray()
-            for ((fcName, fcArgs) in funcCalls) {
+            val feedbackBlocks = mutableListOf<String>()
+            for ((fcName, fcArgs) in localCalls) {
+                stepsRecorded.put(
+                    JSONObject()
+                        .put("type", "function_call")
+                        .put("name", fcName)
+                        .put("arguments", fcArgs)
+                )
                 val toolRes = executeToolCall(fcName, fcArgs, localDir)
                 stepsRecorded.put(
                     JSONObject()
@@ -712,20 +720,18 @@ object LocalAndroidAgent {
                         .put("name", fcName)
                         .put("result", toolRes)
                 )
-                responseParts.put(
-                    JSONObject().put(
-                        "functionResponse",
-                        JSONObject()
-                            .put("name", fcName)
-                            .put("response", toolRes)
-                    )
+                feedbackBlocks.add(
+                    "<local_tool_result name=\"$fcName\">\n${toolRes.toString().take(20000)}\n</local_tool_result>"
                 )
             }
-            contents.put(JSONObject().put("role", "user").put("parts", responseParts))
+
+            currentHopInput = "[RESULTADO REAL DA EXECUÇÃO NO DISPOSITIVO ANDROID LOCAL DO USUÁRIO]:\n" +
+                feedbackBlocks.joinToString("\n\n") +
+                "\n\n[INSTRUÇÃO]: Se precisar executar mais alguma ferramenta local, emita apenas `<local_tool_call>{...}</local_tool_call>`. Caso contrário, apresente a resposta final completa com base nos resultados acima (sem chamar ferramentas internas `default_api:*`)."
         }
 
         JSONObject()
-            .put("id", localTurnId)
+            .put("id", currentPrevId ?: localTurnId)
             .put("status", "completed")
             .put("environment_id", "local:$localDir")
             .put("steps", stepsRecorded)

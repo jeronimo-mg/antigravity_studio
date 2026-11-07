@@ -133,7 +133,7 @@ data class SessionModel(
     val title: String = "Nova Conversa Antigravity",
     val mode: String = "agent", // "agent" or "model"
     val agentName: String = "antigravity-preview-09-2026",
-    val modelName: String = "gemini-3.8-flash",
+    val modelName: String = "gemini-4-argon",
     val environmentId: String = "",
     val lastInteractionId: String = "",
     val maxTotalTokens: Int = 0,
