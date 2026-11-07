@@ -61,6 +61,72 @@ def resolve_local_path(raw_path: str, workdir: str) -> str:
 # ==============================================================================
 
 
+def get_local_machine_summary(workdir: Optional[str] = None) -> Dict[str, Any]:
+    """Coleta informações de hardware, disco, memória e sistema operacional da máquina local."""
+    import getpass
+    import shutil
+    import socket
+
+    info: Dict[str, Any] = {
+        "os": f"{platform.system()} {platform.release()} ({platform.version()})",
+        "architecture": platform.machine(),
+        "processor": platform.processor() or "Desconhecido",
+        "cpu_cores_logical": os.cpu_count() or 1,
+        "hostname": socket.gethostname(),
+        "Python": sys.version.split()[0],
+    }
+    try:
+        info["username"] = getpass.getuser()
+    except Exception:
+        pass
+
+    try:
+        target_disk = os.path.abspath(workdir or get_default_local_workdir())
+        usage = shutil.disk_usage(target_disk)
+        info["disk_total_gb"] = round(usage.total / (1024**3), 2)
+        info["disk_used_gb"] = round(usage.used / (1024**3), 2)
+        info["disk_free_gb"] = round(usage.free / (1024**3), 2)
+    except Exception:
+        pass
+
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                info["ram_total_gb"] = round(stat.ullTotalPhys / (1024**3), 2)
+                info["ram_available_gb"] = round(stat.ullAvailPhys / (1024**3), 2)
+                info["ram_usage_percent"] = int(stat.dwMemoryLoad)
+        elif os.path.isfile("/proc/meminfo"):
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as f:
+                mem_txt = f.read()
+            m_tot = re.search(r"MemTotal:\s+(\d+)\s+kB", mem_txt)
+            m_avail = re.search(r"MemAvailable:\s+(\d+)\s+kB", mem_txt)
+            if m_tot:
+                info["ram_total_gb"] = round(int(m_tot.group(1)) / (1024**2), 2)
+            if m_avail:
+                info["ram_available_gb"] = round(int(m_avail.group(1)) / (1024**2), 2)
+    except Exception:
+        pass
+
+    return info
+
+
 def tool_execute_bash(
     command: str,
     cwd: Optional[str] = None,
@@ -82,17 +148,57 @@ def tool_execute_bash(
         env = os.environ.copy()
         env["PAGER"] = "cat"
         env["GIT_TERMINAL_PROMPT"] = "0"
-        proc = subprocess.run(
-            cmd_str,
-            shell=True,
-            cwd=effective_cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_val,
-            env=env,
-        )
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        use_ps_on_win = False
+        if sys.platform == "win32":
+            ps_markers = (
+                "Get-", "Set-", "Invoke-", "Select-Object", "Where-Object",
+                "Format-Table", "Format-List", "$env:", "Get-CimInstance",
+                "Get-ComputerInfo", "Get-WmiObject", "Get-Process", "Get-Service",
+            )
+            unix_cmds = ("ls ", "ls\t", "cat ", "pwd", "uname", "df ", "free ", "ps ", "which ")
+            if any(m.lower() in cmd_str.lower() for m in ps_markers) or cmd_str.lower() in ("ls", "pwd", "ps") or any(cmd_str.lower().startswith(u) for u in unix_cmds):
+                use_ps_on_win = True
+
+        if sys.platform == "win32" and use_ps_on_win:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd_str],
+                cwd=effective_cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_val,
+                env=env,
+            )
+        else:
+            proc = subprocess.run(
+                cmd_str,
+                shell=True,
+                cwd=effective_cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_val,
+                env=env,
+            )
+            # Se no Windows o cmd.exe falhar com comando não reconhecido (9009), tenta via PowerShell
+            if sys.platform == "win32" and proc.returncode == 9009:
+                proc_ps = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd_str],
+                    cwd=effective_cwd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout_val,
+                    env=env,
+                )
+                if proc_ps.returncode == 0 or proc_ps.stdout:
+                    proc = proc_ps
+
         elapsed_ms = int((time.time() - started) * 1000)
         stdout_txt = proc.stdout or ""
         stderr_txt = proc.stderr or ""
@@ -849,31 +955,36 @@ def build_local_agent_system_instruction(
     custom_instruction: Optional[str] = None,
 ) -> str:
     """Constrói a instrução de sistema contextualizada com a máquina e diretório local."""
-    os_info = f"{platform.system()} {platform.release()} ({platform.machine()})"
-    py_ver = sys.version.split()[0]
     abs_workdir = os.path.abspath(workdir or get_default_local_workdir())
+    hw = get_local_machine_summary(abs_workdir)
 
     base_lines = [
-        "Você é o Agente Antigravity operando em Modo Máquina Local (CLI / Local Workspace Agent).",
-        f"- Sistema Operacional Local: {os_info}",
-        f"- Python Local: {py_ver}",
-        f"- Diretório de Trabalho do Projeto (`local_workdir`): {abs_workdir}",
+        "Você é o Agente Antigravity operando em Modo Máquina Local (CLI / Local OS Agent).",
+        "Você está executando DIRETAMENTE no computador do usuário com acesso real ao terminal/shell e ao sistema de arquivos da máquina.",
+        "",
+        "Dados Reais da Máquina Local Detectados Agora:",
+        f"- Sistema Operacional: {hw.get('os')} ({hw.get('architecture')})",
+        f"- Hostname / Usuário: {hw.get('hostname', 'N/A')} / {hw.get('username', 'N/A')}",
+        f"- Processador / Núcleos Lógicos: {hw.get('processor', 'N/A')} ({hw.get('cpu_cores_logical', 'N/A')} núcleos)",
+        f"- Memória RAM: {hw.get('ram_total_gb', 'N/A')} GB total ({hw.get('ram_available_gb', 'N/A')} GB disponível)",
+        f"- Disco Local: {hw.get('disk_total_gb', 'N/A')} GB total ({hw.get('disk_free_gb', 'N/A')} GB livre)",
+        f"- Python Local: {hw.get('Python')}",
+        f"- Diretório de Trabalho Atual do Projeto (`local_workdir`): {abs_workdir}",
         "",
         "Suas Capabilities e Supported Tools ativas na máquina local:",
-        "1. `execute_bash`: executa comandos diretamente no terminal do sistema operacional local.",
-        "2. `view_file`: lê arquivos locais com numeração de linhas (StartLine..EndLine).",
+        "1. `execute_bash`: executa qualquer comando diretamente no terminal do sistema operacional local (Windows CMD/PowerShell ou Linux/macOS bash).",
+        "2. `view_file`: lê qualquer arquivo local do computador (caminhos relativos ao projeto ou caminhos absolutos em qualquer pasta do disco).",
         "3. `write_to_file`: cria novos arquivos ou sobrescreve arquivos e pastas no disco local.",
         "4. `replace_file_content`: edita blocos específicos de código/texto em arquivos locais.",
         "5. `list_dir`: lista arquivos e subpastas de qualquer diretório local.",
         "6. `find_by_name`: localiza arquivos por nome, padrão glob ou extensão.",
-        "7. `grep_search`: busca código, funções ou textos dentro dos arquivos do projeto local.",
+        "7. `grep_search`: busca código, funções ou textos dentro dos arquivos locais.",
         "8. `web_search` e `browse_url`: pesquisa na web e extrai conteúdo de páginas.",
         "",
-        "Diretrizes de Execução Local:",
-        "- Ao criar, ler ou editar arquivos com caminhos relativos, eles serão resolvidos a partir do diretório do projeto local.",
-        "- Prefira usar `view_file`, `list_dir`, `find_by_name` e `grep_search` para inspecionar o código e `write_to_file` ou `replace_file_content` para criar e editar arquivos.",
-        "- Ao usar `execute_bash`, execute comandos não-interativos adequados ao sistema operacional local.",
-        "- Sempre informe de forma clara e objetiva quais arquivos foram criados/modificados e o resultado dos comandos executados.",
+        "Regras Fundamentais de Execução na Máquina Local:",
+        "- Você TEM acesso direto às configurações, hardware, sistema operacional, processos, rede e arquivos do computador do usuário através de `execute_bash`, `view_file` e `list_dir`.",
+        "- Quando o usuário perguntar sobre configurações do computador, hardware (CPU, GPU, placa de vídeo, memória RAM, discos, placa-mãe, bateria, drivers), rede, processos em execução, variáveis de ambiente ou softwares instalados, SEMPRE execute comandos via `execute_bash` (ex: no Windows use `Get-CimInstance Win32_Processor`, `Get-CimInstance Win32_VideoController`, `systeminfo`, `ipconfig`; no Linux use `lscpu`, `free -h`, `df -h`, `lspci`) para coletar os detalhes reais em tempo real.",
+        "- Caminhos relativos são resolvidos a partir de `local_workdir`, mas você também pode acessar qualquer caminho absoluto do computador quando solicitado pelo usuário.",
     ]
     if custom_instruction and custom_instruction.strip():
         base_lines.extend(["", "Instruções Adicionais do Usuário:", custom_instruction.strip()])
@@ -1067,6 +1178,32 @@ def _sum_usage_dicts(accum: Dict[str, int], new_u: Dict[str, Any]) -> None:
             accum[k] = accum.get(k, 0) + int(val)
 
 
+def _format_turn_history_snippet(t: Dict[str, Any]) -> str:
+    """Formata um turno anterior incluindo as ferramentas locais executadas para manter contexto."""
+    ut = (t.get("user_input_text") or "").strip()
+    ot = (t.get("output_text") or "").strip()
+    steps = t.get("steps") if isinstance(t.get("steps"), list) else []
+    tool_logs: List[str] = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        st = s.get("type")
+        if st == "function_call":
+            fn = s.get("name") or "tool"
+            fargs = json.dumps(s.get("arguments") or {}, ensure_ascii=False)[:240]
+            tool_logs.append(f"  -> Chamou ferramenta local `{fn}` com {fargs}")
+        elif st == "function_result":
+            fn = s.get("name") or "tool"
+            fres = json.dumps(s.get("result") or {}, ensure_ascii=False)[:300]
+            tool_logs.append(f"  <- Resultado de `{fn}`: {fres}")
+    parts = [f"Usuário: {ut[:800]}"]
+    if tool_logs:
+        parts.append("Ações executadas pelo Agente Local na máquina do usuário:\n" + "\n".join(tool_logs[:12]))
+    if ot:
+        parts.append(f"Resposta do Agente Local: {ot[:1200]}")
+    return "\n".join(parts)
+
+
 async def _run_local_agent_via_generate_content(
     prompt: str,
     model_name: str,
@@ -1094,8 +1231,37 @@ async def _run_local_agent_via_generate_content(
         if t.get("status") in ("completed", "incomplete"):
             ut = (t.get("user_input_text") or "").strip()
             ot = (t.get("output_text") or "").strip()
+            steps = t.get("steps") if isinstance(t.get("steps"), list) else []
             if ut:
                 contents.append({"role": "user", "parts": [{"text": ut}]})
+            # Reconstruir chamadas e respostas de ferramentas do turno anterior para que o modelo
+            # saiba que tem acesso ativo às ferramentas locais
+            for s in steps:
+                if not isinstance(s, dict):
+                    continue
+                if s.get("type") == "function_call" and s.get("name"):
+                    contents.append({
+                        "role": "model",
+                        "parts": [{
+                            "functionCall": {
+                                "name": s["name"],
+                                "args": s.get("arguments") if isinstance(s.get("arguments"), dict) else {},
+                            }
+                        }],
+                    })
+                elif s.get("type") == "function_result" and s.get("name"):
+                    res_obj = s.get("result")
+                    if not isinstance(res_obj, dict):
+                        res_obj = {"output": str(res_obj or "")}
+                    contents.append({
+                        "role": "user",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": s["name"],
+                                "response": res_obj,
+                            }
+                        }],
+                    })
             if ot:
                 contents.append({"role": "model", "parts": [{"text": ot}]})
 
@@ -1285,7 +1451,15 @@ async def run_local_agent_turn(
                 pass
 
     # Verifica se previous_interaction_id é um ID remoto da Interactions API (ex: v1_...)
+    # ou se podemos resolver um ID local_... para o _api_interaction_id (v1_...) correspondente
     clean_prev = (previous_interaction_id or "").strip()
+    if clean_prev.startswith("local_") and history_turns:
+        for t in reversed(history_turns):
+            if t.get("interaction_id") == clean_prev:
+                raw_api_id = ((t.get("raw") or {}).get("_api_interaction_id") or "").strip()
+                if raw_api_id.startswith("v1_"):
+                    clean_prev = raw_api_id
+                break
     can_chain_prev_id = clean_prev.startswith("v1_")
 
     effective_prompt = prompt
@@ -1293,15 +1467,15 @@ async def run_local_agent_turn(
         hist_snippets: List[str] = []
         for t in history_turns[-6:]:
             if t.get("status") in ("completed", "incomplete"):
-                ut = (t.get("user_input_text") or "").strip()
-                ot = (t.get("output_text") or "").strip()
-                if ut or ot:
-                    hist_snippets.append(f"Usuário: {ut[:600]}\nAgente Local: {ot[:1200]}")
+                snippet = _format_turn_history_snippet(t)
+                if snippet.strip():
+                    hist_snippets.append(snippet)
         if hist_snippets:
             effective_prompt = (
-                "[HISTÓRICO RESUMIDO DA SESSÃO LOCAL]:\n"
+                "[HISTÓRICO DE TURNOS E FERRAMENTAS EXECUTADAS NA SESSÃO LOCAL]:\n"
                 + "\n---\n".join(hist_snippets)
-                + f"\n\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
+                + "\n\n[LEMBRETE]: Você está no MODO MÁQUINA LOCAL com acesso total às ferramentas `execute_bash`, `view_file`, `write_to_file`, `replace_file_content`, `list_dir`, `find_by_name` e `grep_search` para inspecionar o computador, hardware, SO e arquivos do usuário.\n"
+                + f"\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
             )
 
     tools_decl = get_interactions_api_tools()
@@ -1335,21 +1509,22 @@ async def run_local_agent_turn(
                 )
 
                 # Se previous_interaction_id expirou ou era de um agente remoto incompatível com model+tools,
-                # tenta novamente sem previous_interaction_id injetando o histórico
+                # tenta novamente sem previous_interaction_id injetando o histórico com ferramentas
                 if resp.status_code in (400, 404) and current_prev_id and hop == 0:
                     current_prev_id = None
                     hop_payload.pop("previous_interaction_id", None)
                     if history_turns:
                         hist_snippets = [
-                            f"Usuário: {(t.get('user_input_text') or '')[:600]}\nAgente: {(t.get('output_text') or '')[:1200]}"
+                            _format_turn_history_snippet(t)
                             for t in history_turns[-6:]
                             if t.get("status") in ("completed", "incomplete")
                         ]
                         if hist_snippets:
                             hop_payload["input"] = (
-                                "[HISTÓRICO RESUMIDO DA SESSÃO]:\n"
+                                "[HISTÓRICO DE TURNOS E FERRAMENTAS EXECUTADAS NA SESSÃO LOCAL]:\n"
                                 + "\n---\n".join(hist_snippets)
-                                + f"\n\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
+                                + "\n\n[LEMBRETE]: Você está no MODO MÁQUINA LOCAL com acesso total às ferramentas `execute_bash`, `view_file`, `write_to_file`, `replace_file_content`, `list_dir`, `find_by_name` e `grep_search` para inspecionar o computador, hardware, SO e arquivos do usuário.\n"
+                                + f"\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
                             )
                     resp = await client.post(
                         INTERACTIONS_BASE_URL,
