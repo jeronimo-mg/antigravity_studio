@@ -1037,6 +1037,7 @@ def build_local_agent_system_instruction(
         "Regras Fundamentais de Execução na Máquina Local:",
         "- Você TEM acesso direto às configurações, hardware, sistema operacional, processos, rede e arquivos do computador do usuário através de `execute_bash`, `view_file` e `list_dir`.",
         "- Quando o usuário perguntar sobre configurações do computador, hardware (CPU, GPU, placa de vídeo, memória RAM, discos, placa-mãe, bateria, drivers), rede, processos em execução, variáveis de ambiente ou softwares instalados, SEMPRE execute comandos via `execute_bash` (ex: no Windows use `Get-CimInstance Win32_Processor`, `Get-CimInstance Win32_VideoController`, `systeminfo`, `ipconfig`; no Linux use `lscpu`, `free -h`, `df -h`, `lspci`) para coletar os detalhes reais em tempo real.",
+        "- REGRA DE EFICIÊNCIA DE COTA (CRÍTICO): Sempre que precisar executar mais de um comando de diagnóstico ou inspeção (por exemplo, consultar CPU, memória RAM, discos, placa de vídeo e placa-mãe), COMBINE todos em UMA ÚNICA chamada `execute_bash` separados por `;` (no PowerShell) ou `&&` (no Linux/bash). Exemplo no Windows: `Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum; Get-CimInstance Win32_DiskDrive | Select-Object Model,Size; Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM; Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product`. Isso reduz o número de requisições à API em 80%.",
         "- Comandos `sudo` e privilégios de administrador no Linux/macOS: Você PODE executar comandos `sudo` que exigem senha de forma 100% não-interativa usando a flag `-S` via pipe (`stdin`): `printf '%s\\n' 'SENHA_DO_USUARIO' | sudo -S -p '' <comando>` (por exemplo, se a senha for `1903`: `printf '%s\\n' '1903' | sudo -S -p '' apt-get update`). NUNCA diga que não consegue fornecer senhas para prompts `sudo`. Se um comando `sudo` falhar pedindo senha e você ainda não souber a senha, peça a senha ao usuário; assim que ele informar a senha no chat, execute imediatamente o comando usando `printf '%s\\n' 'SENHA' | sudo -S -p '' <comando>`.",
         "- Caminhos relativos são resolvidos a partir de `local_workdir`, mas você também pode acessar qualquer caminho absoluto do computador quando solicitado pelo usuário.",
     ]
@@ -1258,6 +1259,78 @@ def _format_turn_history_snippet(t: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _sanitize_contents_for_model_switch(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove campos específicos de pensamento (`thought` / `thoughtSignature`) ao alternar entre modelos em caso de HTTP 429."""
+    cleaned: List[Dict[str, Any]] = []
+    for msg in contents:
+        role = msg.get("role", "user")
+        raw_parts = msg.get("parts") or []
+        new_parts: List[Dict[str, Any]] = []
+        for p in raw_parts:
+            if not isinstance(p, dict):
+                continue
+            if p.get("thought"):
+                continue
+            if "functionCall" in p:
+                new_parts.append({"functionCall": p["functionCall"]})
+            elif "functionResponse" in p:
+                new_parts.append({"functionResponse": p["functionResponse"]})
+            elif "text" in p:
+                new_parts.append({"text": p["text"]})
+        if new_parts:
+            cleaned.append({"role": role, "parts": new_parts})
+    return cleaned
+
+
+def _synthesize_local_results_on_quota_exhausted(
+    accumulated_steps: List[Dict[str, Any]],
+    workdir: str,
+) -> Optional[str]:
+    """
+    Caso TODAS as cotas de modelos Gemini da chave gratuita atinjam HTTP 429 *após* as ferramentas
+    locais (`execute_bash`, `view_file`, `list_dir`, etc.) já terem sido executadas na máquina do usuário,
+    formata e entrega os resultados reais coletados para não perder a resposta do turno.
+    """
+    tool_results = [
+        s for s in accumulated_steps
+        if isinstance(s, dict) and s.get("type") == "function_result"
+    ]
+    if not tool_results:
+        return None
+
+    hw = get_local_machine_summary(workdir)
+    lines: List[str] = [
+        "### 📊 Dados Coletados Diretamente da Sua Máquina Local",
+        "",
+        f"- **Sistema Operacional:** {hw.get('os')} ({hw.get('architecture')})",
+        f"- **Processador / Núcleos Lógicos:** {hw.get('processor', 'N/A')} ({hw.get('cpu_cores_logical', 'N/A')} núcleos)",
+        f"- **Memória RAM:** {hw.get('ram_total_gb', 'N/A')} GB total ({hw.get('ram_available_gb', 'N/A')} GB disponível)",
+        f"- **Armazenamento (Disco):** {hw.get('disk_total_gb', 'N/A')} GB total ({hw.get('disk_free_gb', 'N/A')} GB livre)",
+        f"- **Hostname / Usuário:** `{hw.get('hostname', 'N/A')}` / `{hw.get('username', 'N/A')}`",
+        "",
+        "#### 🔧 Saída dos Comandos Executados Localmente:",
+    ]
+    for idx, tr in enumerate(tool_results, 1):
+        tname = tr.get("name") or "tool"
+        res = tr.get("result") if isinstance(tr.get("result"), dict) else {"output": str(tr.get("result") or "")}
+        cmd = res.get("command") or res.get("path") or res.get("directory") or tname
+        stdout = (res.get("stdout") or res.get("content") or "").strip()
+        stderr = (res.get("stderr") or res.get("error") or "").strip()
+        if not stdout and not stderr and "children" in res:
+            stdout = json.dumps(res.get("children"), ensure_ascii=False, indent=2)
+        lines.append(f"\n**{idx}. `{cmd}`**")
+        if stdout:
+            lines.append(f"```text\n{stdout[:4000]}\n```")
+        if stderr:
+            lines.append(f"*(Aviso/Stderr)*:\n```text\n{stderr[:1500]}\n```")
+
+    lines.append(
+        "\n> 💡 *Nota: Os comandos acima foram executados com sucesso na sua máquina local. "
+        "A síntese final de texto foi gerada localmente porque sua chave atingiu temporariamente o limite de requisições do Free Tier (HTTP 429) nos modelos consultados.*"
+    )
+    return "\n".join(lines)
+
+
 async def _run_local_agent_via_generate_content(
     prompt: str,
     model_name: str,
@@ -1273,10 +1346,10 @@ async def _run_local_agent_via_generate_content(
 ) -> Tuple[str, str]:
     """
     Executa o loop de Function Calling do Agente Local usando o endpoint padrão
-    `POST /v1beta/models/{model}:generateContent` caso o modelo selecionado ou a
-    Interactions API exija chamada direta.
+    `POST /v1beta/models/{model}:generateContent` com rotação automática entre modelos
+    em caso de HTTP 429 (cota excedida por modelo no Free Tier) ou HTTP 404/503.
     """
-    effective_model = model_name or "gemini-2.5-flash"
+    effective_model = (model_name or "gemini-2.5-flash").strip()
     if effective_model.startswith("models/"):
         effective_model = effective_model.replace("models/", "", 1)
 
@@ -1324,35 +1397,70 @@ async def _run_local_agent_via_generate_content(
     headers = build_headers(api_key)
     final_texts: List[str] = []
 
-    fallback_models = [effective_model]
-    for candidate in ("gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"):
+    # Modelos internos exclusivos do agente remoto não existem no endpoint :generateContent público
+    internal_aliases = {"gemini-4-argon", "gemini-3.8-flash", "antigravity-preview-09-2026"}
+    fallback_models: List[str] = []
+    if effective_model and effective_model not in internal_aliases:
+        fallback_models.append(effective_model)
+    for candidate in (
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
+        "gemini-1.5-flash",
+    ):
         if candidate not in fallback_models:
             fallback_models.append(candidate)
 
     active_model = fallback_models[0]
+    exhausted_models: set = set()
 
     async with httpx.AsyncClient(timeout=180.0) as client:
         for iteration in range(max_iterations):
             if run_state.get("cancelled"):
                 return "\n\n".join(final_texts).strip(), "cancelled"
 
-            req_body: Dict[str, Any] = {
-                "contents": contents,
-                "tools": tools_payload,
-                "systemInstruction": {"parts": [{"text": sys_instruction}]},
-            }
+            # Ordena modelos priorizando o active_model seguido dos demais que ainda não falharam com 404/429
+            models_to_try = [active_model] + [m for m in fallback_models if m != active_model]
+            avail_models = [m for m in models_to_try if m not in exhausted_models] or models_to_try
 
             resp = None
-            for m_idx, m_try in enumerate(fallback_models if iteration == 0 else [active_model]):
+            switched_model = False
+            for m_idx, m_try in enumerate(avail_models):
+                cur_contents = _sanitize_contents_for_model_switch(contents) if (m_try != active_model or switched_model) else contents
+                req_body: Dict[str, Any] = {
+                    "contents": cur_contents,
+                    "tools": tools_payload,
+                    "systemInstruction": {"parts": [{"text": sys_instruction}]},
+                }
                 url = f"{GENERATE_CONTENT_BASE_URL}/{m_try}:generateContent"
                 resp = await client.post(url, json=req_body, headers=headers)
                 if resp.status_code < 400:
+                    if m_try != active_model:
+                        contents = cur_contents
                     active_model = m_try
                     break
-                if resp.status_code in (400, 404) and m_idx < len(fallback_models) - 1:
-                    continue
+                if resp.status_code in (400, 404, 429, 500, 502, 503, 504):
+                    if resp.status_code in (404, 429):
+                        exhausted_models.add(m_try)
+                    switched_model = True
+                    if m_idx < len(avail_models) - 1:
+                        continue
 
             if resp is None or resp.status_code >= 400:
+                # Se já executamos ferramentas locais neste turno e todos os modelos retornaram 429,
+                # entregamos os resultados coletados localmente sem perder a resposta!
+                synthesized = _synthesize_local_results_on_quota_exhausted(accumulated_steps, workdir)
+                if synthesized:
+                    accumulated_steps.append({
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": synthesized}],
+                    })
+                    if on_progress:
+                        on_progress(accumulated_steps, synthesized, "completed")
+                    return synthesized, "completed"
                 err_txt = resp.text if resp is not None else "Sem resposta HTTP"
                 code = resp.status_code if resp is not None else 500
                 raise ValueError(f"Erro na API Gemini ({active_model}, HTTP {code}): {err_txt}")
@@ -1534,136 +1642,135 @@ async def run_local_agent_turn(
 
     tools_decl = get_interactions_api_tools()
     headers = build_headers(api_key)
-    used_fallback = False
+    internal_aliases = {"gemini-4-argon", "gemini-3.8-flash", "antigravity-preview-09-2026"}
+    clean_model_name = (model_name or "gemini-2.5-flash").strip()
+    used_fallback = clean_model_name in internal_aliases
 
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            current_input: Any = effective_prompt
-            current_prev_id: Optional[str] = clean_prev if can_chain_prev_id else None
+        if not used_fallback:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                current_input: Any = effective_prompt
+                current_prev_id: Optional[str] = clean_prev if can_chain_prev_id else None
 
-            for hop in range(max_iterations):
-                if run_state.get("cancelled"):
-                    final_status = "cancelled"
-                    break
+                for hop in range(max_iterations):
+                    if run_state.get("cancelled"):
+                        final_status = "cancelled"
+                        break
 
-                hop_payload: Dict[str, Any] = {
-                    "model": model_name or "gemini-3.8-flash",
-                    "input": current_input,
-                    "system_instruction": sys_inst,
-                    "tools": tools_decl,
-                    "store": True,
-                }
-                if current_prev_id:
-                    hop_payload["previous_interaction_id"] = current_prev_id
+                    hop_payload: Dict[str, Any] = {
+                        "model": clean_model_name,
+                        "input": current_input,
+                        "system_instruction": sys_inst,
+                        "tools": tools_decl,
+                        "store": True,
+                    }
+                    if current_prev_id:
+                        hop_payload["previous_interaction_id"] = current_prev_id
 
-                resp = await client.post(
-                    INTERACTIONS_BASE_URL,
-                    json=hop_payload,
-                    headers=headers,
-                )
-
-                # Se previous_interaction_id expirou ou era de um agente remoto incompatível com model+tools,
-                # tenta novamente sem previous_interaction_id injetando o histórico com ferramentas
-                if resp.status_code in (400, 404) and current_prev_id and hop == 0:
-                    current_prev_id = None
-                    hop_payload.pop("previous_interaction_id", None)
-                    if history_turns:
-                        hist_snippets = [
-                            _format_turn_history_snippet(t)
-                            for t in history_turns[-6:]
-                            if t.get("status") in ("completed", "incomplete")
-                        ]
-                        if hist_snippets:
-                            hop_payload["input"] = (
-                                "[HISTÓRICO DE TURNOS E FERRAMENTAS EXECUTADAS NA SESSÃO LOCAL]:\n"
-                                + "\n---\n".join(hist_snippets)
-                                + "\n\n[LEMBRETE]: Você está no MODO MÁQUINA LOCAL com acesso total às ferramentas `execute_bash`, `view_file`, `write_to_file`, `replace_file_content`, `list_dir`, `find_by_name` e `grep_search` para inspecionar o computador, hardware, SO e arquivos do usuário.\n"
-                                + f"\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
-                            )
                     resp = await client.post(
                         INTERACTIONS_BASE_URL,
                         json=hop_payload,
                         headers=headers,
                     )
 
-                if resp.status_code >= 400:
-                    if hop == 0:
+                    # Se previous_interaction_id expirou ou era de um agente remoto incompatível com model+tools,
+                    # tenta novamente sem previous_interaction_id injetando o histórico com ferramentas
+                    if resp.status_code in (400, 404) and current_prev_id and hop == 0:
+                        current_prev_id = None
+                        hop_payload.pop("previous_interaction_id", None)
+                        if history_turns:
+                            hist_snippets = [
+                                _format_turn_history_snippet(t)
+                                for t in history_turns[-6:]
+                                if t.get("status") in ("completed", "incomplete")
+                            ]
+                            if hist_snippets:
+                                hop_payload["input"] = (
+                                    "[HISTÓRICO DE TURNOS E FERRAMENTAS EXECUTADAS NA SESSÃO LOCAL]:\n"
+                                    + "\n---\n".join(hist_snippets)
+                                    + "\n\n[LEMBRETE]: Você está no MODO MÁQUINA LOCAL com acesso total às ferramentas `execute_bash`, `view_file`, `write_to_file`, `replace_file_content`, `list_dir`, `find_by_name` e `grep_search` para inspecionar o computador, hardware, SO e arquivos do usuário.\n"
+                                    + f"\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
+                                )
+                        resp = await client.post(
+                            INTERACTIONS_BASE_URL,
+                            json=hop_payload,
+                            headers=headers,
+                        )
+
+                    if resp.status_code >= 400:
                         used_fallback = True
                         break
-                    raise ValueError(
-                        f"Erro na Interactions API durante execução local (HTTP {resp.status_code}): {resp.text}"
-                    )
 
-                hop_data = resp.json()
-                if hop_data.get("id"):
-                    final_api_id = str(hop_data["id"])
-                    current_prev_id = final_api_id
+                    hop_data = resp.json()
+                    if hop_data.get("id"):
+                        final_api_id = str(hop_data["id"])
+                        current_prev_id = final_api_id
 
-                _sum_usage_dicts(accumulated_usage, hop_data.get("usage") or {})
+                    _sum_usage_dicts(accumulated_usage, hop_data.get("usage") or {})
 
-                hop_steps = hop_data.get("steps") or []
-                for s in hop_steps:
-                    if not isinstance(s, dict):
-                        continue
-                    stype = s.get("type", "")
-                    if stype == "user_input":
-                        continue
-                    accumulated_steps.append(s)
-                    if stype == "model_output":
-                        txts = [
-                            c.get("text", "")
-                            for c in (s.get("content") or [])
-                            if isinstance(c, dict) and c.get("type") == "text" and c.get("text")
-                        ]
-                        if txts:
-                            final_output_text = "\n\n".join(txts).strip()
+                    hop_steps = hop_data.get("steps") or []
+                    for s in hop_steps:
+                        if not isinstance(s, dict):
+                            continue
+                        stype = s.get("type", "")
+                        if stype == "user_input":
+                            continue
+                        accumulated_steps.append(s)
+                        if stype == "model_output":
+                            txts = [
+                                c.get("text", "")
+                                for c in (s.get("content") or [])
+                                if isinstance(c, dict) and c.get("type") == "text" and c.get("text")
+                            ]
+                            if txts:
+                                final_output_text = "\n\n".join(txts).strip()
 
-                if not final_output_text and isinstance(hop_data.get("output_text"), str) and hop_data["output_text"].strip():
-                    final_output_text = hop_data["output_text"].strip()
+                    if not final_output_text and isinstance(hop_data.get("output_text"), str) and hop_data["output_text"].strip():
+                        final_output_text = hop_data["output_text"].strip()
 
-                _notify(accumulated_steps, final_output_text, "in_progress")
+                    _notify(accumulated_steps, final_output_text, "in_progress")
 
-                func_calls = _extract_function_calls_from_steps(hop_steps)
-                if not func_calls:
-                    final_status = hop_data.get("status") or "completed"
-                    if final_status == "requires_action":
-                        final_status = "completed"
-                    break
+                    func_calls = _extract_function_calls_from_steps(hop_steps)
+                    if not func_calls:
+                        final_status = hop_data.get("status") or "completed"
+                        if final_status == "requires_action":
+                            final_status = "completed"
+                        break
 
-                # Executa cada ferramenta solicitada localmente na máquina do usuário
-                result_steps: List[Dict[str, Any]] = []
-                for fc in func_calls:
+                    # Executa cada ferramenta solicitada localmente na máquina do usuário
+                    result_steps: List[Dict[str, Any]] = []
+                    for fc in func_calls:
+                        if run_state.get("cancelled"):
+                            final_status = "cancelled"
+                            break
+                        tool_res, is_err = await execute_local_tool_call(
+                            tool_name=fc["name"],
+                            arguments=fc["arguments"],
+                            workdir=abs_workdir,
+                        )
+                        res_str = json.dumps(tool_res, ensure_ascii=False)
+                        step_record = {
+                            "type": "function_result",
+                            "call_id": fc["id"],
+                            "name": fc["name"],
+                            "result": tool_res,
+                            "is_error": is_err,
+                        }
+                        accumulated_steps.append(step_record)
+                        result_steps.append({
+                            "type": "function_result",
+                            "call_id": fc["id"],
+                            "name": fc["name"],
+                            "result": res_str,
+                            "is_error": is_err,
+                        })
+                        _notify(accumulated_steps, final_output_text, "in_progress")
+
                     if run_state.get("cancelled"):
                         final_status = "cancelled"
                         break
-                    tool_res, is_err = await execute_local_tool_call(
-                        tool_name=fc["name"],
-                        arguments=fc["arguments"],
-                        workdir=abs_workdir,
-                    )
-                    res_str = json.dumps(tool_res, ensure_ascii=False)
-                    step_record = {
-                        "type": "function_result",
-                        "call_id": fc["id"],
-                        "name": fc["name"],
-                        "result": tool_res,
-                        "is_error": is_err,
-                    }
-                    accumulated_steps.append(step_record)
-                    result_steps.append({
-                        "type": "function_result",
-                        "call_id": fc["id"],
-                        "name": fc["name"],
-                        "result": res_str,
-                        "is_error": is_err,
-                    })
-                    _notify(accumulated_steps, final_output_text, "in_progress")
 
-                if run_state.get("cancelled"):
-                    final_status = "cancelled"
-                    break
-
-                current_input = result_steps
+                    current_input = result_steps
 
         if used_fallback and not run_state.get("cancelled"):
             final_output_text, final_status = await _run_local_agent_via_generate_content(

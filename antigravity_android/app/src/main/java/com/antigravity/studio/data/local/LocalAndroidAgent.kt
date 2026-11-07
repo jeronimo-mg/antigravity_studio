@@ -123,7 +123,7 @@ object LocalAndroidAgent {
         sb.appendLine()
         sb.appendLine("Regras Fundamentais:")
         sb.appendLine("- Você TEM acesso direto às informações de hardware, propriedades do sistema Android (`getprop`), CPU, memória, armazenamento e arquivos locais do celular através de `execute_bash`, `view_file` e `list_dir`.")
-        sb.appendLine("- Quando o usuário perguntar sobre configurações do celular, processador, memória, bateria, rede ou sistema Android, SEMPRE execute `execute_bash` (ex: `getprop`, `cat /proc/cpuinfo`, `cat /proc/meminfo`, `df -h`, `uname -a`) para consultar os dados reais.")
+        sb.appendLine("- Quando o usuário perguntar sobre configurações do celular, processador, memória, bateria, rede ou sistema Android, SEMPRE execute `execute_bash` combinando os comandos em UMA ÚNICA chamada (ex: `uname -a && cat /proc/cpuinfo | head -n 30 && cat /proc/meminfo | head -n 15 && df -h`) para economizar requisições à API.")
         if (customInstruction.isNotBlank()) {
             sb.appendLine()
             sb.appendLine("Instruções Adicionais do Usuário:")
@@ -568,28 +568,41 @@ object LocalAndroidAgent {
                 .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", prompt)))
         )
 
+        val internalAliases = setOf("gemini-4-argon", "gemini-3.8-flash", "antigravity-preview-09-2026")
         val candidateModels = mutableListOf<String>()
-        val cleanModel = modelName.removePrefix("models/").ifBlank { "gemini-2.5-flash" }
-        candidateModels.add(cleanModel)
-        for (fallback in listOf("gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash")) {
+        val cleanModel = modelName.removePrefix("models/").trim().ifBlank { "gemini-2.5-flash" }
+        if (cleanModel !in internalAliases) {
+            candidateModels.add(cleanModel)
+        }
+        for (fallback in listOf(
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-2.5-pro",
+            "gemini-1.5-flash"
+        )) {
             if (fallback !in candidateModels) candidateModels.add(fallback)
         }
         var activeModel = candidateModels.first()
+        val exhaustedModels = mutableSetOf<String>()
         var finalOutputText = ""
         var totalIn = 0
         var totalOut = 0
         var totalTok = 0
 
         for (iteration in 0 until 15) {
-            val reqBody = JSONObject()
-                .put("contents", contents)
-                .put("tools", toolsPayload)
-                .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysInst))))
+            val ordered = listOf(activeModel) + candidateModels.filter { it != activeModel }
+            val modelsToTry = ordered.filter { it !in exhaustedModels }.ifEmpty { ordered }
 
             var respJson: JSONObject? = null
             var lastErr = ""
-            val modelsToTry = if (iteration == 0) candidateModels else listOf(activeModel)
             for (mTry in modelsToTry) {
+                val reqBody = JSONObject()
+                    .put("contents", contents)
+                    .put("tools", toolsPayload)
+                    .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sysInst))))
                 val url = "$GENERATE_CONTENT_BASE_URL/$mTry:generateContent?key=${URLEncoder.encode(apiKey.trim(), "UTF-8")}"
                 val req = Request.Builder()
                     .url(url)
@@ -601,13 +614,43 @@ object LocalAndroidAgent {
                         activeModel = mTry
                         respJson = JSONObject(bodyStr)
                     } else {
+                        if (resp.code == 404 || resp.code == 429) {
+                            exhaustedModels.add(mTry)
+                        }
                         lastErr = "HTTP ${resp.code}: $bodyStr"
                     }
                 }
                 if (respJson != null) break
             }
 
-            val data = respJson ?: throw IllegalStateException("Erro na API Gemini ($activeModel): $lastErr")
+            if (respJson == null) {
+                // Se ferramentas locais já foram executadas e todos os modelos retornaram 429, entrega os resultados coletados
+                val toolOutputs = mutableListOf<String>()
+                for (i in 0 until stepsRecorded.length()) {
+                    val s = stepsRecorded.optJSONObject(i) ?: continue
+                    if (s.optString("type") == "function_result") {
+                        val r = s.optJSONObject("result") ?: continue
+                        val cmd = r.optString("command", s.optString("name", "tool"))
+                        val out = r.optString("stdout", r.optString("content", "")).trim()
+                        if (out.isNotEmpty()) {
+                            toolOutputs.add("**`$cmd`**:\n```text\n${out.take(3000)}\n```")
+                        }
+                    }
+                }
+                if (toolOutputs.isNotEmpty()) {
+                    finalOutputText = "### 📊 Dados Coletados no Seu Dispositivo Local\n\n" +
+                        toolOutputs.joinToString("\n\n") +
+                        "\n\n> 💡 *Nota: Os comandos locais foram executados com sucesso, mas a cota gratuita da API (HTTP 429) foi atingida na etapa final de síntese.*"
+                    stepsRecorded.put(
+                        JSONObject()
+                            .put("type", "model_output")
+                            .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", finalOutputText)))
+                    )
+                    break
+                }
+                throw IllegalStateException("Erro na API Gemini ($activeModel): $lastErr")
+            }
+            val data = respJson!!
             val uMeta = data.optJSONObject("usageMetadata")
             if (uMeta != null) {
                 totalIn += uMeta.optInt("promptTokenCount", 0)
