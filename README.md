@@ -28,14 +28,23 @@ Interface visual inspirada no **Google AI Studio Playground**, projetada especif
    - **Empacotamento automático de pastas em `.tar.gz`:** Ao selecionar uma pasta local na interface, o backend gera o arquivo `.tar.gz` em memória e realiza o upload com `extract=true` e `overwrite=true`, extraindo toda a árvore de diretórios dentro do sandbox (ex: `/workspace/meu-projeto`).
    - **Provisionamento automático (`POST /v1beta/environments`):** Se a sessão ainda estiver com `environment="remote"`, o sistema provisiona automaticamente o contêiner remoto antes de realizar o upload e vincula o `environment_id` retornado à sessão.
    - **Suporte a Upload Retomável (`uploadType=resumable`):** Opção para envio em chunks (`Content-Range`) e protocolo resumable Scotty para arquivos grandes, além de explorador de arquivos do ambiente (`GET /v1beta/environments/{environment_id}/files/{path}`).
+9. **Chave Seletora `"Modo: Sandbox Remoto (Google) | Máquina Local"` & Agente / CLI Local (Estilo `gemini-cli` / `claude code`):**
+   - Na interface web (barra do compositor e painel *Run Settings*), alterne instantaneamente entre **`☁️ Sandbox Remoto (Google)`** e **`💻 Máquina Local`**.
+   - Quando em **`💻 Máquina Local`**, o agente executa comandos diretamente no terminal/sistema operacional do seu computador, cria pastas e arquivos no seu disco e lê/edita diretamente os arquivos da pasta do seu projeto (`local_workdir`), mantendo exatamente as mesmas **Capabilities e Supported Tools** da documentação oficial do Antigravity Agent (`https://aistudio.google.com/docs/antigravity-agent`):
+     - `execute_bash`: Execução de comandos no terminal/shell do sistema operacional local com captura de `stdout`, `stderr` e `exit_code`.
+     - `view_file`: Leitura de arquivos locais com numeração de linhas (`StartLine`/`EndLine`) e extração nativa de documentos (`.pdf`, `.odt`, `.odp`, `.docx`, `.pptx`).
+     - `write_to_file`: Criação/sobrescrita/append de arquivos e diretórios pai diretamente no disco local.
+     - `replace_file_content`: Edição cirúrgica de blocos de código em arquivos locais do projeto.
+     - `list_dir`, `find_by_name`, `grep_search`: Navegação e busca rápida na árvore de arquivos do projeto local.
+     - `web_search` e `browse_url`: Pesquisa web em tempo real e extração de conteúdo de páginas HTTP/HTTPS.
 
 ---
 
-## Como Executar Localmente
+## Como Executar Localmente (Interface Web + CLI)
 
 ### 1. Instalar dependências
 ```bash
-cd antigravity-studio
+cd antigravity_studio
 pip install -r requirements.txt
 ```
 
@@ -45,8 +54,22 @@ export GEMINI_API_KEY="SUA_CHAVE_AQUI"
 ```
 *(Você também pode clicar no botão **🔑 API Key** no canto superior direito da interface para salvar sua chave direto no banco SQLite).*
 
-### 3. Iniciar o servidor
+### 3. Iniciar a Interface Web (Playground)
 ```bash
 python3 run.py
 ```
-Depois, abra no navegador: **http://127.0.0.1:8000**
+Depois, abra no navegador: **http://127.0.0.1:8000** e escolha na chave seletora:
+- **Modo: `☁️ Sandbox Remoto (Google) | 💻 Máquina Local`**
+
+### 4. Usar como Agente CLI no Terminal Local (`--cli`)
+Você também pode rodar o agente diretamente no seu terminal (estilo `gemini-cli` ou `claude code`), apontando para qualquer pasta de projeto:
+
+```bash
+# Modo interativo (REPL) na pasta atual ou em um projeto específico:
+python3 run.py --cli --workdir /caminho/do/seu/projeto
+
+# Modo One-Shot (executa a tarefa localmente e encerra):
+python3 run.py --cli --workdir /caminho/do/seu/projeto -p "Analise a estrutura do projeto, rode os testes e crie um arquivo RELATORIO.md"
+```
+No modo interativo do terminal, use `/help`, `/tools`, `/cd <pasta>`, `/pwd`, `/ls`, `/local`, `/remote`, `/model <nome>` ou `/exit`.
+

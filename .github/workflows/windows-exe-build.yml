@@ -50,6 +50,8 @@ jobs:
             --hidden-import "app.main" `
             --hidden-import "app.database" `
             --hidden-import "app.interactions_client" `
+            --hidden-import "app.local_agent" `
+            --hidden-import "app.cli" `
             run.py
 
       - name: Upload Windows EXE Artifact

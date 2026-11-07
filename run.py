@@ -1,7 +1,6 @@
 import asyncio
 import errno
 import sys
-import uvicorn
 
 
 def install_windows_asyncio_shield() -> None:
@@ -145,6 +144,13 @@ if __name__ == "__main__":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+    cli_triggers = {"cli", "--cli", "-p", "--prompt", "--workdir", "-w"}
+    if any(arg in cli_triggers for arg in sys.argv[1:]):
+        from app.cli import run_cli_main
+
+        cli_args = [a for a in sys.argv[1:] if a != "--cli"]
+        sys.exit(run_cli_main(cli_args))
+
     port = int(os.environ.get("ANTIGRAVITY_PORT", "8000"))
     url = f"http://127.0.0.1:{port}"
     no_browser = (
@@ -163,6 +169,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     install_windows_asyncio_shield()
+    import uvicorn
     from app.main import app as fastapi_app
 
     print(f">> Iniciando Antigravity Studio Playground em {url} ...")

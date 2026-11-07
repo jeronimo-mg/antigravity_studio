@@ -41,11 +41,23 @@ from .interactions_client import (
     resolve_api_key,
     upload_file_to_environment,
 )
+from .local_agent import (
+    ACTIVE_LOCAL_RUNS,
+    ANTIGRAVITY_SUPPORTED_TOOLS_METADATA,
+    execute_local_tool_call,
+    get_default_local_workdir,
+    resolve_local_path,
+    run_local_agent_turn,
+    tool_find_by_name,
+    tool_list_dir,
+    tool_view_file,
+    tool_write_to_file,
+)
 
 app = FastAPI(
     title="Antigravity Studio Playground",
-    description="Interface visual estilo Google AI Studio com recuperação e continuação completa de sessões Antigravity via previous_interaction_id e environment_id.",
-    version="1.0.0",
+    description="Interface visual estilo Google AI Studio com recuperação e continuação completa de sessões Antigravity via previous_interaction_id, environment_id e Agente Local (CLI / Máquina Local).",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -72,6 +84,8 @@ class SettingsUpdate(BaseModel):
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = "Nova Conversa Antigravity"
     mode: Optional[str] = "agent"
+    execution_mode: Optional[str] = "remote"
+    local_workdir: Optional[str] = ""
     agent_name: Optional[str] = "antigravity-preview-09-2026"
     model_name: Optional[str] = "gemini-3.8-flash"
     environment_id: Optional[str] = ""
@@ -85,6 +99,8 @@ class SessionCreateRequest(BaseModel):
 class SessionUpdateRequest(BaseModel):
     title: Optional[str] = None
     mode: Optional[str] = None
+    execution_mode: Optional[str] = None
+    local_workdir: Optional[str] = None
     agent_name: Optional[str] = None
     model_name: Optional[str] = None
     environment_id: Optional[str] = None
@@ -95,12 +111,13 @@ class SessionUpdateRequest(BaseModel):
     uploaded_files: Optional[list] = None
 
 
-
 class ImportChainRequest(BaseModel):
     interaction_id: str
     environment_id: Optional[str] = ""
     title: Optional[str] = ""
     mode: Optional[str] = "agent"
+    execution_mode: Optional[str] = "remote"
+    local_workdir: Optional[str] = ""
     agent_name: Optional[str] = "antigravity-preview-09-2026"
     model_name: Optional[str] = "gemini-3.8-flash"
     api_key: Optional[str] = None
@@ -115,6 +132,8 @@ class ForkSessionRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     prompt: str
     mode: Optional[str] = None
+    execution_mode: Optional[str] = None
+    local_workdir: Optional[str] = None
     agent_name: Optional[str] = None
     model_name: Optional[str] = None
     previous_interaction_id: Optional[str] = None
@@ -307,12 +326,18 @@ async def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
     inherited_uploads = body.uploaded_files
     if not inherited_uploads and body.environment_id:
         inherited_uploads = _find_uploaded_files_for_environment(body.environment_id)
+    eff_exec_mode = (body.execution_mode or "remote").strip().lower()
+    if eff_exec_mode not in ("remote", "local"):
+        eff_exec_mode = "remote"
+    eff_workdir = (body.local_workdir or "").strip() or get_default_local_workdir()
     session = create_session(
         title=body.title or "Nova Conversa Antigravity",
         mode=body.mode or "agent",
+        execution_mode=eff_exec_mode,
+        local_workdir=eff_workdir,
         agent_name=body.agent_name or "antigravity-preview-09-2026",
         model_name=body.model_name or "gemini-3.8-flash",
-        environment_id=body.environment_id or "",
+        environment_id=body.environment_id or (f"local:{eff_workdir}" if eff_exec_mode == "local" else ""),
         last_interaction_id=body.last_interaction_id or "",
         max_total_tokens=body.max_total_tokens or 0,
         system_instruction=body.system_instruction or "",
@@ -705,6 +730,8 @@ def api_fork_session(session_id: str, body: ForkSessionRequest) -> Dict[str, Any
     forked = create_session(
         title=new_title,
         mode=source.get("mode", "agent"),
+        execution_mode=source.get("execution_mode", "remote"),
+        local_workdir=source.get("local_workdir", ""),
         agent_name=source.get("agent_name", "antigravity-preview-09-2026"),
         model_name=source.get("model_name", "gemini-3.8-flash"),
         environment_id=target_env,
@@ -736,11 +763,14 @@ def api_fork_session(session_id: str, body: ForkSessionRequest) -> Dict[str, Any
 async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[str, Any]:
     """
     Envia uma nova mensagem na sessão encadeando automaticamente:
-    - previous_interaction_id (da sessão ou sobrescrito manualmente)
-    - environment (environment_id da sessão para manter o mesmo container Linux do Antigravity)
-    - Verificação Pre-Flight na Gemini Files API: antes de enviar, checa se outro dispositivo
-      avançou a conversa na nuvem e puxa os turnos/uploads faltantes automaticamente.
+    - Modo Sandbox Remoto (Google): usa `agent="antigravity-preview-09-2026"` + `environment_id` remoto na nuvem.
+    - Modo Máquina Local: executa o loop do Agente Local diretamente no sistema operacional/terminal
+      e pasta do projeto do usuário (`local_workdir`) mantendo todas as Capabilities e Supported Tools
+      da documentação oficial (`execute_bash`, `view_file`, `write_to_file`, `replace_file_content`,
+      `list_dir`, `find_by_name`, `grep_search`, `web_search`, `browse_url`).
     """
+    import uuid as _uuid
+
     session = get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
@@ -749,16 +779,26 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
     if not prompt:
         raise HTTPException(status_code=400, detail="A mensagem não pode estar vazia.")
 
+    execution_mode = (
+        body.execution_mode
+        or session.get("execution_mode")
+        or "remote"
+    ).strip().lower()
+    if execution_mode not in ("remote", "local"):
+        execution_mode = "remote"
+
+    local_workdir = resolve_local_path(
+        ".",
+        (body.local_workdir or session.get("local_workdir") or get_default_local_workdir()).strip(),
+    )
+
     # PROTEÇÃO PRE-FLIGHT CONTRA DESSINCRONIZAÇÃO (SPLIT-BRAIN):
-    # Mesmo que a UI tenha preenchido previous_interaction_id com o last_interaction_id local,
-    # se não for um fork manual explícito para um turno antigo, consulta o ponteiro da sessão
-    # na Gemini Files API antes de enviar o prompt para puxar eventuais turnos feitos em outro PC/celular.
     pre_flight_synced_turns = 0
     requested_prev = (body.previous_interaction_id or "").strip()
     initial_local_last = (session.get("last_interaction_id") or "").strip()
     is_manual_fork = bool(requested_prev and initial_local_last and requested_prev != initial_local_last)
 
-    if not is_manual_fork:
+    if not is_manual_fork and execution_mode == "remote":
         try:
             cloud_meta = await get_synced_session_from_files_api(session_id, api_key=body.api_key)
             if cloud_meta:
@@ -822,17 +862,204 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         if body.system_instruction is not None
         else session.get("system_instruction", "")
     )
-
     sources = (
         body.sources
         if body.sources is not None
         else session.get("sources", [])
     )
+    turns = session.get("turns", [])
+    next_index = len(turns) + 1
+
+    new_title = session.get("title", "Nova Conversa Antigravity")
+    if next_index == 1 and new_title in ("Nova Conversa Antigravity", "Nova Conversa"):
+        new_title = prompt[:48] + ("..." if len(prompt) > 48 else "")
+
+    # ==========================================================================
+    # EXECUÇÃO NO MODO MÁQUINA LOCAL (CLI / LOCAL OS & FILESYSTEM AGENT)
+    # ==========================================================================
+    if execution_mode == "local":
+        local_env_label = f"local:{local_workdir}"
+        local_turn_id = f"local_{_uuid.uuid4().hex[:16]}"
+        created_ts = now_iso()
+
+        if body.background:
+            initial_steps = [{"type": "user_input", "content": [{"type": "text", "text": prompt}]}]
+            initial_raw = {
+                "id": local_turn_id,
+                "previous_interaction_id": prev_id or "",
+                "environment_id": local_env_label,
+                "execution_mode": "local",
+                "local_workdir": local_workdir,
+                "status": "in_progress",
+                "steps": initial_steps,
+                "output_text": "",
+                "usage": {},
+                "created": created_ts,
+            }
+            ACTIVE_LOCAL_RUNS[local_turn_id] = dict(initial_raw)
+            upsert_turn(
+                session_id=session_id,
+                interaction_id=local_turn_id,
+                turn_index=next_index,
+                previous_interaction_id=prev_id or "",
+                environment_id=local_env_label,
+                user_input_text=prompt,
+                output_text="",
+                status="in_progress",
+                steps=initial_steps,
+                usage={},
+                raw=initial_raw,
+                created_at=created_ts,
+            )
+            update_session(
+                session_id,
+                title=new_title,
+                mode=mode,
+                execution_mode="local",
+                local_workdir=local_workdir,
+                agent_name=agent_name,
+                model_name=model_name,
+                environment_id=local_env_label,
+                last_interaction_id=local_turn_id,
+                max_total_tokens=max_tokens,
+                system_instruction=sys_inst,
+            )
+
+            async def _bg_local_worker() -> None:
+                def _on_step(steps_now: List[Dict[str, Any]], out_now: str, status_now: str) -> None:
+                    cur_usage = (ACTIVE_LOCAL_RUNS.get(local_turn_id) or {}).get("usage") or {}
+                    upsert_turn(
+                        session_id=session_id,
+                        interaction_id=local_turn_id,
+                        turn_index=next_index,
+                        previous_interaction_id=prev_id or "",
+                        environment_id=local_env_label,
+                        user_input_text=prompt,
+                        output_text=out_now,
+                        status=status_now,
+                        steps=steps_now,
+                        usage=cur_usage,
+                        raw=ACTIVE_LOCAL_RUNS.get(local_turn_id) or initial_raw,
+                        created_at=created_ts,
+                    )
+
+                final_res = await run_local_agent_turn(
+                    prompt=prompt,
+                    workdir=local_workdir,
+                    model_name=model_name,
+                    previous_interaction_id=prev_id,
+                    system_instruction=sys_inst,
+                    history_turns=turns,
+                    api_key=body.api_key,
+                    interaction_id_override=local_turn_id,
+                    on_progress=_on_step,
+                )
+                fin_status = final_res.get("status", "completed")
+                upsert_turn(
+                    session_id=session_id,
+                    interaction_id=local_turn_id,
+                    turn_index=next_index,
+                    previous_interaction_id=prev_id or "",
+                    environment_id=local_env_label,
+                    user_input_text=prompt,
+                    output_text=final_res.get("output_text", ""),
+                    status=fin_status,
+                    steps=final_res.get("steps", []),
+                    usage=final_res.get("usage", {}),
+                    raw=final_res,
+                    created_at=created_ts,
+                )
+                next_valid_last = (
+                    final_res.get("_api_interaction_id") or local_turn_id
+                    if fin_status not in ("failed", "cancelled")
+                    else (prev_id or "")
+                )
+                update_session(
+                    session_id,
+                    execution_mode="local",
+                    local_workdir=local_workdir,
+                    environment_id=local_env_label,
+                    last_interaction_id=next_valid_last,
+                )
+
+            asyncio.create_task(_bg_local_worker())
+            return {
+                "session": get_session(session_id),
+                "latest_interaction": initial_raw,
+                "sent_payload": {
+                    "execution_mode": "local",
+                    "local_workdir": local_workdir,
+                    "model": model_name,
+                    "input": prompt,
+                },
+                "pre_flight_synced_turns": 0,
+            }
+
+        # Execução síncrona no modo Máquina Local
+        local_res = await run_local_agent_turn(
+            prompt=prompt,
+            workdir=local_workdir,
+            model_name=model_name,
+            previous_interaction_id=prev_id,
+            system_instruction=sys_inst,
+            history_turns=turns,
+            api_key=body.api_key,
+            interaction_id_override=local_turn_id,
+        )
+        fin_status = local_res.get("status", "completed")
+        upsert_turn(
+            session_id=session_id,
+            interaction_id=local_turn_id,
+            turn_index=next_index,
+            previous_interaction_id=prev_id or "",
+            environment_id=local_env_label,
+            user_input_text=prompt,
+            output_text=local_res.get("output_text", ""),
+            status=fin_status,
+            steps=local_res.get("steps", []),
+            usage=local_res.get("usage", {}),
+            raw=local_res,
+            created_at=local_res.get("created"),
+        )
+        next_valid_last = (
+            local_res.get("_api_interaction_id") or local_turn_id
+            if fin_status not in ("failed", "cancelled")
+            else (prev_id or "")
+        )
+        update_session(
+            session_id,
+            title=new_title,
+            mode=mode,
+            execution_mode="local",
+            local_workdir=local_workdir,
+            agent_name=agent_name,
+            model_name=model_name,
+            environment_id=local_env_label,
+            last_interaction_id=next_valid_last,
+            max_total_tokens=max_tokens,
+            system_instruction=sys_inst,
+        )
+        return {
+            "session": get_session(session_id),
+            "latest_interaction": local_res,
+            "sent_payload": {
+                "execution_mode": "local",
+                "local_workdir": local_workdir,
+                "model": model_name,
+                "input": prompt,
+            },
+            "pre_flight_synced_turns": 0,
+        }
+
+    # ==========================================================================
+    # EXECUÇÃO NO MODO SANDBOX REMOTO (GOOGLE CLOUD CONTAINER)
+    # ==========================================================================
+    if env_id.startswith("local:"):
+        env_id = ""
 
     uploaded_files = session.get("uploaded_files", []) or _find_uploaded_files_for_environment(env_id)
-    turns = session.get("turns", [])
 
-    if prev_id and prev_id.strip() and not turns:
+    if prev_id and prev_id.strip() and not prev_id.startswith("local_") and not turns:
         try:
             loaded_session = await _load_chain_into_session(session_id, prev_id.strip(), api_key=body.api_key)
             if loaded_session:
@@ -845,6 +1072,9 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         except Exception:
             pass
 
+    if prev_id and prev_id.startswith("local_"):
+        prev_id = ""
+
     # Monta resumo de histórico para fallback caso previous_interaction_id falhe com HTTP 500
     history_lines: List[str] = []
     for t in turns[-6:]:
@@ -855,11 +1085,6 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                 history_lines.append(f"Usuário: {ut[:600]}\nAgente: {ot[:1200]}")
     fallback_history_text = "\n---\n".join(history_lines) if history_lines else None
 
-    # Se algum turno anterior que apontava para este mesmo prev_id (ou o último turno da sessão)
-    # terminou como 'cancelled' ou 'failed', a cadeia raiz no servidor Google pode estar
-    # travada/corrompida em modo background=True (aceita o POST 200 OK mas aborta após ~60s).
-    # Nesses casos, iniciamos proativamente um novo encadeamento mantendo o mesmo environment_id
-    # e injetando o histórico resumido dos últimos turnos.
     proactively_dropped_prev = False
     effective_prompt = prompt
     if prev_id and prev_id.strip() and turns:
@@ -918,11 +1143,6 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
 
     next_index = len(turns) + 1
 
-    # Atualiza título automático se for o primeiro turno de uma sessão com título padrão
-    new_title = session.get("title", "Nova Conversa Antigravity")
-    if next_index == 1 and new_title in ("Nova Conversa Antigravity", "Nova Conversa"):
-        new_title = prompt[:48] + ("..." if len(prompt) > 48 else "")
-
     upsert_turn(
         session_id=session_id,
         interaction_id=new_interaction_id,
@@ -944,6 +1164,8 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         session_id,
         title=new_title,
         mode=mode,
+        execution_mode="remote",
+        local_workdir=local_workdir,
         agent_name=agent_name,
         model_name=model_name,
         environment_id=returned_env_id,
@@ -967,21 +1189,57 @@ async def api_poll_turn(
     interaction_id: str,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Consulta o status atualizado de uma interação (útil para background=True)."""
+    """Consulta o status atualizado de uma interação (tanto Sandbox Remoto quanto Máquina Local)."""
     session = get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
-
-    try:
-        interaction_resp = await get_interaction(interaction_id, include_input=True, api_key=api_key)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
 
     turns = session.get("turns", [])
     existing_turn = next(
         (t for t in turns if t.get("interaction_id") == interaction_id),
         None,
     )
+
+    # Se for um turno em execução na Máquina Local (`local_...`)
+    if interaction_id in ACTIVE_LOCAL_RUNS or interaction_id.startswith("local_"):
+        local_state = ACTIVE_LOCAL_RUNS.get(interaction_id)
+        if local_state:
+            turn_index = existing_turn["turn_index"] if existing_turn else len(turns) + 1
+            u_text = existing_turn.get("user_input_text", "") if existing_turn else ""
+            upsert_turn(
+                session_id=session_id,
+                interaction_id=interaction_id,
+                turn_index=turn_index,
+                previous_interaction_id=local_state.get("previous_interaction_id", ""),
+                environment_id=local_state.get("environment_id", ""),
+                user_input_text=u_text,
+                output_text=local_state.get("output_text", ""),
+                status=local_state.get("status", "in_progress"),
+                steps=local_state.get("steps", []),
+                usage=local_state.get("usage", {}),
+                raw=local_state,
+                created_at=local_state.get("created"),
+            )
+            return {
+                "session": get_session(session_id),
+                "latest_interaction": local_state,
+            }
+        if existing_turn:
+            return {
+                "session": session,
+                "latest_interaction": existing_turn.get("raw") or {
+                    "id": interaction_id,
+                    "status": existing_turn.get("status", "completed"),
+                    "steps": existing_turn.get("steps", []),
+                    "output_text": existing_turn.get("output_text", ""),
+                },
+            }
+
+    try:
+        interaction_resp = await get_interaction(interaction_id, include_input=True, api_key=api_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     turn_index = existing_turn["turn_index"] if existing_turn else len(turns) + 1
     fallback_input = existing_turn.get("user_input_text", "") if existing_turn else ""
 
@@ -998,10 +1256,6 @@ async def api_poll_turn(
     was_user_cancelled = bool(existing_raw.get("_user_cancelled"))
     already_auto_retried = bool(existing_raw.get("_auto_retried_from"))
 
-    # Auto-recuperação transparente: se um turno em background com previous_interaction_id
-    # foi abortado silenciosamente pelo backend Google ("cancelled" ou "failed" sem resposta)
-    # e NÃO foi cancelado manualmente pelo usuário, reenvia automaticamente 1 vez sem
-    # previous_interaction_id (injetando o histórico resumido e mantendo o environment_id).
     if (
         turn_status in ("failed", "cancelled")
         and not (out_text or "").strip()
@@ -1104,8 +1358,6 @@ async def api_poll_turn(
     )
 
     if turn_status in ("failed", "cancelled"):
-        # Desvincula o last_interaction_id para que o próximo envio não fique preso
-        # em uma cadeia raiz cancelada/corrompida no servidor Google
         update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id="")
     elif returned_env_id:
         update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id=interaction_id)
@@ -1131,12 +1383,45 @@ async def api_cancel_turn(
     if not session:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
 
+    existing_turn = next(
+        (t for t in session.get("turns", []) if t.get("interaction_id") == interaction_id),
+        None,
+    )
+    turn_index = existing_turn["turn_index"] if existing_turn else len(session.get("turns", [])) + 1
+    fallback_input = existing_turn.get("user_input_text", "") if existing_turn else ""
+
+    if interaction_id in ACTIVE_LOCAL_RUNS or interaction_id.startswith("local_"):
+        if interaction_id in ACTIVE_LOCAL_RUNS:
+            ACTIVE_LOCAL_RUNS[interaction_id]["cancelled"] = True
+            ACTIVE_LOCAL_RUNS[interaction_id]["status"] = "cancelled"
+        local_state = ACTIVE_LOCAL_RUNS.get(interaction_id) or (existing_turn.get("raw") if existing_turn else {}) or {}
+        local_state["status"] = "cancelled"
+        local_state["_user_cancelled"] = True
+        upsert_turn(
+            session_id=session_id,
+            interaction_id=interaction_id,
+            turn_index=turn_index,
+            previous_interaction_id=local_state.get("previous_interaction_id") or (existing_turn.get("previous_interaction_id", "") if existing_turn else ""),
+            environment_id=local_state.get("environment_id") or (existing_turn.get("environment_id", "") if existing_turn else ""),
+            user_input_text=fallback_input,
+            output_text=local_state.get("output_text") or "(Execução local cancelada pelo usuário)",
+            status="cancelled",
+            steps=local_state.get("steps") or (existing_turn.get("steps", []) if existing_turn else []),
+            usage=local_state.get("usage") or (existing_turn.get("usage", {}) if existing_turn else {}),
+            raw=local_state,
+            created_at=local_state.get("created") or (existing_turn.get("created_at") if existing_turn else None),
+        )
+        return {
+            "status": "cancelled",
+            "interaction": local_state,
+            "session": get_session(session_id),
+        }
+
     try:
         resp = await cancel_interaction(interaction_id, api_key=api_key)
     except Exception as exc:
         resp = {"id": interaction_id, "status": "cancelled", "_cancel_warning": str(exc)}
 
-    # Tenta buscar os steps/textos parciais mais recentes da API
     latest_data = resp
     try:
         polled = await get_interaction(interaction_id, include_input=True, api_key=api_key)
@@ -1146,13 +1431,6 @@ async def api_cancel_turn(
         pass
 
     latest_data["_user_cancelled"] = True
-
-    existing_turn = next(
-        (t for t in session.get("turns", []) if t.get("interaction_id") == interaction_id),
-        None,
-    )
-    turn_index = existing_turn["turn_index"] if existing_turn else len(session.get("turns", [])) + 1
-    fallback_input = existing_turn.get("user_input_text", "") if existing_turn else ""
 
     u_text, out_text = extract_texts_from_interaction(latest_data, fallback_user_input=fallback_input)
     if fallback_input and u_text.startswith("[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:"):
@@ -1185,8 +1463,6 @@ async def api_cancel_turn(
         created_at=latest_data.get("created") or (existing_turn.get("created_at") if existing_turn else None),
     )
 
-    # Limpa last_interaction_id quando o turno foi cancelado para que o próximo turno
-    # inicie uma nova cadeia limpa (com histórico resumido + mesmo environment_id)
     valid_prev = interaction_id if final_status == "completed" else ""
 
     update_session(
@@ -1252,17 +1528,46 @@ def _extract_known_paths_for_env(environment_id: str, session: Optional[Dict[str
     return paths
 
 
+def _download_local_path_or_snapshot(base_dir: str, rel_or_abs_path: Optional[str] = None) -> Tuple[bytes, str, str]:
+    import mimetypes as _mimetypes
+
+    target = resolve_local_path(rel_or_abs_path or ".", base_dir)
+    if not os.path.exists(target):
+        raise ValueError(f"Caminho local não encontrado: {target}")
+    if os.path.isdir(target):
+        return _build_local_tar_gz(target)
+    with open(target, "rb") as f:
+        data = f.read()
+    fname = os.path.basename(target) or "arquivo"
+    mime = _mimetypes.guess_type(fname)[0] or "application/octet-stream"
+    return data, fname, mime
+
+
 @app.get("/api/sessions/{session_id}/environment/download")
 async def api_download_session_environment(
     session_id: str,
     path: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Response:
-    """Baixa o snapshot (.tar.gz) do sandbox ou um arquivo específico associado a esta sessão."""
+    """Baixa o snapshot (.tar.gz) do sandbox/pasta local ou um arquivo específico associado a esta sessão."""
     session = get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
+    exec_mode = (session.get("execution_mode") or "remote").strip().lower()
     env_id = (session.get("environment_id") or "").strip()
+
+    if exec_mode == "local" or env_id.startswith("local:"):
+        base_dir = session.get("local_workdir") or env_id.removeprefix("local:") or get_default_local_workdir()
+        try:
+            content, filename, content_type = _download_local_path_or_snapshot(base_dir, path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={"Content-Disposition": _build_content_disposition(filename)},
+        )
+
     if not env_id or env_id == "remote":
         raise HTTPException(
             status_code=400,
@@ -1294,8 +1599,20 @@ async def api_download_environment_by_id(
     path: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> Response:
-    """Baixa o snapshot (.tar.gz) ou um arquivo específico diretamente pelo environment_id."""
+    """Baixa o snapshot (.tar.gz) ou um arquivo específico diretamente pelo environment_id ou pasta local."""
     clean_id = environment_id.strip()
+    if clean_id.startswith("local:"):
+        base_dir = clean_id.removeprefix("local:") or get_default_local_workdir()
+        try:
+            content, filename, content_type = _download_local_path_or_snapshot(base_dir, path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={"Content-Disposition": _build_content_disposition(filename)},
+        )
+
     if not clean_id or clean_id == "remote":
         raise HTTPException(
             status_code=400,
@@ -1501,7 +1818,75 @@ async def api_upload_to_session_environment(
     if not files_list:
         raise HTTPException(status_code=400, detail="Nenhum arquivo enviado para upload.")
 
-    env_id = clean_environment_id(parsed["environment_id"] or session.get("environment_id") or "")
+    exec_mode = (session.get("execution_mode") or "remote").strip().lower()
+    raw_env_id = (parsed["environment_id"] or session.get("environment_id") or "").strip()
+
+    if exec_mode == "local" or raw_env_id.startswith("local:"):
+        base_dir = resolve_local_path(
+            ".",
+            session.get("local_workdir") or raw_env_id.removeprefix("local:") or get_default_local_workdir(),
+        )
+        os.makedirs(base_dir, exist_ok=True)
+        rel_target = (parsed["target_path"] or "").strip()
+        if rel_target in ("workspace", "/workspace", ".", "/"):
+            rel_target = ""
+
+        total_bytes = 0
+        saved_paths: List[str] = []
+        for item in files_list:
+            rel_item = (item["path"] or "file.bin").lstrip("/\\")
+            if len(files_list) == 1 and rel_target and not rel_target.endswith("/"):
+                dest_full = resolve_local_path(rel_target, base_dir)
+            elif rel_target:
+                dest_full = resolve_local_path(os.path.join(rel_target, rel_item), base_dir)
+            else:
+                dest_full = resolve_local_path(rel_item, base_dir)
+            os.makedirs(os.path.dirname(dest_full) or base_dir, exist_ok=True)
+            with open(dest_full, "wb") as fp:
+                fp.write(item["bytes"])
+            total_bytes += len(item["bytes"])
+            saved_paths.append(dest_full)
+
+        local_env_id = f"local:{base_dir}"
+        label = (
+            files_list[0]["path"]
+            if len(files_list) == 1
+            else f"Pasta/Pacote Local ({len(files_list)} arquivos)"
+        )
+        current_uploaded = list(session.get("uploaded_files") or [])
+        upload_record = {
+            "label": label,
+            "summary": label,
+            "target_path": saved_paths[0] if len(saved_paths) == 1 else base_dir,
+            "size_bytes": total_bytes,
+            "mime_type": files_list[0].get("mime_type", "application/octet-stream"),
+            "extract": False,
+            "overwrite": parsed["overwrite"],
+            "resumable": False,
+            "upload_mode": "local_disk",
+            "file_count": len(files_list),
+            "environment_id": local_env_id,
+            "uploaded_at": now_iso(),
+        }
+        current_uploaded.append(upload_record)
+        updated_session = update_session(
+            session_id,
+            execution_mode="local",
+            local_workdir=base_dir,
+            environment_id=local_env_id,
+            uploaded_files=current_uploaded,
+        )
+        return {
+            "status": "uploaded",
+            "provisioned_new_environment": False,
+            "auto_provisioned_environment": False,
+            "environment_id": local_env_id,
+            "upload": upload_record,
+            "upload_result": upload_record,
+            "session": updated_session,
+        }
+
+    env_id = clean_environment_id(raw_env_id)
     provisioned_now = False
 
     # Se ainda não houver um environment_id provisionado na sessão e auto_provision=True,
@@ -1688,6 +2073,83 @@ async def api_upload_to_environment_by_id(
     }
 
 
+def _build_local_tar_gz(target_dir: str) -> Tuple[bytes, str, str]:
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    ignore_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+    base_name = os.path.basename(target_dir.rstrip("/\\")) or "local_workspace"
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for r, dirs, files in os.walk(target_dir):
+            dirs[:] = [d for d in dirs if d not in ignore_dirs]
+            for f in files:
+                full_p = os.path.join(r, f)
+                rel_p = os.path.relpath(full_p, target_dir).replace("\\", "/")
+                try:
+                    tar.add(full_p, arcname=f"{base_name}/{rel_p}", recursive=False)
+                except Exception:
+                    pass
+    buf.seek(0)
+    return buf.read(), f"{base_name}.tar.gz", "application/gzip"
+
+
+@app.get("/api/local/info")
+def api_get_local_info() -> Dict[str, Any]:
+    """Retorna informações da máquina local, pasta padrão e Capabilities / Supported Tools."""
+    import platform as _platform
+    import sys as _sys_mod
+
+    return {
+        "os": f"{_platform.system()} {_platform.release()} ({_platform.machine()})",
+        "platform": _sys_mod.platform,
+        "python_version": _sys_mod.version.split()[0],
+        "default_workdir": get_default_local_workdir(),
+        "supported_tools": ANTIGRAVITY_SUPPORTED_TOOLS_METADATA,
+    }
+
+
+@app.get("/api/local/files")
+def api_list_local_files(
+    path: Optional[str] = None,
+    workdir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Lista arquivos e diretórios diretamente do disco da máquina local."""
+    base_dir = (workdir or "").strip() or get_default_local_workdir()
+    target = resolve_local_path(path or ".", base_dir)
+    res = tool_list_dir(target, default_workdir=base_dir)
+    if res.get("error"):
+        raise HTTPException(status_code=400, detail=str(res["error"]))
+    return {
+        "workdir": base_dir,
+        "resolved_path": res.get("directory", target),
+        "files": res.get("entries", []),
+    }
+
+
+class LocalToolRequest(BaseModel):
+    tool_name: str
+    arguments: Dict[str, Any] = {}
+    workdir: Optional[str] = None
+
+
+@app.post("/api/local/tool")
+async def api_execute_local_tool(body: LocalToolRequest) -> Dict[str, Any]:
+    """Permite executar diretamente qualquer Supported Tool na máquina local."""
+    base_dir = resolve_local_path(".", (body.workdir or "").strip() or get_default_local_workdir())
+    res, is_err = await execute_local_tool_call(
+        tool_name=body.tool_name,
+        arguments=body.arguments,
+        workdir=base_dir,
+    )
+    return {
+        "tool_name": body.tool_name,
+        "workdir": base_dir,
+        "is_error": is_err,
+        "result": res,
+    }
+
+
 @app.get("/api/sessions/{session_id}/environment/files")
 async def api_list_session_environment_files(
     session_id: str,
@@ -1695,11 +2157,31 @@ async def api_list_session_environment_files(
     recursive: bool = True,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Lista os arquivos presentes no ambiente sandbox associado à sessão."""
+    """Lista os arquivos presentes no ambiente (Sandbox Remoto ou Máquina Local) associado à sessão."""
     session = get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
-    env_id = clean_environment_id(session.get("environment_id") or "")
+
+    exec_mode = (session.get("execution_mode") or "remote").strip().lower()
+    raw_env = (session.get("environment_id") or "").strip()
+
+    if exec_mode == "local" or raw_env.startswith("local:"):
+        base_dir = session.get("local_workdir") or raw_env.removeprefix("local:") or get_default_local_workdir()
+        req_path = "." if path in ("workspace", "", "/") else path
+        target = resolve_local_path(req_path, base_dir)
+        res = tool_list_dir(target, default_workdir=base_dir)
+        if res.get("error"):
+            raise HTTPException(status_code=400, detail=str(res["error"]))
+        return {
+            "environment_id": f"local:{base_dir}",
+            "execution_mode": "local",
+            "data": {
+                "resolved_path": res.get("directory", target),
+                "files": res.get("entries", []),
+            },
+        }
+
+    env_id = clean_environment_id(raw_env)
     if not env_id or env_id == "remote":
         raise HTTPException(
             status_code=400,
@@ -1714,7 +2196,7 @@ async def api_list_session_environment_files(
             known_paths=known_paths,
             api_key=api_key,
         )
-        return {"environment_id": env_id, "data": data}
+        return {"environment_id": env_id, "execution_mode": "remote", "data": data}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1726,7 +2208,23 @@ async def api_list_environment_files_by_id(
     recursive: bool = True,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Lista os arquivos presentes em um environment_id específico via Environments API."""
+    """Lista os arquivos presentes em um environment_id específico via Environments API ou Máquina Local."""
+    if environment_id.startswith("local:"):
+        base_dir = environment_id.removeprefix("local:") or get_default_local_workdir()
+        req_path = "." if path in ("workspace", "", "/") else path
+        target = resolve_local_path(req_path, base_dir)
+        res = tool_list_dir(target, default_workdir=base_dir)
+        if res.get("error"):
+            raise HTTPException(status_code=400, detail=str(res["error"]))
+        return {
+            "environment_id": environment_id,
+            "execution_mode": "local",
+            "data": {
+                "resolved_path": res.get("directory", target),
+                "files": res.get("entries", []),
+            },
+        }
+
     clean_id = clean_environment_id(environment_id)
     known_paths = _extract_known_paths_for_env(clean_id)
     try:

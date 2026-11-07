@@ -50,12 +50,14 @@ jobs:
             --hidden-import "app.main" \
             --hidden-import "app.database" \
             --hidden-import "app.interactions_client" \
+            --hidden-import "app.local_agent" \
+            --hidden-import "app.cli" \
             run.py
           chmod +x dist/AntigravityStudio-linux-x86_64
 
       - name: Package Debian / Lubuntu Installer (.deb)
         run: |
-          PKG_DIR="build_deb/antigravity-studio_1.1.0_amd64"
+          PKG_DIR="build_deb/antigravity-studio_1.2.0_amd64"
           mkdir -p "$PKG_DIR/DEBIAN"
           mkdir -p "$PKG_DIR/opt/antigravity-studio"
           mkdir -p "$PKG_DIR/usr/bin"
@@ -104,7 +106,7 @@ jobs:
 
           cat << 'EOF' > "$PKG_DIR/DEBIAN/control"
           Package: antigravity-studio
-          Version: 1.1.0
+          Version: 1.2.0
           Section: devel
           Priority: optional
           Architecture: amd64
@@ -115,7 +117,7 @@ jobs:
            completa de sessoes Antigravity via previous_interaction_id e environment_id.
           EOF
 
-          dpkg-deb --build --root-owner-group "$PKG_DIR" dist/antigravity-studio_1.1.0_amd64.deb
+          dpkg-deb --build --root-owner-group "$PKG_DIR" dist/antigravity-studio_1.2.0_amd64.deb
 
       - name: Upload Linux / Lubuntu Artifacts
         uses: actions/upload-artifact@v4
@@ -123,4 +125,4 @@ jobs:
           name: antigravity-studio-linux-lubuntu
           path: |
             dist/AntigravityStudio-linux-x86_64
-            dist/antigravity-studio_1.1.0_amd64.deb
+            dist/antigravity-studio_1.2.0_amd64.deb

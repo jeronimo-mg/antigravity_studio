@@ -3,6 +3,8 @@ let sessionsList = [];
 let activePollTimer = null;
 let isPollingInFlight = false;
 let pollGeneration = 0;
+let defaultLocalWorkdir = "";
+let localMachineInfo = null;
 
 async function fetchWithRetry(url, options = {}, maxRetries = 3) {
   let lastErr = null;
@@ -17,7 +19,20 @@ async function fetchWithRetry(url, options = {}, maxRetries = 3) {
   throw lastErr;
 }
 
+async function fetchLocalMachineInfo() {
+  try {
+    const res = await fetch("/api/local/info");
+    if (res.ok) {
+      localMachineInfo = await res.json();
+      defaultLocalWorkdir = localMachineInfo.default_workdir || "";
+    }
+  } catch (err) {
+    console.warn("Não foi possível carregar informações da máquina local:", err);
+  }
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
+  await fetchLocalMachineInfo();
   const hasKey = await checkApiKeyStatus();
   await loadSessionsList();
 
@@ -49,6 +64,15 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   const envInput = document.getElementById("environmentIdInput");
   envInput.addEventListener("input", updateHeaderAndComposerBadges);
+
+  const localWorkdirEl = document.getElementById("localWorkdirInput");
+  if (localWorkdirEl) {
+    localWorkdirEl.addEventListener("input", () => {
+      const compEl = document.getElementById("composerLocalWorkdirInput");
+      if (compEl) compEl.value = localWorkdirEl.value;
+      updateHeaderAndComposerBadges();
+    });
+  }
 });
 
 async function checkApiKeyStatus() {
@@ -132,9 +156,12 @@ function renderSessionsSidebar() {
   container.innerHTML = sessionsList
     .map((s) => {
       const isSelected = currentSession && currentSession.id === s.id;
-      const envBadge = s.environment_id
+      const isLocal = (s.execution_mode || "remote") === "local" || (s.environment_id || "").startsWith("local:");
+      const modeBadge = isLocal
+        ? `<span class="text-[10px] font-mono text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.5 rounded">💻 Local</span>`
+        : s.environment_id
         ? `<span class="text-[10px] font-mono text-purple-300 bg-purple-500/10 px-1.5 py-0.5 rounded">${escapeHtml(s.environment_id.slice(0, 12))}</span>`
-        : "";
+        : `<span class="text-[10px] font-mono text-blue-300 bg-blue-500/10 px-1.5 py-0.5 rounded">☁️ Remoto</span>`;
       return `
         <div
           onclick="selectSession('${s.id}')"
@@ -148,7 +175,7 @@ function renderSessionsSidebar() {
             <div class="font-medium truncate">${escapeHtml(s.title || "Sem título")}</div>
             <div class="flex items-center gap-1.5 mt-1 text-[10px] text-gray-400">
               <span>${s.turn_count || 0} turnos</span>
-              ${envBadge}
+              ${modeBadge}
             </div>
           </div>
           <button
@@ -165,6 +192,8 @@ function renderSessionsSidebar() {
 }
 
 async function createNewSession() {
+  const currentExecMode = currentSession ? (currentSession.execution_mode || "remote") : "remote";
+  const currentLocalDir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || "";
   try {
     const res = await fetch("/api/sessions", {
       method: "POST",
@@ -172,6 +201,8 @@ async function createNewSession() {
       body: JSON.stringify({
         title: "Nova Conversa Antigravity",
         mode: "agent",
+        execution_mode: currentExecMode,
+        local_workdir: currentLocalDir,
         agent_name: "antigravity-preview-09-2026",
         model_name: "gemini-3.8-flash",
       }),
@@ -233,9 +264,118 @@ function syncInputsFromSession() {
   document.getElementById("sysInstructionInput").value =
     currentSession.system_instruction || "";
 
+  const workdirVal = currentSession.local_workdir || defaultLocalWorkdir || "";
+  const localWorkdirEl = document.getElementById("localWorkdirInput");
+  const compWorkdirEl = document.getElementById("composerLocalWorkdirInput");
+  if (localWorkdirEl) localWorkdirEl.value = workdirVal;
+  if (compWorkdirEl) compWorkdirEl.value = workdirVal;
+
+  updateExecutionModeUI(currentSession.execution_mode || "remote");
   updateModeUI(currentSession.mode || "agent");
   renderSourcesList();
   renderUploadedFilesList();
+  updateHeaderAndComposerBadges();
+}
+
+function setExecutionMode(execMode) {
+  updateExecutionModeUI(execMode);
+  saveSessionSettings(null, execMode);
+}
+
+function syncLocalWorkdirFromComposer(val) {
+  const localWorkdirEl = document.getElementById("localWorkdirInput");
+  if (localWorkdirEl) {
+    localWorkdirEl.value = val;
+  }
+  saveSessionSettings();
+}
+
+function useDefaultLocalWorkdir() {
+  const dir = defaultLocalWorkdir || ".";
+  const localWorkdirEl = document.getElementById("localWorkdirInput");
+  const compWorkdirEl = document.getElementById("composerLocalWorkdirInput");
+  if (localWorkdirEl) localWorkdirEl.value = dir;
+  if (compWorkdirEl) compWorkdirEl.value = dir;
+  saveSessionSettings();
+}
+
+function updateExecutionModeUI(execMode) {
+  const norm = execMode === "local" ? "local" : "remote";
+  if (currentSession) {
+    currentSession.execution_mode = norm;
+  }
+
+  const remoteBtn = document.getElementById("execModeRemoteBtn");
+  const localBtn = document.getElementById("execModeLocalBtn");
+  const compRemoteBtn = document.getElementById("composerExecRemoteBtn");
+  const compLocalBtn = document.getElementById("composerExecLocalBtn");
+  const descEl = document.getElementById("execModeDescription");
+  const localGroup = document.getElementById("localMachineConfigGroup");
+  const compLocalBar = document.getElementById("composerLocalBar");
+  const engineBadge = document.getElementById("sidebarEngineBadge");
+
+  if (norm === "local") {
+    if (localBtn) {
+      localBtn.className =
+        "py-2 px-2 rounded-md font-semibold text-[11px] transition bg-emerald-600/30 text-emerald-200 border border-emerald-500/50 shadow";
+    }
+    if (remoteBtn) {
+      remoteBtn.className =
+        "py-2 px-2 rounded-md font-semibold text-[11px] transition text-gray-400 hover:text-white border border-transparent";
+    }
+    if (compLocalBtn) {
+      compLocalBtn.className =
+        "px-2.5 py-1 rounded-md text-[11px] font-semibold transition bg-emerald-600/30 text-emerald-200 border border-emerald-500/50";
+    }
+    if (compRemoteBtn) {
+      compRemoteBtn.className =
+        "px-2.5 py-1 rounded-md text-[11px] font-semibold transition text-gray-400 hover:text-white border border-transparent";
+    }
+    if (descEl) {
+      descEl.textContent =
+        "Executa comandos diretamente no seu terminal/OS local e cria/lê/edita arquivos diretamente na pasta do seu projeto com todas as Supported Tools.";
+    }
+    if (localGroup) localGroup.classList.remove("hidden");
+    if (compLocalBar) {
+      compLocalBar.classList.remove("hidden");
+      compLocalBar.classList.add("flex");
+    }
+    if (engineBadge) {
+      engineBadge.textContent = "💻 Máquina Local";
+      engineBadge.className = "text-[11px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-500/40";
+    }
+  } else {
+    if (remoteBtn) {
+      remoteBtn.className =
+        "py-2 px-2 rounded-md font-semibold text-[11px] transition bg-blue-600/25 text-blue-200 border border-blue-500/40 shadow";
+    }
+    if (localBtn) {
+      localBtn.className =
+        "py-2 px-2 rounded-md font-semibold text-[11px] transition text-gray-400 hover:text-white border border-transparent";
+    }
+    if (compRemoteBtn) {
+      compRemoteBtn.className =
+        "px-2.5 py-1 rounded-md text-[11px] font-semibold transition bg-blue-600/25 text-blue-200 border border-blue-500/40";
+    }
+    if (compLocalBtn) {
+      compLocalBtn.className =
+        "px-2.5 py-1 rounded-md text-[11px] font-semibold transition text-gray-400 hover:text-white border border-transparent";
+    }
+    if (descEl) {
+      descEl.textContent =
+        "Executa em container Linux isolado nos servidores do Google via Interactions API.";
+    }
+    if (localGroup) localGroup.classList.add("hidden");
+    if (compLocalBar) {
+      compLocalBar.classList.add("hidden");
+      compLocalBar.classList.remove("flex");
+    }
+    if (engineBadge) {
+      engineBadge.textContent = "Interactions API";
+      engineBadge.className = "text-[11px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30";
+    }
+  }
+
   updateHeaderAndComposerBadges();
 }
 
@@ -253,6 +393,7 @@ function updateModeUI(mode) {
   const budgetGroup = document.getElementById("budgetConfigGroup");
   const sysGroup = document.getElementById("sysInstructionGroup");
   const modelLabel = document.getElementById("modelSelectLabel");
+  const isLocal = currentSession && currentSession.execution_mode === "local";
 
   if (mode === "agent") {
     agentBtn.className =
@@ -260,10 +401,16 @@ function updateModeUI(mode) {
     modelBtn.className =
       "py-1.5 rounded-md font-medium transition text-gray-400 hover:text-white";
     agentGroup.classList.remove("hidden");
-    envGroup.classList.remove("hidden");
-    if (sourcesGroup) sourcesGroup.classList.remove("hidden");
+    if (isLocal) {
+      envGroup.classList.add("hidden");
+      if (sourcesGroup) sourcesGroup.classList.add("hidden");
+      sysGroup.classList.remove("hidden");
+    } else {
+      envGroup.classList.remove("hidden");
+      if (sourcesGroup) sourcesGroup.classList.remove("hidden");
+      sysGroup.classList.add("hidden");
+    }
     budgetGroup.classList.remove("hidden");
-    sysGroup.classList.add("hidden");
     modelLabel.textContent = "Modelo Subjacente (agent_config.model)";
   } else {
     modelBtn.className =
@@ -285,6 +432,8 @@ function updateHeaderAndComposerBadges() {
   const prevId = document.getElementById("prevInteractionIdInput").value.trim();
   const envId = document.getElementById("environmentIdInput").value.trim();
   const mode = currentSession ? currentSession.mode : "agent";
+  const execMode = currentSession ? (currentSession.execution_mode || "remote") : "remote";
+  const localDir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || ".";
 
   const headerPrev = document.getElementById("headerPrevId");
   const headerEnv = document.getElementById("headerEnvId");
@@ -302,9 +451,17 @@ function updateHeaderAndComposerBadges() {
     chainDot.className = "w-2 h-2 rounded-full bg-gray-500";
   }
 
-  if (mode === "agent") {
-    headerEnv.textContent = envId ? envId : "remote (novo)";
-    composerEnv.textContent = `environment: ${envId ? envId : "remote"}`;
+  if (execMode === "local") {
+    const shortDir = localDir.length > 28 ? "..." + localDir.slice(-26) : localDir;
+    headerEnv.textContent = `local:${shortDir}`;
+    composerEnv.textContent = `💻 local: ${shortDir}`;
+    composerEnv.className = "px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono text-[11px]";
+    composerEnv.classList.remove("hidden");
+  } else if (mode === "agent") {
+    const cleanEnv = envId.startsWith("local:") ? "" : envId;
+    headerEnv.textContent = cleanEnv ? cleanEnv : "remote (novo)";
+    composerEnv.textContent = `environment: ${cleanEnv ? cleanEnv : "remote"}`;
+    composerEnv.className = "px-2 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30 font-mono text-[11px]";
     composerEnv.classList.remove("hidden");
   } else {
     headerEnv.textContent = "N/A (Modo Model)";
@@ -312,15 +469,26 @@ function updateHeaderAndComposerBadges() {
   }
 }
 
-async function saveSessionSettings(overrideMode = null) {
+async function saveSessionSettings(overrideMode = null, overrideExecMode = null) {
   if (!currentSession) return;
+  const execMode = overrideExecMode || currentSession.execution_mode || "remote";
+  const localWorkdir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || "";
+  let envVal = document.getElementById("environmentIdInput").value.trim();
+  if (execMode === "local") {
+    envVal = localWorkdir ? `local:${localWorkdir}` : "";
+  } else if (envVal.startsWith("local:")) {
+    envVal = "";
+  }
+
   const payload = {
     title: document.getElementById("sessionTitleInput").value.trim() || "Conversa Antigravity",
     mode: overrideMode || currentSession.mode || "agent",
+    execution_mode: execMode,
+    local_workdir: localWorkdir,
     agent_name: document.getElementById("agentSelect").value,
     model_name: document.getElementById("modelSelect").value,
     last_interaction_id: document.getElementById("prevInteractionIdInput").value.trim(),
-    environment_id: document.getElementById("environmentIdInput").value.trim(),
+    environment_id: envVal,
     max_total_tokens: parseInt(document.getElementById("maxTokensInput").value || "0", 10),
     system_instruction: document.getElementById("sysInstructionInput").value,
     sources: currentSession ? (currentSession.sources || []) : [],
@@ -589,10 +757,19 @@ function renderSingleTurnCard(turn, turnNumber) {
     `
     : "";
 
+  const isLocalTurn =
+    (turn.environment_id || "").startsWith("local:") ||
+    (turn.interaction_id || "").startsWith("local_") ||
+    (currentSession && currentSession.execution_mode === "local");
+
   const renderedOutput = turn.output_text
     ? marked.parse(turn.output_text)
     : status === "in_progress"
-    ? `<div class="text-amber-300 text-xs flex items-center gap-2">⏳ O agente Antigravity está executando esta tarefa no sandbox remoto...</div>`
+    ? `<div class="text-amber-300 text-xs flex items-center gap-2">⏳ ${
+        isLocalTurn
+          ? "O agente Antigravity está executando ferramentas diretamente na sua Máquina Local..."
+          : "O agente Antigravity está executando esta tarefa no sandbox remoto..."
+      }</div>`
     : `<div class="text-gray-500 italic text-xs">(Sem texto de saída final neste turno)</div>`;
 
   const incompleteBanner =
@@ -600,7 +777,7 @@ function renderSingleTurnCard(turn, turnNumber) {
       ? `
       <div class="mt-3 p-3 rounded-xl bg-orange-500/15 border border-orange-500/40 flex items-center justify-between text-xs">
         <div class="text-orange-200">
-          ⚠️ <strong>Interação pausada (status: incomplete)</strong> — O limite de <code>max_total_tokens</code> foi atingido. O estado e o ambiente estão preservados.
+          ⚠️ <strong>Interação pausada (status: incomplete)</strong> — O limite de <code>max_total_tokens</code> ou passos foi atingido. O estado e o ambiente estão preservados.
         </div>
         <button
           onclick="continueIncompleteTurn('${turn.interaction_id}', '${turn.environment_id || ""}')"
@@ -617,7 +794,7 @@ function renderSingleTurnCard(turn, turnNumber) {
       ? `
       <div class="mt-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between text-xs">
         <div class="text-amber-200">
-          🔄 Execução em segundo plano em andamento (ID: <code>${escapeHtml(turn.interaction_id)}</code>)
+          🔄 Execução em andamento ${isLocalTurn ? "(💻 Máquina Local)" : "(☁️ Sandbox Remoto)"} — ID: <code>${escapeHtml(turn.interaction_id)}</code>
         </div>
         <div class="flex items-center gap-2">
           <button
@@ -655,7 +832,11 @@ function renderSingleTurnCard(turn, turnNumber) {
           }
           ${
             turn.environment_id
-              ? `<span class="text-purple-300 font-mono bg-purple-500/10 border border-purple-500/30 px-1.5 py-0.5 rounded">env: ${escapeHtml(turn.environment_id)}</span>`
+              ? `<span class="${
+                  turn.environment_id.startsWith("local:")
+                    ? "text-emerald-300 bg-emerald-500/15 border-emerald-500/40"
+                    : "text-purple-300 bg-purple-500/10 border-purple-500/30"
+                } font-mono border px-1.5 py-0.5 rounded">${escapeHtml(turn.environment_id)}</span>`
               : ""
           }
         </div>
@@ -722,9 +903,14 @@ async function sendPrompt(overridePrompt = null) {
     promptEl.value = "";
   }
 
+  const execMode = currentSession.execution_mode || "remote";
+  const localWorkdir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || "";
+
   const body = {
     prompt: promptText,
     mode: currentSession.mode || "agent",
+    execution_mode: execMode,
+    local_workdir: localWorkdir,
     agent_name: document.getElementById("agentSelect").value,
     model_name: document.getElementById("modelSelect").value,
     previous_interaction_id: document.getElementById("prevInteractionIdInput").value.trim(),
@@ -756,7 +942,7 @@ async function sendPrompt(overridePrompt = null) {
       startPollingTurn(currentSession.id, latest.id);
     }
   } catch (err) {
-    alert("Erro na chamada da Interactions API:\n\n" + err.message);
+    alert("Erro na execução do agente:\n\n" + err.message);
     if (overridePrompt === null) {
       promptEl.value = promptText;
     }
@@ -804,6 +990,7 @@ function startPollingTurn(sessionId, interactionId) {
   stopPolling();
   const myGen = ++pollGeneration;
   let currentPolledId = interactionId;
+  const intervalMs = String(interactionId || "").startsWith("local_") ? 1500 : 4000;
   activePollTimer = setInterval(async () => {
     if (isPollingInFlight || myGen !== pollGeneration) return;
     isPollingInFlight = true;
@@ -815,7 +1002,7 @@ function startPollingTurn(sessionId, interactionId) {
     } finally {
       isPollingInFlight = false;
     }
-  }, 4000);
+  }, intervalMs);
 }
 
 function stopPolling() {
@@ -951,6 +1138,7 @@ function openCodeModal() {
   const agent = document.getElementById("agentSelect").value;
   const model = document.getElementById("modelSelect").value;
   const mode = currentSession ? currentSession.mode : "agent";
+  const localDir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || ".";
 
   let pyCode = "";
   let curlCode = "";
@@ -1017,7 +1205,7 @@ print(interaction.output_text)`;
   }'`;
   }
 
-  const cleanEnv = (!envId || envId === "remote") ? "<ENVIRONMENT_ID>" : envId.replace(/^environments\//, "");
+  const cleanEnv = (!envId || envId === "remote" || envId.startsWith("local:")) ? "<ENVIRONMENT_ID>" : envId.replace(/^environments\//, "");
   const uploadedFiles = currentSession ? (currentSession.uploaded_files || []) : [];
   const lastUploaded = uploadedFiles.length > 0 ? uploadedFiles[uploadedFiles.length - 1] : null;
   const sampleTarget = lastUploaded ? (lastUploaded.target_path || "/workspace/project") : "/workspace/project";
@@ -1061,11 +1249,32 @@ curl -X PUT \\
   -H "Content-Type: application/gzip" \\
   --data-binary @project.tar.gz`;
 
+  const localCliCode = `# 1) Modo Interativo no Terminal Local (estilo gemini-cli / claude code):
+python run.py --cli --workdir "${localDir}" --model "${model}"
+
+# 2) Execução One-Shot direto do seu terminal:
+python run.py --cli --workdir "${localDir}" -p "Analise os arquivos deste projeto e rode os testes"
+
+# 3) Uso programático do Agente Local em Python:
+import asyncio
+from app.local_agent import run_local_agent_turn
+
+res = asyncio.run(run_local_agent_turn(
+    prompt="Liste os arquivos da pasta e crie um resumo em RESUMO.md",
+    workdir=r"${localDir}",
+    model_name="${model}",
+))
+print(res["output_text"])`;
+
   document.getElementById("pythonCodeSnippet").textContent = pyCode;
   document.getElementById("curlCodeSnippet").textContent = curlCode;
   const envUploadEl = document.getElementById("envUploadCodeSnippet");
   if (envUploadEl) {
     envUploadEl.textContent = envUploadCode;
+  }
+  const localCliEl = document.getElementById("localCliCodeSnippet");
+  if (localCliEl) {
+    localCliEl.textContent = localCliCode;
   }
   document.getElementById("codeModal").classList.remove("hidden");
   document.getElementById("codeModal").classList.add("flex");
@@ -1814,6 +2023,21 @@ async function openEnvFilesModal() {
   modal.classList.add("flex");
   const filterEl = document.getElementById("envFilesFilterInput");
   if (filterEl) filterEl.value = "";
+  const isLocal = currentSession && currentSession.execution_mode === "local";
+  const titleEl = document.getElementById("envFilesModalTitle");
+  const pathInput = document.getElementById("envFilesPathInput");
+  if (isLocal) {
+    const localDir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || ".";
+    if (titleEl) titleEl.textContent = `Arquivos na Máquina Local (${localDir}) — Explorar e Baixar`;
+    if (pathInput && (pathInput.value === "workspace" || !pathInput.value)) {
+      pathInput.value = ".";
+    }
+  } else {
+    if (titleEl) titleEl.textContent = "Arquivos no Ambiente Sandbox — Explorar e Baixar";
+    if (pathInput && pathInput.value === ".") {
+      pathInput.value = "workspace";
+    }
+  }
   await refreshEnvFilesList();
 }
 
@@ -1852,7 +2076,7 @@ function normalizeEnvEntry(item, queriedPath) {
     rawPath = rawPath.split("/files/")[1];
   }
   let cleanPath = rawPath.replace(/^\/+/, "");
-  if (cleanPath && base && !cleanPath.startsWith(base + "/") && cleanPath !== base && !rawPath.startsWith("/")) {
+  if (cleanPath && base && base !== "." && !cleanPath.startsWith(base + "/") && cleanPath !== base && !rawPath.startsWith("/")) {
     cleanPath = `${base}/${cleanPath}`;
   }
 
@@ -1871,8 +2095,8 @@ function normalizeEnvEntry(item, queriedPath) {
   const sizeStr = rawSize !== undefined && rawSize !== null && !isDir ? formatBytesSize(rawSize) : "";
 
   return {
-    fullPath: cleanPath || base,
-    displayName: cleanPath || rawPath || JSON.stringify(item),
+    fullPath: rawPath || cleanPath || base,
+    displayName: item.name || cleanPath || rawPath || JSON.stringify(item),
     isDir,
     sizeStr,
   };
@@ -1881,13 +2105,32 @@ function normalizeEnvEntry(item, queriedPath) {
 function navigateEnvFolder(folderPath) {
   const input = document.getElementById("envFilesPathInput");
   if (!input) return;
-  input.value = (folderPath || "workspace").replace(/^\/+|\/+$/g, "") || "workspace";
+  const isLocal = currentSession && currentSession.execution_mode === "local";
+  if (isLocal) {
+    input.value = folderPath || ".";
+  } else {
+    input.value = (folderPath || "workspace").replace(/^\/+|\/+$/g, "") || "workspace";
+  }
   refreshEnvFilesList();
 }
 
 function navigateEnvParentFolder() {
   const input = document.getElementById("envFilesPathInput");
   if (!input) return;
+  const isLocal = currentSession && currentSession.execution_mode === "local";
+  if (isLocal) {
+    const current = (input.value || ".").replace(/[\\/]+$/, "");
+    if (!current || current === "." || current === "/") {
+      input.value = "..";
+    } else {
+      const sep = current.includes("\\") ? "\\" : "/";
+      const parts = current.split(/[\\/]/);
+      parts.pop();
+      input.value = parts.join(sep) || ".";
+    }
+    refreshEnvFilesList();
+    return;
+  }
   const current = (input.value || "workspace").replace(/^\/+|\/+$/g, "");
   if (!current || !current.includes("/")) {
     input.value = "workspace";
@@ -1921,7 +2164,8 @@ function filterEnvFilesRenderedList() {
 }
 
 async function copyEnvFilePath(filePath, btnEl) {
-  const formatted = filePath.startsWith("/") ? filePath : `/${filePath}`;
+  const isLocal = currentSession && currentSession.execution_mode === "local";
+  const formatted = isLocal ? filePath : (filePath.startsWith("/") ? filePath : `/${filePath}`);
   try {
     await navigator.clipboard.writeText(formatted);
     if (btnEl) {
@@ -1942,15 +2186,20 @@ function downloadCurrentEnvFolder() {
 }
 
 async function downloadSpecificEnvFile(filePath, btnEl = null) {
+  const isLocal = currentSession && currentSession.execution_mode === "local";
   const envInput = document.getElementById("environmentIdInput");
-  const targetEnv = (envInput?.value || (currentSession && currentSession.environment_id) || "").trim();
+  let targetEnv = (envInput?.value || (currentSession && currentSession.environment_id) || "").trim();
+  if (isLocal && !targetEnv.startsWith("local:")) {
+    const localDir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || ".";
+    targetEnv = `local:${localDir}`;
+  }
 
-  if (!targetEnv || targetEnv === "remote") {
+  if (!isLocal && (!targetEnv || targetEnv === "remote")) {
     alert("⚠️ Nenhum environment_id ativo nesta sessão para baixar arquivos.");
     return;
   }
 
-  const cleanPath = (filePath || "").trim().replace(/^\/+/, "");
+  const cleanPath = isLocal ? (filePath || "").trim() : (filePath || "").trim().replace(/^\/+/, "");
   const origHtml = btnEl ? btnEl.innerHTML : "";
   if (btnEl) {
     btnEl.disabled = true;
@@ -1959,7 +2208,7 @@ async function downloadSpecificEnvFile(filePath, btnEl = null) {
 
   try {
     const qs = cleanPath ? `?${new URLSearchParams({ path: cleanPath }).toString()}` : "";
-    const url = (currentSession && currentSession.id && currentSession.environment_id === targetEnv)
+    const url = (currentSession && currentSession.id)
       ? `/api/sessions/${currentSession.id}/environment/download${qs}`
       : `/api/environments/${encodeURIComponent(targetEnv)}/download${qs}`;
 
@@ -1971,9 +2220,8 @@ async function downloadSpecificEnvFile(filePath, btnEl = null) {
 
     const blob = await resp.blob();
     const disposition = resp.headers.get("content-disposition") || "";
-    let filename = cleanPath ? cleanPath.split("/").filter(Boolean).pop() : `environment_${targetEnv}.tar.gz`;
+    let filename = cleanPath ? cleanPath.split(/[\\/]/).filter(Boolean).pop() : `environment.tar.gz`;
 
-    // Suporta RFC 5987 filename*=UTF-8''... e filename="..."
     const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
     if (utf8Match && utf8Match[1]) {
       try {
@@ -2017,18 +2265,24 @@ async function refreshEnvFilesList() {
   const container = document.getElementById("envFilesListContainer");
   if (!container) return;
 
-  const envId = (document.getElementById("environmentIdInput").value || "").trim();
-  const pathVal = (document.getElementById("envFilesPathInput")?.value || "workspace").trim();
+  const isLocal = currentSession && currentSession.execution_mode === "local";
+  const localDir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || ".";
+  let envId = (document.getElementById("environmentIdInput").value || "").trim();
+  if (isLocal) {
+    envId = `local:${localDir}`;
+  }
+
+  const pathVal = (document.getElementById("envFilesPathInput")?.value || (isLocal ? "." : "workspace")).trim();
   const recursive = document.getElementById("envFilesRecursiveCheckbox")?.checked ?? true;
 
-  if (!envId || envId === "remote") {
+  if (!isLocal && (!envId || envId === "remote")) {
     const uploaded = (currentSession && Array.isArray(currentSession.uploaded_files))
       ? currentSession.uploaded_files
       : [];
     container.innerHTML = `
       <div class="p-4 text-xs text-amber-300 bg-amber-950/30 border border-amber-500/30 rounded-lg space-y-2">
         <p class="font-semibold">⚠️ O ambiente desta sessão ainda está como <code>remote</code> (não provisionado).</p>
-        <p class="text-gray-300">Clique em <strong>"⚡ Provisionar"</strong>, <strong>"⬆️ Upload de Arquivo/Pasta"</strong> ou envie uma mensagem no chat para instanciar o contêiner e listar seus arquivos.</p>
+        <p class="text-gray-300">Clique em <strong>"⚡ Provisionar"</strong>, <strong>"⬆️ Upload de Arquivo/Pasta"</strong>, mude a chave seletora para <strong>"💻 Máquina Local"</strong> ou envie uma mensagem no chat.</p>
         ${uploaded.length > 0 ? `<p class="text-blue-300">Registros de uploads na sessão: ${uploaded.length}</p>` : ""}
       </div>
     `;
@@ -2064,9 +2318,10 @@ async function refreshEnvFilesList() {
     let html = "";
     if (filesArr && filesArr.length > 0) {
       const entries = filesArr.map((item) => normalizeEnvEntry(item, pathVal));
+      const resolvedHeader = apiData.resolved_path || pathVal;
       html += `
         <div class="flex items-center justify-between text-[11px] text-gray-400 pb-1.5 mb-1.5 border-b border-studio-border">
-          <span>Caminho consultado: <code class="text-purple-300">/${escapeHtml(pathVal.replace(/^\/+/, ""))}</code></span>
+          <span>Caminho consultado: <code class="${isLocal ? "text-emerald-300" : "text-purple-300"}">${escapeHtml(resolvedHeader)}</code></span>
           <span id="envFilesVisibleCount">${entries.length} item(ns)</span>
         </div>
         <div class="space-y-1.5">
@@ -2110,7 +2365,7 @@ async function refreshEnvFilesList() {
             <div data-filepath="${escapeHtml(entry.fullPath)}" class="env-file-row flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-studio-card hover:bg-gray-800/80 border border-studio-border text-xs font-mono transition">
               <div class="flex items-center gap-2 min-w-0 flex-1">
                 <span class="shrink-0">📄</span>
-                <span class="text-gray-100 truncate" title="/${escapeHtml(entry.fullPath)}">${escapeHtml(entry.displayName)}</span>
+                <span class="text-gray-100 truncate" title="${escapeHtml(entry.fullPath)}">${escapeHtml(entry.displayName)}</span>
                 ${entry.sizeStr ? `<span class="text-gray-500 text-[10px] shrink-0">(${escapeHtml(entry.sizeStr)})</span>` : ""}
               </div>
               <div class="flex items-center gap-1.5 shrink-0">
@@ -2118,7 +2373,7 @@ async function refreshEnvFilesList() {
                   type="button"
                   onclick='copyEnvFilePath(${safePathJson}, this)'
                   class="px-2 py-1 rounded bg-studio-bg hover:bg-gray-700 text-gray-300 border border-studio-border text-[10px]"
-                  title="Copiar caminho completo do arquivo no sandbox"
+                  title="Copiar caminho completo do arquivo"
                 >
                   📋 Caminho
                 </button>
@@ -2126,7 +2381,7 @@ async function refreshEnvFilesList() {
                   type="button"
                   onclick='downloadSpecificEnvFile(${safePathJson}, this)'
                   class="px-2.5 py-1 rounded bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 font-semibold text-[10px] transition"
-                  title="Baixar este arquivo para o seu computador"
+                  title="Baixar este arquivo"
                 >
                   ⬇️ Baixar
                 </button>
@@ -2148,7 +2403,7 @@ async function refreshEnvFilesList() {
       : [];
     container.innerHTML = `
       <div class="p-3 text-xs text-red-300 bg-red-950/30 border border-red-500/30 rounded-lg space-y-2">
-        <div>❌ Erro ao consultar API de arquivos do ambiente: ${escapeHtml(err.message)}</div>
+        <div>❌ Erro ao consultar arquivos do ambiente: ${escapeHtml(err.message)}</div>
         ${uploaded.length > 0 ? `
           <div class="pt-2 border-t border-red-500/20 text-gray-300">
             <div class="font-semibold text-blue-300 mb-1">Histórico de Uploads registrados nesta sessão:</div>
@@ -2170,5 +2425,75 @@ async function refreshEnvFilesList() {
     `;
   }
 }
+
+// ============================================================================
+// MODAL 7: TERMINAL LOCAL & SUPPORTED TOOLS (MÁQUINA LOCAL)
+// ============================================================================
+function openLocalTerminalModal() {
+  const localDir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || ".";
+  const badge = document.getElementById("localModalWorkdirBadge");
+  if (badge) badge.textContent = localDir;
+  const cliCmd = document.getElementById("localModalCliCmd");
+  if (cliCmd) {
+    cliCmd.textContent = `python run.py --cli --workdir "${localDir}"`;
+  }
+  const modal = document.getElementById("localTerminalModal");
+  modal.classList.remove("hidden");
+  modal.classList.add("flex");
+  document.getElementById("localBashCmdInput")?.focus();
+}
+
+function closeLocalTerminalModal() {
+  const modal = document.getElementById("localTerminalModal");
+  modal.classList.add("hidden");
+  modal.classList.remove("flex");
+}
+
+async function runDirectLocalBash() {
+  const cmdInput = document.getElementById("localBashCmdInput");
+  const outBox = document.getElementById("localBashOutputBox");
+  const btn = document.getElementById("runLocalBashBtn");
+  const cmd = (cmdInput?.value || "").trim();
+  if (!cmd) return;
+
+  const localDir = document.getElementById("localWorkdirInput")?.value?.trim() || defaultLocalWorkdir || ".";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Executando...";
+  }
+  if (outBox) {
+    outBox.textContent = `$ ${cmd}\n(Executando em ${localDir}...)`;
+  }
+
+  try {
+    const res = await fetch("/api/local/tool", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tool_name: "execute_bash",
+        workdir: localDir,
+        arguments: { command: cmd, cwd: localDir },
+      }),
+    });
+    const data = await res.json();
+    const r = data.result || {};
+    const stdout = r.stdout || "";
+    const stderr = r.stderr || "";
+    const code = r.exit_code !== undefined ? r.exit_code : "?";
+    if (outBox) {
+      outBox.textContent = `$ ${cmd}\n[cwd: ${r.cwd || localDir} | exit_code: ${code}]\n\n${stdout}${stderr ? `\n[stderr]:\n${stderr}` : ""}`;
+    }
+  } catch (err) {
+    if (outBox) {
+      outBox.textContent = `❌ Erro ao executar comando local: ${err.message}`;
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "▶️ Executar no Terminal Local";
+    }
+  }
+}
+
 
 

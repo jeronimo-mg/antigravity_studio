@@ -35,6 +35,8 @@ def init_db() -> None:
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 mode TEXT NOT NULL DEFAULT 'agent',
+                execution_mode TEXT NOT NULL DEFAULT 'remote',
+                local_workdir TEXT DEFAULT '',
                 agent_name TEXT DEFAULT 'antigravity-preview-09-2026',
                 model_name TEXT DEFAULT 'gemini-3.8-flash',
                 environment_id TEXT DEFAULT '',
@@ -54,6 +56,14 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE sessions ADD COLUMN uploaded_files_json TEXT DEFAULT '[]'")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'remote'")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN local_workdir TEXT DEFAULT ''")
         except Exception:
             pass
         conn.execute(
@@ -121,26 +131,34 @@ def create_session(
     uploaded_files: Optional[List[Dict[str, Any]]] = None,
     session_id: Optional[str] = None,
     updated_at: Optional[str] = None,
+    execution_mode: str = "remote",
+    local_workdir: str = "",
 ) -> Dict[str, Any]:
     effective_id = (session_id or "").strip() or f"sess_{uuid.uuid4().hex[:12]}"
     ts = now_iso()
     eff_updated = (updated_at or "").strip() or ts
     sources_data = json.dumps(sources or [])
     uploaded_files_data = json.dumps(uploaded_files or [])
+    eff_exec_mode = (execution_mode or "remote").strip().lower()
+    if eff_exec_mode not in ("remote", "local"):
+        eff_exec_mode = "remote"
     conn = get_connection()
     with conn:
         conn.execute(
             """
             INSERT OR IGNORE INTO sessions (
-                id, title, mode, agent_name, model_name,
-                environment_id, last_interaction_id, max_total_tokens,
-                system_instruction, sources_json, uploaded_files_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                id, title, mode, execution_mode, local_workdir,
+                agent_name, model_name, environment_id, last_interaction_id,
+                max_total_tokens, system_instruction, sources_json,
+                uploaded_files_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 effective_id,
                 title,
                 mode,
+                eff_exec_mode,
+                local_workdir or "",
                 agent_name,
                 model_name,
                 environment_id,
@@ -161,6 +179,8 @@ def update_session(session_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
     allowed = {
         "title",
         "mode",
+        "execution_mode",
+        "local_workdir",
         "agent_name",
         "model_name",
         "environment_id",
@@ -206,6 +226,8 @@ def list_sessions() -> List[Dict[str, Any]]:
     results = []
     for r in rows:
         d = dict(r)
+        d.setdefault("execution_mode", "remote")
+        d.setdefault("local_workdir", "")
         d["sources"] = json.loads(d.pop("sources_json", None) or "[]")
         d["uploaded_files"] = json.loads(d.pop("uploaded_files_json", None) or "[]")
         results.append(d)
@@ -219,6 +241,8 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         conn.close()
         return None
     session_dict = dict(row)
+    session_dict.setdefault("execution_mode", "remote")
+    session_dict.setdefault("local_workdir", "")
     session_dict["sources"] = json.loads(session_dict.pop("sources_json", None) or "[]")
     session_dict["uploaded_files"] = json.loads(session_dict.pop("uploaded_files_json", None) or "[]")
     turns_rows = conn.execute(
