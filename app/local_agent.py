@@ -127,13 +127,24 @@ def get_local_machine_summary(workdir: Optional[str] = None) -> Dict[str, Any]:
     return info
 
 
+# Cache em memória para senha sudo fornecida na sessão local (ou via ANTIGRAVITY_SUDO_PASSWORD)
+_CACHED_SUDO_PASSWORD: Optional[str] = os.environ.get("ANTIGRAVITY_SUDO_PASSWORD") or None
+
+
+def set_local_sudo_password(password: Optional[str]) -> None:
+    """Define ou limpa a senha sudo em memória para execução não-interativa."""
+    global _CACHED_SUDO_PASSWORD
+    _CACHED_SUDO_PASSWORD = (password or "").strip() or None
+
+
 def tool_execute_bash(
     command: str,
     cwd: Optional[str] = None,
     timeout_seconds: int = 120,
     default_workdir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Executa comando no terminal do sistema operacional local."""
+    """Executa comando no terminal do sistema operacional local sem travar em TTY interativo."""
+    global _CACHED_SUDO_PASSWORD
     effective_cwd = resolve_local_path(cwd or ".", default_workdir or get_default_local_workdir())
     if not os.path.isdir(effective_cwd):
         os.makedirs(effective_cwd, exist_ok=True)
@@ -149,6 +160,30 @@ def tool_execute_bash(
         env["PAGER"] = "cat"
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["PYTHONIOENCODING"] = "utf-8"
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+
+        exec_cmd = cmd_str
+        if sys.platform != "win32":
+            # Captura automaticamente a senha se o modelo executou: echo 'SENHA' | sudo -S ... ou printf '%s\n' 'SENHA' | sudo -S ...
+            m_pipe_sudo = re.search(
+                r"""(?:echo|printf\s+(?:['"]%s\\n['"]\s+)?)\s*['"]?([^'"|\n]+)['"]?\s*\|\s*sudo\b""",
+                exec_cmd,
+            )
+            if m_pipe_sudo:
+                candidate_pw = m_pipe_sudo.group(1).strip()
+                if candidate_pw:
+                    _CACHED_SUDO_PASSWORD = candidate_pw
+                # Garante que sudo após pipe tenha a flag -S -p ''
+                exec_cmd = re.sub(r"\|\s*sudo(?!\s+-[a-zA-Z]*S)\b", "| sudo -S -p ''", exec_cmd)
+            elif re.search(r"(?:^|&&|\|\||;)\s*sudo\b", exec_cmd):
+                # Se já temos a senha sudo em memória e o comando chamou `sudo` puro sem pipe:
+                if _CACHED_SUDO_PASSWORD and not re.search(r"\bsudo\s+-[a-zA-Z]*[SnA]", exec_cmd):
+                    safe_pw = _CACHED_SUDO_PASSWORD.replace("'", "'\"'\"'")
+                    exec_cmd = re.sub(
+                        r"(^|&&|\|\||;)(\s*)sudo\b",
+                        rf"\1\2printf '%s\\n' '{safe_pw}' | sudo -S -p ''",
+                        exec_cmd,
+                    )
 
         use_ps_on_win = False
         if sys.platform == "win32":
@@ -163,8 +198,9 @@ def tool_execute_bash(
 
         if sys.platform == "win32" and use_ps_on_win:
             proc = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd_str],
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", exec_cmd],
                 cwd=effective_cwd,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -173,22 +209,28 @@ def tool_execute_bash(
                 env=env,
             )
         else:
-            proc = subprocess.run(
-                cmd_str,
-                shell=True,
-                cwd=effective_cwd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout_val,
-                env=env,
-            )
+            run_kwargs: Dict[str, Any] = {
+                "shell": True,
+                "cwd": effective_cwd,
+                "stdin": subprocess.DEVNULL,
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "timeout": timeout_val,
+                "env": env,
+            }
+            if sys.platform != "win32":
+                # Desacopla do /dev/tty controlador para que `sudo` sem senha NUNCA trave esperando digitação no terminal
+                run_kwargs["start_new_session"] = True
+
+            proc = subprocess.run(exec_cmd, **run_kwargs)
             # Se no Windows o cmd.exe falhar com comando não reconhecido (9009), tenta via PowerShell
             if sys.platform == "win32" and proc.returncode == 9009:
                 proc_ps = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd_str],
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", exec_cmd],
                     cwd=effective_cwd,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
@@ -202,6 +244,17 @@ def tool_execute_bash(
         elapsed_ms = int((time.time() - started) * 1000)
         stdout_txt = proc.stdout or ""
         stderr_txt = proc.stderr or ""
+        if (
+            sys.platform != "win32"
+            and proc.returncode != 0
+            and ("terminal is required to read the password" in stderr_txt or "password is required" in stderr_txt or "no tty present" in stderr_txt)
+        ):
+            stderr_txt += (
+                "\n[DICA DO AGENTE LOCAL]: O comando `sudo` exigiu senha. "
+                "Se o usuário já informou a senha na conversa, execute novamente passando a senha via pipe com `sudo -S -p ''`: "
+                "printf '%s\\n' 'SENHA_DO_USUARIO' | sudo -S -p '' <comando>. "
+                "Se o usuário ainda não informou a senha sudo, peça a senha a ele."
+            )
         max_chars = 32000
         if len(stdout_txt) > max_chars:
             stdout_txt = stdout_txt[:max_chars] + f"\n... [stdout truncado em {max_chars} caracteres]"
@@ -984,6 +1037,7 @@ def build_local_agent_system_instruction(
         "Regras Fundamentais de Execução na Máquina Local:",
         "- Você TEM acesso direto às configurações, hardware, sistema operacional, processos, rede e arquivos do computador do usuário através de `execute_bash`, `view_file` e `list_dir`.",
         "- Quando o usuário perguntar sobre configurações do computador, hardware (CPU, GPU, placa de vídeo, memória RAM, discos, placa-mãe, bateria, drivers), rede, processos em execução, variáveis de ambiente ou softwares instalados, SEMPRE execute comandos via `execute_bash` (ex: no Windows use `Get-CimInstance Win32_Processor`, `Get-CimInstance Win32_VideoController`, `systeminfo`, `ipconfig`; no Linux use `lscpu`, `free -h`, `df -h`, `lspci`) para coletar os detalhes reais em tempo real.",
+        "- Comandos `sudo` e privilégios de administrador no Linux/macOS: Você PODE executar comandos `sudo` que exigem senha de forma 100% não-interativa usando a flag `-S` via pipe (`stdin`): `printf '%s\\n' 'SENHA_DO_USUARIO' | sudo -S -p '' <comando>` (por exemplo, se a senha for `1903`: `printf '%s\\n' '1903' | sudo -S -p '' apt-get update`). NUNCA diga que não consegue fornecer senhas para prompts `sudo`. Se um comando `sudo` falhar pedindo senha e você ainda não souber a senha, peça a senha ao usuário; assim que ele informar a senha no chat, execute imediatamente o comando usando `printf '%s\\n' 'SENHA' | sudo -S -p '' <comando>`.",
         "- Caminhos relativos são resolvidos a partir de `local_workdir`, mas você também pode acessar qualquer caminho absoluto do computador quando solicitado pelo usuário.",
     ]
     if custom_instruction and custom_instruction.strip():

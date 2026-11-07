@@ -9,6 +9,7 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.antigravity.studio.data.local.LocalAndroidAgent
 import com.antigravity.studio.data.local.StudioRepository
 import com.antigravity.studio.data.model.EnvFileEntry
 import com.antigravity.studio.data.model.SessionModel
@@ -543,6 +544,21 @@ class StudioViewModel(
         }
     }
 
+    fun setExecutionMode(useLocal: Boolean, customWorkdir: String? = null) {
+        val current = _uiState.value.activeSession ?: return
+        val newEnvId = if (useLocal) {
+            val dir = customWorkdir?.trim()?.takeIf { it.isNotEmpty() }
+                ?: LocalAndroidAgent.extractWorkdirFromEnvId(
+                    current.environmentId,
+                    LocalAndroidAgent.getDefaultAndroidWorkdir()
+                )
+            "local:$dir"
+        } else {
+            if (LocalAndroidAgent.isLocalEnvironment(current.environmentId)) "" else current.environmentId
+        }
+        updateActiveSessionSettings(environmentId = newEnvId)
+    }
+
     fun sendMessage(promptText: String) {
         val prompt = promptText.trim()
         var session = _uiState.value.activeSession ?: return
@@ -556,6 +572,64 @@ class StudioViewModel(
         viewModelScope.launch {
             _uiState.update { it.copy(isSending = true, errorMessage = null) }
             try {
+                if (LocalAndroidAgent.isLocalEnvironment(session.environmentId)) {
+                    val workdir = LocalAndroidAgent.extractWorkdirFromEnvId(
+                        session.environmentId,
+                        LocalAndroidAgent.getDefaultAndroidWorkdir()
+                    )
+                    val prevId = (_uiState.value.customPrevInteractionId ?: session.lastInteractionId).trim()
+                    val resp = LocalAndroidAgent.runLocalAndroidTurn(
+                        prompt = prompt,
+                        workdir = workdir,
+                        modelName = session.modelName,
+                        systemInstruction = session.systemInstruction,
+                        historyTurns = session.turns,
+                        apiKey = apiKey
+                    )
+                    val newInteractionId = resp.optString("id", "local_${System.currentTimeMillis()}")
+                    val returnedEnvId = resp.optString("environment_id", "local:$workdir")
+                    val outText = resp.optString("output_text", "")
+                    val turnStatus = resp.optString("status", "completed")
+                    val nextIndex = session.turns.size + 1
+
+                    var newTitle = session.title
+                    if (nextIndex == 1 && newTitle in listOf("Nova Conversa Antigravity", "Nova Conversa")) {
+                        newTitle = if (prompt.length > 48) "${prompt.take(48)}..." else prompt
+                    }
+
+                    repository.upsertTurn(
+                        sessionId = session.id,
+                        interactionId = newInteractionId,
+                        turnIndex = nextIndex,
+                        previousInteractionId = prevId,
+                        environmentId = returnedEnvId,
+                        userInputText = prompt,
+                        outputText = outText,
+                        status = turnStatus,
+                        stepsJson = resp.optJSONArray("steps")?.toString() ?: "[]",
+                        usageJson = resp.optJSONObject("usage")?.toString() ?: "{}",
+                        rawJson = resp.toString()
+                    )
+
+                    val updatedSession = repository.updateSession(
+                        sessionId = session.id,
+                        title = newTitle,
+                        environmentId = returnedEnvId,
+                        lastInteractionId = newInteractionId
+                    )
+                    val allSessions = repository.listSessions()
+                    _uiState.update {
+                        it.copy(
+                            isSending = false,
+                            sessions = allSessions,
+                            activeSession = updatedSession,
+                            customPrevInteractionId = null
+                        )
+                    }
+                    pushSessionToCloudBg(session.id)
+                    return@launch
+                }
+
                 val customPrev = _uiState.value.customPrevInteractionId?.trim().orEmpty()
                 val initialLocalLast = session.lastInteractionId.trim()
                 val isManualFork = customPrev.isNotEmpty() && initialLocalLast.isNotEmpty() && customPrev != initialLocalLast

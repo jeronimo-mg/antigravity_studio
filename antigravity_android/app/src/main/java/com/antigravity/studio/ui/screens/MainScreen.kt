@@ -52,7 +52,9 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import com.antigravity.studio.data.local.LocalAndroidAgent
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -375,6 +377,29 @@ fun MainScreen(viewModel: StudioViewModel) {
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
+                        val isLocalMode = LocalAndroidAgent.isLocalEnvironment(activeSession?.environmentId)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "Modo:",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Slate400
+                            )
+                            FilterChip(
+                                selected = !isLocalMode,
+                                onClick = { viewModel.setExecutionMode(false) },
+                                label = { Text("☁️ Sandbox Remoto", fontSize = 11.sp) }
+                            )
+                            FilterChip(
+                                selected = isLocalMode,
+                                onClick = { viewModel.setExecutionMode(true) },
+                                label = { Text("📱 Máquina Local (Celular)", fontSize = 11.sp) }
+                            )
+                        }
+
                         // Barra de status de encadeamento (previous_interaction_id + background switch)
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
