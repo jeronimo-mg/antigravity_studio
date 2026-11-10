@@ -184,6 +184,10 @@ def list_models_compat() -> Dict[str, Any]:
         "data": [
             {"id": "antigravity-preview-09-2026", "object": "model", "owned_by": "google"},
             {"id": "gemini-4-argon", "object": "model", "owned_by": "google"},
+            {"id": "gemini-4-carbon", "object": "model", "owned_by": "google"},
+            {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google"},
+            {"id": "gemini-3.6-flash", "object": "model", "owned_by": "google"},
+            {"id": "gemini-3.5-flash-lite", "object": "model", "owned_by": "google"},
         ],
     }
 

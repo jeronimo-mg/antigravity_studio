@@ -22,6 +22,7 @@ from .interactions_client import (
     build_headers,
     extract_and_clean_session_title,
     extract_text_from_document_bytes,
+    normalize_antigravity_model,
     resolve_api_key,
     synthesize_agent_session_title,
 )
@@ -1488,11 +1489,11 @@ async def _run_antigravity_agent_hop(
     run_state: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Executa um turno (hop) usando SEMPRE o agente `antigravity-preview-09-2026`
-    com `agent_config.model = "gemini-4-argon"` na Interactions API (`POST /v1beta/interactions`),
+    Executa um turno (hop) usando o agente `antigravity-preview-09-2026`
+    com `agent_config.model` (`gemini-4-argon`, `gemini-4-carbon`, etc.) na Interactions API (`POST /v1beta/interactions`),
     realizando polling até concluir.
     """
-    underlying_model = "gemini-4-argon"
+    underlying_model = normalize_antigravity_model(model_name)
     payload: Dict[str, Any] = {
         "agent": "antigravity-preview-09-2026",
         "environment": "remote",
@@ -1556,13 +1557,13 @@ async def run_local_agent_turn(
 ) -> Dict[str, Any]:
     """
     Executa um turno completo do Agente Local na máquina do usuário:
-    - Usa SEMPRE o modelo subjacente `gemini-4-argon` (`agent_config.model`) através do agente
-      `antigravity-preview-09-2026` na Interactions API (`POST /v1beta/interactions`).
+    - Usa o modelo subjacente configurado (`gemini-4-argon` ou `gemini-4-carbon`, etc. em `agent_config.model`)
+      através do agente `antigravity-preview-09-2026` na Interactions API (`POST /v1beta/interactions`).
     - Injeta o contexto da máquina local e extrai ações ```json:local-action (ou blocos de comando shell)
       para que todas as ferramentas (`execute_bash`, `view_file`, `write_to_file`,
       `replace_file_content`, `list_dir`, `find_by_name`, `grep_search`, `web_search`, `browse_url`)
       sejam executadas diretamente no computador do usuário (`workdir`) e seus resultados reais
-      sejam devolvidos ao `gemini-4-argon` até concluir a resposta final.
+      sejam devolvidos ao modelo até concluir a resposta final.
     """
     abs_workdir = resolve_local_path(".", workdir or get_default_local_workdir())
     os.makedirs(abs_workdir, exist_ok=True)
@@ -1635,7 +1636,7 @@ async def run_local_agent_turn(
     )
 
     headers = build_headers(api_key)
-    underlying_model = "gemini-4-argon"
+    underlying_model = normalize_antigravity_model(model_name)
     executed_any_local_tool = False
     extracted_agent_title: Optional[str] = None
 

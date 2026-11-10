@@ -625,7 +625,7 @@ object LocalAndroidAgent {
         previousInteractionId: String?,
         apiKey: String
     ): JSONObject {
-        val underlyingModel = "gemini-4-argon"
+        val underlyingModel = com.antigravity.studio.data.remote.InteractionsClient.normalizeAntigravityModel(modelName)
         val payload = JSONObject()
             .put("agent", "antigravity-preview-09-2026")
             .put("environment", "remote")
@@ -697,7 +697,7 @@ object LocalAndroidAgent {
         val localDir = File(workdir).apply { if (!exists()) mkdirs() }.absolutePath
         val localTurnId = "local_${UUID.randomUUID().toString().replace("-", "").take(16)}"
         val sysInst = buildSystemInstruction(localDir, systemInstruction)
-        val underlyingModel = "gemini-4-argon"
+        val underlyingModel = com.antigravity.studio.data.remote.InteractionsClient.normalizeAntigravityModel(modelName)
 
         val historySnippets = mutableListOf<String>()
         historyTurns.takeLast(6).filter { it.status in listOf("completed", "incomplete") }.forEach { t ->

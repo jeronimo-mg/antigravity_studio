@@ -381,7 +381,8 @@ function syncInputsFromSession() {
   }
   document.getElementById("agentSelect").value =
     currentSession.agent_name || "antigravity-preview-09-2026";
-  document.getElementById("modelSelect").value = "gemini-4-argon";
+  document.getElementById("modelSelect").value =
+    currentSession.model_name || "gemini-4-argon";
   document.getElementById("prevInteractionIdInput").value =
     currentSession.last_interaction_id || "";
   document.getElementById("environmentIdInput").value =

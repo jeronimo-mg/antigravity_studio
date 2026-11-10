@@ -465,6 +465,27 @@ def _build_remote_environment_spec(
     return "remote"
 
 
+SUPPORTED_ANTIGRAVITY_MODELS = (
+    "gemini-4-argon",
+    "gemini-4-carbon",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+)
+
+
+def normalize_antigravity_model(model_name: Optional[str]) -> str:
+    """
+    Normaliza o modelo subjacente (`agent_config.model` / `model`) conforme a documentação oficial
+    do Antigravity Agent (https://aistudio.google.com/docs/antigravity-agent#model-selection).
+    Mantém `gemini-4-argon` como padrão caso nenhum modelo válido seja informado.
+    """
+    clean = (model_name or "").strip().lower()
+    if clean in SUPPORTED_ANTIGRAVITY_MODELS:
+        return clean
+    return "gemini-4-argon"
+
+
 def build_create_payload(
     prompt: str,
     mode: str = "agent",
@@ -479,6 +500,7 @@ def build_create_payload(
     uploaded_files: Optional[List[Dict[str, Any]]] = None,
     allow_agent_session_naming: bool = True,
 ) -> Dict[str, Any]:
+    effective_model = normalize_antigravity_model(model_name)
     effective_prompt = (
         enrich_agent_prompt_for_sandbox(
             prompt,
@@ -516,13 +538,13 @@ def build_create_payload(
         if "antigravity" in payload["agent"]:
             agent_cfg: Dict[str, Any] = {
                 "type": "antigravity",
-                "model": "gemini-4-argon",
+                "model": effective_model,
             }
             if max_total_tokens and int(max_total_tokens) > 0:
                 agent_cfg["max_total_tokens"] = int(max_total_tokens)
             payload["agent_config"] = agent_cfg
     else:
-        payload["model"] = "gemini-4-argon"
+        payload["model"] = effective_model
         if system_instruction and system_instruction.strip():
             payload["system_instruction"] = system_instruction.strip()
 
@@ -1892,7 +1914,7 @@ def encode_session_sync_display_name(session: Dict[str, Any]) -> str:
         "env": env_id,
         "m": (session.get("mode") or "agent").strip(),
         "ag": (session.get("agent_name") or "antigravity-preview-09-2026").strip(),
-        "md": "gemini-4-argon",
+        "md": normalize_antigravity_model(session.get("model_name")),
         "u": (session.get("updated_at") or "").strip(),
         "tc": turn_count,
     }
@@ -1954,7 +1976,7 @@ def decode_session_sync_display_name(display_name: str) -> Optional[Dict[str, An
             "environment_id": env_id,
             "mode": str(data.get("m") or "agent").strip(),
             "agent_name": str(data.get("ag") or "antigravity-preview-09-2026").strip(),
-            "model_name": "gemini-4-argon",
+            "model_name": normalize_antigravity_model(str(data.get("md") or "gemini-4-argon")),
             "updated_at": str(data.get("u") or "").strip(),
             "turn_count": tc_val,
             "uploaded_files": uploaded_files,

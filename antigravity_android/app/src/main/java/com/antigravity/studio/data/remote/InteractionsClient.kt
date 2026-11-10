@@ -338,6 +338,19 @@ if __name__ == "__main__":
         return enriched
     }
 
+    val SUPPORTED_ANTIGRAVITY_MODELS = listOf(
+        "gemini-4-argon",
+        "gemini-4-carbon",
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite"
+    )
+
+    fun normalizeAntigravityModel(modelName: String?): String {
+        val clean = (modelName ?: "").trim().lowercase()
+        return if (clean in SUPPORTED_ANTIGRAVITY_MODELS) clean else "gemini-4-argon"
+    }
+
     fun buildCreatePayload(
         prompt: String,
         mode: String = "agent",
@@ -352,6 +365,7 @@ if __name__ == "__main__":
         uploadedFiles: List<UploadedFileRecord> = emptyList(),
         allowAgentSessionNaming: Boolean = true
     ): JSONObject {
+        val effectiveModel = normalizeAntigravityModel(modelName)
         val effectivePrompt = if (mode == "agent") {
             enrichAgentPromptForSandbox(prompt, uploadedFiles, allowAgentSessionNaming)
         } else {
@@ -426,14 +440,14 @@ if __name__ == "__main__":
             if (effAgent.contains("antigravity")) {
                 val agentCfg = JSONObject()
                     .put("type", "antigravity")
-                    .put("model", "gemini-4-argon")
+                    .put("model", effectiveModel)
                 if (maxTotalTokens > 0) {
                     agentCfg.put("max_total_tokens", maxTotalTokens)
                 }
                 payload.put("agent_config", agentCfg)
             }
         } else {
-            payload.put("model", "gemini-4-argon")
+            payload.put("model", effectiveModel)
             if (!systemInstruction.isNullOrBlank()) {
                 payload.put("system_instruction", systemInstruction.trim())
             }

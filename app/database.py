@@ -72,7 +72,21 @@ def init_db() -> None:
         except Exception:
             pass
         try:
-            conn.execute("UPDATE sessions SET model_name = 'gemini-4-argon' WHERE model_name != 'gemini-4-argon' OR model_name IS NULL OR model_name = ''")
+            conn.execute(
+                """
+                UPDATE sessions
+                SET model_name = 'gemini-4-argon'
+                WHERE model_name IS NULL
+                   OR model_name = ''
+                   OR model_name NOT IN (
+                       'gemini-4-argon',
+                       'gemini-4-carbon',
+                       'gemini-3.8-flash',
+                       'gemini-3.6-flash',
+                       'gemini-3.5-flash-lite'
+                   )
+                """
+            )
         except Exception:
             pass
         conn.execute(
