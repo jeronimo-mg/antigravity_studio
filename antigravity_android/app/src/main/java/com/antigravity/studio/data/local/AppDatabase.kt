@@ -33,6 +33,7 @@ import java.util.UUID
 data class SessionEntity(
     @PrimaryKey val id: String,
     val title: String,
+    @ColumnInfo(name = "title_locked_by_user", defaultValue = "0") val titleLockedByUser: Int = 0,
     val mode: String = "agent",
     @ColumnInfo(name = "agent_name") val agentName: String = "antigravity-preview-09-2026",
     @ColumnInfo(name = "model_name") val modelName: String = "gemini-4-argon",
@@ -94,6 +95,9 @@ interface StudioDao {
     @Query("SELECT COUNT(*) FROM turns WHERE session_id = :sessionId")
     suspend fun countTurnsForSession(sessionId: String): Int
 
+    @Query("SELECT MAX(created_at) FROM turns WHERE session_id = :sessionId")
+    suspend fun getLastPromptAtForSession(sessionId: String): String?
+
     @Query("SELECT * FROM sessions WHERE id = :sessionId LIMIT 1")
     suspend fun getSessionRaw(sessionId: String): SessionEntity?
 
@@ -134,7 +138,7 @@ interface StudioDao {
 
 @Database(
     entities = [SessionEntity::class, TurnEntity::class, SettingEntity::class],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -144,13 +148,26 @@ abstract class AppDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: AppDatabase? = null
 
+        private val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                try {
+                    db.execSQL("ALTER TABLE sessions ADD COLUMN title_locked_by_user INTEGER NOT NULL DEFAULT 0")
+                } catch (_: Exception) {
+                }
+            }
+        }
+
         fun getInstance(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     AppDatabase::class.java,
                     "antigravity_studio.db"
-                ).fallbackToDestructiveMigration().build().also { INSTANCE = it }
+                )
+                    .addMigrations(MIGRATION_1_2)
+                    .fallbackToDestructiveMigration()
+                    .build()
+                    .also { INSTANCE = it }
             }
         }
     }
@@ -169,7 +186,8 @@ class StudioRepository(private val dao: StudioDao) {
         val entities = dao.listSessionsRaw()
         return entities.map { entity ->
             val count = dao.countTurnsForSession(entity.id)
-            entity.toDomain(turns = emptyList(), turnCount = count)
+            val lastPrompt = dao.getLastPromptAtForSession(entity.id).orEmpty()
+            entity.toDomain(turns = emptyList(), turnCount = count, lastPromptAt = lastPrompt)
         }
     }
 
@@ -177,7 +195,8 @@ class StudioRepository(private val dao: StudioDao) {
         val entity = dao.getSessionRaw(sessionId) ?: return null
         val turnEntities = dao.getTurnsForSession(sessionId)
         val turns = turnEntities.map { it.toDomain() }
-        return entity.toDomain(turns = turns, turnCount = turns.size)
+        val lastPrompt = turns.maxOfOrNull { it.createdAt }.orEmpty()
+        return entity.toDomain(turns = turns, turnCount = turns.size, lastPromptAt = lastPrompt)
     }
 
     suspend fun findUploadedFilesForEnvironment(environmentId: String?): List<UploadedFileRecord> {
@@ -203,6 +222,7 @@ class StudioRepository(private val dao: StudioDao) {
 
     suspend fun createSession(
         title: String = "Nova Conversa Antigravity",
+        titleLockedByUser: Boolean = false,
         mode: String = "agent",
         agentName: String = "antigravity-preview-09-2026",
         modelName: String = "gemini-4-argon",
@@ -227,6 +247,7 @@ class StudioRepository(private val dao: StudioDao) {
         val entity = SessionEntity(
             id = sessionId,
             title = title.ifBlank { "Nova Conversa Antigravity" },
+            titleLockedByUser = if (titleLockedByUser) 1 else 0,
             mode = mode.ifBlank { "agent" },
             agentName = agentName.ifBlank { "antigravity-preview-09-2026" },
             modelName = modelName.ifBlank { "gemini-4-argon" },
@@ -246,6 +267,7 @@ class StudioRepository(private val dao: StudioDao) {
     suspend fun updateSession(
         sessionId: String,
         title: String? = null,
+        titleLockedByUser: Boolean? = null,
         mode: String? = null,
         agentName: String? = null,
         modelName: String? = null,
@@ -270,6 +292,7 @@ class StudioRepository(private val dao: StudioDao) {
 
         val updated = existing.copy(
             title = title ?: existing.title,
+            titleLockedByUser = titleLockedByUser?.let { if (it) 1 else 0 } ?: existing.titleLockedByUser,
             mode = mode ?: existing.mode,
             agentName = agentName ?: existing.agentName,
             modelName = modelName ?: existing.modelName,
@@ -396,10 +419,12 @@ class StudioRepository(private val dao: StudioDao) {
 
     private fun SessionEntity.toDomain(
         turns: List<TurnModel>,
-        turnCount: Int
+        turnCount: Int,
+        lastPromptAt: String = ""
     ): SessionModel = SessionModel(
         id = id,
         title = title,
+        titleLockedByUser = titleLockedByUser != 0,
         mode = mode,
         agentName = agentName,
         modelName = modelName,
@@ -411,6 +436,7 @@ class StudioRepository(private val dao: StudioDao) {
         uploadedFiles = parseUploadedFilesJson(uploadedFilesJson),
         turns = turns,
         turnCount = turnCount,
+        lastPromptAt = lastPromptAt,
         createdAt = createdAt,
         updatedAt = updatedAt
     )

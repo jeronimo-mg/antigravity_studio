@@ -45,10 +45,158 @@ def build_headers(api_key: Optional[str] = None) -> Dict[str, str]:
     return headers
 
 
+_SESSION_TITLE_TAG_RE = re.compile(
+    r"<session_title>\s*(.*?)\s*</session_title>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_SESSION_TITLE_PROMPT_NOTE = (
+    "\n\n[Nota de Organização da Sessão: Ao final da sua resposta, inclua uma tag "
+    "<session_title>Título Curto da Sessão</session_title> (de 3 a 7 palavras) que dê um nome claro e descritivo "
+    "para esta sessão. Você pode atualizar esse título livremente conforme a conversa evolui para novos assuntos.]"
+)
+
+_DEFAULT_SESSION_TITLES = {
+    "",
+    "nova conversa antigravity",
+    "nova conversa",
+    "conversa antigravity",
+    "sem título",
+    "nova sessão",
+    "nova sessao",
+}
+
+
+def is_default_session_title(title: Optional[str]) -> bool:
+    clean = (title or "").strip().lower()
+    return clean in _DEFAULT_SESSION_TITLES
+
+
+def _clean_title_candidate(raw_title: str) -> str:
+    t = (raw_title or "").strip()
+    t = re.sub(r"[\r\n\t]+", " ", t)
+    t = re.sub(r"^[#*`_~\-–—:>\s\"'«»]+|[#*`_~\-–—:>\s\"'«»]+$", "", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    if len(t) > 64:
+        cut = t[:64].rsplit(" ", 1)[0]
+        t = (cut if len(cut) >= 24 else t[:61]).rstrip(" ,;:-") + "..."
+    return t
+
+
+def extract_and_clean_session_title(text: str) -> Tuple[Optional[str], str]:
+    """
+    Extrai o título gerado pelo agente em `<session_title>...</session_title>` (usando a última ocorrência caso haja mais de uma)
+    e remove a tag do texto de saída para não exibi-la no corpo da mensagem.
+    """
+    if not text:
+        return None, ""
+    matches = list(_SESSION_TITLE_TAG_RE.finditer(text))
+    if not matches:
+        return None, text
+    extracted = _clean_title_candidate(matches[-1].group(1))
+    cleaned_text = _SESSION_TITLE_TAG_RE.sub("", text).strip()
+    return (extracted if len(extracted) >= 3 else None), cleaned_text
+
+
+def synthesize_agent_session_title(
+    user_prompt: str = "",
+    output_text: str = "",
+    current_title: str = "",
+) -> str:
+    """
+    Cria ou atualiza o nome da sessão com base no título emitido pelo agente (`<session_title>`)
+    ou sintetiza um nome descritivo a partir do tópico da resposta/pedido (em substituição a truncar o início do prompt).
+    """
+    tag_title, _ = extract_and_clean_session_title(output_text)
+    if tag_title:
+        return tag_title
+
+    # Tenta identificar um título temático nos cabeçalhos Markdown da resposta do agente
+    if output_text:
+        generic_headings = {
+            "execução concluída na máquina local",
+            "resumo",
+            "conclusão",
+            "introdução",
+            "resultado",
+            "resultados",
+            "resposta",
+            "observações",
+            "próximos passos",
+            "detalhes",
+        }
+        for line in output_text.splitlines()[:15]:
+            sline = line.strip()
+            m_head = re.match(r"^#{1,3}\s+(.+)$", sline)
+            if m_head:
+                cand = _clean_title_candidate(re.sub(r"^[^\wÀ-ÿ]+", "", m_head.group(1)))
+                if 4 <= len(cand) <= 60 and cand.lower() not in generic_headings:
+                    return cand
+
+    # Se não houver tag explícita ainda (ex: 1º turno em andamento), sintetiza um título nominalizado a partir do pedido
+    raw_p = (user_prompt or "").strip()
+    if not raw_p:
+        return current_title or "Nova Conversa Antigravity"
+
+    first_line = next((ln.strip() for ln in raw_p.splitlines() if ln.strip()), raw_p)
+    first_clause = re.split(r"[.!?\n;]+", first_line)[0].strip()
+
+    # Remove saudações e muletas conversacionais iniciais
+    first_clause = re.sub(
+        r"^(?:olá|oi|bom dia|boa tarde|boa noite|hey|e aí)[,!\s]*",
+        "",
+        first_clause,
+        flags=re.IGNORECASE,
+    ).strip()
+    first_clause = re.sub(
+        r"^(?:por favor|pfv|por gentileza)[,\s]*",
+        "",
+        first_clause,
+        flags=re.IGNORECASE,
+    ).strip()
+    first_clause = re.sub(
+        r"^(?:eu\s+)?(?:gostaria que (?:você\s+)?|gostaria de\s+|quero que (?:você\s+)?|quero\s+|preciso que (?:você\s+)?|preciso\s+|você pode\s+|pode\s+|poderia\s+|me ajude a\s+|vamos\s+)",
+        "",
+        first_clause,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    nominalizations = [
+        (r"^(?:instale|instalar|instalando)\s+(?:o\s+|a\s+|os\s+|as\s+)?(.+)$", "Instalação de \\1"),
+        (r"^(?:crie|criar|gere|gerar|desenvolva|desenvolver)\s+(.+)$", "Criação de \\1"),
+        (r"^(?:implemente|implementar)\s+(.+)$", "Implementação de \\1"),
+        (r"^(?:analise|analisar|avalie|avaliar|inspecione|inspecionar|veja|ver)\s+(.+)$", "Análise de \\1"),
+        (r"^(?:corrija|corrigir|conserte|consertar|resolva|resolver|depure|debugar)\s+(.+)$", "Correção de \\1"),
+        (r"^(?:configure|configurar|ajuste|ajustar)\s+(.+)$", "Configuração de \\1"),
+        (r"^(?:explique|explicar|me explique|como funciona|o que é)\s+(.+)$", "Explicação sobre \\1"),
+        (r"^(?:atualize|atualizar)\s+(.+)$", "Atualização de \\1"),
+        (r"^(?:baixe|baixar|faça download de|fazer download de)\s+(.+)$", "Download de \\1"),
+        (r"^(?:execute|executar|rode|rodar)\s+(.+)$", "Execução de \\1"),
+        (r"^(?:pesquise|pesquisar|busque|buscar|procure|procurar)\s+(?:sobre\s+|por\s+)?(.+)$", "Pesquisa sobre \\1"),
+        (r"^(?:otimize|otimizar|melhore|melhorar|refatore|refatorar)\s+(.+)$", "Otimização de \\1"),
+        (r"^(?:teste|testar|valide|validar)\s+(.+)$", "Teste de \\1"),
+        (r"^(?:converta|converter|transforme|transformar)\s+(.+)$", "Conversão de \\1"),
+    ]
+    synthesized = first_clause
+    for pattern, repl in nominalizations:
+        m = re.match(pattern, first_clause, flags=re.IGNORECASE)
+        if m:
+            synthesized = re.sub(pattern, repl, first_clause, flags=re.IGNORECASE)
+            break
+
+    # Remove pronomes possessivos redundantes no final ("no meu computador" -> "no Computador")
+    synthesized = re.sub(r"\bno meu computador\b", "no Computador", synthesized, flags=re.IGNORECASE)
+    synthesized = re.sub(r"\bna minha máquina\b", "na Máquina Local", synthesized, flags=re.IGNORECASE)
+    synthesized = _clean_title_candidate(synthesized)
+    if synthesized:
+        synthesized = synthesized[0].upper() + synthesized[1:]
+    return synthesized or current_title or "Sessão Antigravity"
+
+
 def extract_texts_from_interaction(
     data: Dict[str, Any], fallback_user_input: str = ""
 ) -> Tuple[str, str]:
-    """Extrai o texto de entrada do usuário e o texto final de saída do modelo/agente."""
+    """Extrai o texto de entrada do usuário e o texto final de saída do modelo/agente (limpando tags de título)."""
     user_texts: List[str] = []
     output_texts: List[str] = []
 
@@ -66,6 +214,8 @@ def extract_texts_from_interaction(
                     if isinstance(c, dict) and c.get("type") == "text":
                         user_texts.append(c.get("text", ""))
 
+    extracted_agent_title: Optional[str] = None
+
     for step in data.get("steps", []) or []:
         if not isinstance(step, dict):
             continue
@@ -78,10 +228,19 @@ def extract_texts_from_interaction(
         elif stype == "model_output":
             for c in contents:
                 if isinstance(c, dict) and c.get("type") == "text":
-                    output_texts.append(c.get("text", ""))
+                    raw_t = c.get("text", "")
+                    t_title, clean_t = extract_and_clean_session_title(raw_t)
+                    if t_title:
+                        extracted_agent_title = t_title
+                        c["text"] = clean_t
+                    output_texts.append(clean_t)
 
     if not output_texts and isinstance(data.get("output_text"), str):
-        output_texts.append(data["output_text"])
+        t_title, clean_t = extract_and_clean_session_title(data["output_text"])
+        if t_title:
+            extracted_agent_title = t_title
+        data["output_text"] = clean_t
+        output_texts.append(clean_t)
 
     local_user = (data.get("_local_user_input_text") or "").strip()
     if not local_user and data.get("id"):
@@ -94,12 +253,28 @@ def extract_texts_from_interaction(
         or local_user
         or fallback_user_input
     )
-    marker = "\n\n---\n[NOTA TÉCNICA DO AMBIENTE SANDBOX"
-    if marker in user_input_str:
-        user_input_str = user_input_str.split(marker, 1)[0].strip()
+    for marker in (
+        "\n\n---\n[NOTA TÉCNICA DO AMBIENTE SANDBOX",
+        "\n\n[Nota de Organização da Sessão:",
+    ):
+        if marker in user_input_str:
+            user_input_str = user_input_str.split(marker, 1)[0].strip()
     if "[NOVA INSTRUÇÃO DO USUÁRIO]:\n" in user_input_str:
         user_input_str = user_input_str.split("[NOVA INSTRUÇÃO DO USUÁRIO]:\n", 1)[1].strip()
+        for marker in (
+            "\n\n---\n[NOTA TÉCNICA DO AMBIENTE SANDBOX",
+            "\n\n[Nota de Organização da Sessão:",
+        ):
+            if marker in user_input_str:
+                user_input_str = user_input_str.split(marker, 1)[0].strip()
+
     output_str = "\n\n".join(t for t in output_texts if t).strip()
+    extra_title, output_str = extract_and_clean_session_title(output_str)
+    if extra_title:
+        extracted_agent_title = extra_title
+    if extracted_agent_title:
+        data["_agent_session_title"] = extracted_agent_title
+
     return user_input_str, output_str
 
 
@@ -206,12 +381,12 @@ async def recover_conversation_chain(
 def enrich_agent_prompt_for_sandbox(
     prompt: str,
     uploaded_files: Optional[List[Dict[str, Any]]] = None,
+    allow_agent_session_naming: bool = True,
 ) -> str:
     """
     Adiciona instruções técnicas transparentes para o agente Antigravity quando há arquivos
-    enviados via Environments API ou quando o prompt menciona arquivos .pdf, .odt, .odp, .docx, etc.
-    Isso evita que o agente chame `view_file` diretamente em binários (.odt/.odp) ou PDFs grandes,
-    o que causa `HTTP 500: Internal error encountered` na Interactions API (que suporta apenas Text/Image).
+    enviados via Environments API ou quando o prompt menciona arquivos .pdf, .odt, .odp, .docx, etc.,
+    além de solicitar um título descritivo (`<session_title>`) quando o nome da sessão não foi travado pelo usuário.
     """
     if prompt.strip().lower() == "continue":
         return prompt
@@ -220,33 +395,38 @@ def enrich_agent_prompt_for_sandbox(
         re.search(r"\.(pdf|odt|odp|ods|docx|pptx|xlsx)\b", prompt, flags=re.IGNORECASE)
     )
     has_uploads = bool(uploaded_files)
-    if not has_doc_ext and not has_uploads:
-        return prompt
+    enriched = prompt
 
-    notes: List[str] = [
-        "\n\n---",
-        "[NOTA TÉCNICA DO AMBIENTE SANDBOX (ANTIGRAVITY STUDIO)]:",
-    ]
-    if uploaded_files:
-        paths = []
-        for uf in uploaded_files:
-            tp = uf.get("target_path")
-            if tp and tp not in paths:
-                paths.append(tp)
-        if paths:
-            formatted_paths = ", ".join(f"`{p}`" for p in paths)
-            notes.append(
-                f"- Arquivos/pastas enviados via Environments API estão localizados em: {formatted_paths} (use `find_by_name` ou `execute_bash` com `ls -la` para listar os nomes exatos)."
-            )
+    if has_doc_ext or has_uploads:
+        notes: List[str] = [
+            "\n\n---",
+            "[NOTA TÉCNICA DO AMBIENTE SANDBOX (ANTIGRAVITY STUDIO)]:",
+        ]
+        if uploaded_files:
+            paths = []
+            for uf in uploaded_files:
+                tp = uf.get("target_path")
+                if tp and tp not in paths:
+                    paths.append(tp)
+            if paths:
+                formatted_paths = ", ".join(f"`{p}`" for p in paths)
+                notes.append(
+                    f"- Arquivos/pastas enviados via Environments API estão localizados em: {formatted_paths} (use `find_by_name` ou `execute_bash` com `ls -la` para listar os nomes exatos)."
+                )
 
-    notes.extend([
-        "- REGRA CRÍTICA (PREVENÇÃO DE ERRO HTTP 500 NA API): NUNCA use a ferramenta `view_file` diretamente em arquivos `.pdf`, `.odt`, `.odp`, `.ods`, `.docx`, `.pptx` ou `.xlsx`. A ferramenta `view_file` injeta o binário completo no histórico multimodal, o que falha para formatos OpenDocument (`.odt`/`.odp`) e PDFs grandes com erro `HTTP 500: Internal error encountered`.",
-        "- COMO LER ESSES DOCUMENTOS COM SEGURANÇA:",
-        "  1. Verifique primeiro se já existem arquivos `.extracted.txt` gerados automaticamente ao lado dos documentos (ex: `<nome_do_arquivo>.extracted.txt`) ou o script `_extract_docs_helper.py` no diretório de upload.",
-        "  2. Caso precise extrair texto de `.odt` ou `.odp` (OpenDocument XML), use `execute_bash` com `python3` lendo `content.xml` via `zipfile.ZipFile` e `xml.etree.ElementTree` (bibliotecas nativas do Python 3.12).",
-        "  3. Caso precise extrair texto de `.pdf`, use `execute_bash` com `python3` (`pypdf`, `pymupdf`/`fitz` ou `pdfplumber`, instalando via `pip install --break-system-packages pypdf pymupdf` se necessário) ou `pdftotext`, salvando o texto em `/tmp/*.txt` e inspecionando por partes/seções.",
-    ])
-    return prompt + "\n".join(notes)
+        notes.extend([
+            "- REGRA CRÍTICA (PREVENÇÃO DE ERRO HTTP 500 NA API): NUNCA use a ferramenta `view_file` diretamente em arquivos `.pdf`, `.odt`, `.odp`, `.ods`, `.docx`, `.pptx` ou `.xlsx`. A ferramenta `view_file` injeta o binário completo no histórico multimodal, o que falha para formatos OpenDocument (`.odt`/`.odp`) e PDFs grandes com erro `HTTP 500: Internal error encountered`.",
+            "- COMO LER ESSES DOCUMENTOS COM SEGURANÇA:",
+            "  1. Verifique primeiro se já existem arquivos `.extracted.txt` gerados automaticamente ao lado dos documentos (ex: `<nome_do_arquivo>.extracted.txt`) ou o script `_extract_docs_helper.py` no diretório de upload.",
+            "  2. Caso precise extrair texto de `.odt` ou `.odp` (OpenDocument XML), use `execute_bash` com `python3` lendo `content.xml` via `zipfile.ZipFile` e `xml.etree.ElementTree` (bibliotecas nativas do Python 3.12).",
+            "  3. Caso precise extrair texto de `.pdf`, use `execute_bash` com `python3` (`pypdf`, `pymupdf`/`fitz` ou `pdfplumber`, instalando via `pip install --break-system-packages pypdf pymupdf` se necessário) ou `pdftotext`, salvando o texto em `/tmp/*.txt` e inspecionando por partes/seções.",
+        ])
+        enriched = enriched + "\n".join(notes)
+
+    if allow_agent_session_naming and "<session_title>" not in enriched:
+        enriched = enriched + _SESSION_TITLE_PROMPT_NOTE
+
+    return enriched
 
 
 def _build_remote_environment_spec(
@@ -297,11 +477,20 @@ def build_create_payload(
     background: bool = False,
     sources: Optional[List[Dict[str, Any]]] = None,
     uploaded_files: Optional[List[Dict[str, Any]]] = None,
+    allow_agent_session_naming: bool = True,
 ) -> Dict[str, Any]:
     effective_prompt = (
-        enrich_agent_prompt_for_sandbox(prompt, uploaded_files=uploaded_files)
+        enrich_agent_prompt_for_sandbox(
+            prompt,
+            uploaded_files=uploaded_files,
+            allow_agent_session_naming=allow_agent_session_naming,
+        )
         if mode == "agent"
-        else prompt
+        else (
+            prompt + _SESSION_TITLE_PROMPT_NOTE
+            if allow_agent_session_naming and "<session_title>" not in prompt and prompt.strip().lower() != "continue"
+            else prompt
+        )
     )
     payload: Dict[str, Any] = {
         "input": effective_prompt,
@@ -537,6 +726,7 @@ async def cancel_interaction(
 
 
 def format_session_as_markdown(session: Dict[str, Any]) -> str:
+    last_prompt = session.get("last_prompt_at") or session.get("updated_at") or session.get("created_at") or "N/A"
     lines = [
         f"# {session.get('title', 'Conversa Antigravity Studio')}",
         "",
@@ -546,6 +736,7 @@ def format_session_as_markdown(session: Dict[str, Any]) -> str:
         f"- **Modelo:** `{session.get('model_name')}`",
         f"- **Environment ID:** `{session.get('environment_id') or 'remote (novo)'}`",
         f"- **Último Interaction ID:** `{session.get('last_interaction_id') or 'N/A'}`",
+        f"- **Data/Hora do Último Prompt:** `{last_prompt}`",
     ]
 
     uploaded_files = session.get("uploaded_files") or []
@@ -559,7 +750,10 @@ def format_session_as_markdown(session: Dict[str, Any]) -> str:
     lines.extend(["", "---", ""])
 
     for idx, turn in enumerate(session.get("turns", []), start=1):
-        lines.append(f"## Turno {idx}")
+        turn_ts = turn.get("created_at") or ""
+        lines.append(f"## Turno {idx}" + (f" ({turn_ts})" if turn_ts else ""))
+        if turn_ts:
+            lines.append(f"- **Data/Hora do Prompt:** `{turn_ts}`")
         lines.append(f"- **Interaction ID:** `{turn.get('interaction_id')}`")
         if turn.get("previous_interaction_id"):
             lines.append(f"- **Previous Interaction ID:** `{turn.get('previous_interaction_id')}`")
@@ -1693,6 +1887,7 @@ def encode_session_sync_display_name(session: Dict[str, Any]) -> str:
     meta: Dict[str, Any] = {
         "id": (session.get("id") or "").strip(),
         "t": (session.get("title") or "Conversa Antigravity").strip()[:56],
+        "tl": 1 if session.get("title_locked_by_user") else 0,
         "last": last_id,
         "env": env_id,
         "m": (session.get("mode") or "agent").strip(),
@@ -1754,6 +1949,7 @@ def decode_session_sync_display_name(display_name: str) -> Optional[Dict[str, An
         return {
             "id": str(data.get("id") or "").strip(),
             "title": str(data.get("t") or "Conversa Antigravity").strip(),
+            "title_locked_by_user": bool(data.get("tl")),
             "last_interaction_id": str(data.get("last") or "").strip(),
             "environment_id": env_id,
             "mode": str(data.get("m") or "agent").strip(),

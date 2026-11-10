@@ -131,6 +131,7 @@ data class TurnModel(
 data class SessionModel(
     val id: String,
     val title: String = "Nova Conversa Antigravity",
+    val titleLockedByUser: Boolean = false,
     val mode: String = "agent", // "agent" or "model"
     val agentName: String = "antigravity-preview-09-2026",
     val modelName: String = "gemini-4-argon",
@@ -142,6 +143,7 @@ data class SessionModel(
     val uploadedFiles: List<UploadedFileRecord> = emptyList(),
     val turns: List<TurnModel> = emptyList(),
     val turnCount: Int = 0,
+    val lastPromptAt: String = "",
     val createdAt: String = nowIso(),
     val updatedAt: String = nowIso()
 )
@@ -162,6 +164,32 @@ fun nowIso(): String =
     DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
         .withZone(ZoneOffset.UTC)
         .format(Instant.now())
+
+fun formatDateTimePtBr(isoStr: String?): String {
+    val raw = isoStr?.trim().orEmpty()
+    if (raw.isEmpty()) return ""
+    return try {
+        val instant = Instant.parse(if (raw.endsWith("Z") || raw.contains("+")) raw else "${raw}Z")
+        DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss")
+            .withZone(java.time.ZoneId.systemDefault())
+            .format(instant)
+    } catch (_: Exception) {
+        raw
+    }
+}
+
+fun formatShortDateTimePtBr(isoStr: String?): String {
+    val raw = isoStr?.trim().orEmpty()
+    if (raw.isEmpty()) return ""
+    return try {
+        val instant = Instant.parse(if (raw.endsWith("Z") || raw.contains("+")) raw else "${raw}Z")
+        DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
+            .withZone(java.time.ZoneId.systemDefault())
+            .format(instant)
+    } catch (_: Exception) {
+        raw
+    }
+}
 
 fun parseSourcesJson(jsonStr: String?): List<SourceItem> {
     if (jsonStr.isNullOrBlank()) return emptyList()

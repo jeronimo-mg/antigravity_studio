@@ -124,6 +124,7 @@ object LocalAndroidAgent {
         sb.appendLine("- `find_by_name`: `{\"tool\": \"find_by_name\", \"arguments\": {\"SearchDirectory\": \".\", \"Pattern\": \"*\"}}`")
         sb.appendLine("- `grep_search`: `{\"tool\": \"grep_search\", \"arguments\": {\"SearchPath\": \".\", \"Query\": \"...\"}}`")
         sb.appendLine("- `web_search` / `browse_url`: `{\"tool\": \"web_search\", \"arguments\": {\"queries\": [\"...\"]}}` / `{\"tool\": \"browse_url\", \"arguments\": {\"urls\": [\"...\"]}}`")
+        sb.appendLine("- Ao concluir a resposta final deste turno, inclua na última linha `<session_title>Título Curto da Sessão (3 a 7 palavras)</session_title>` criando ou atualizando o título descritivo desta sessão conforme o progresso da conversa.")
         if (customInstruction.isNotBlank()) {
             sb.appendLine()
             sb.appendLine("Observações adicionais do meu projeto:")
@@ -730,6 +731,7 @@ object LocalAndroidAgent {
         )
 
         var finalOutputText = ""
+        var agentSessionTitle: String? = null
         var totalIn = 0
         var totalOut = 0
         var totalTok = 0
@@ -787,6 +789,12 @@ object LocalAndroidAgent {
                 rawHopOutput = outTxts.joinToString("\n\n").trim()
             }
 
+            val (cleanedHopOutput, hopTitle) = com.antigravity.studio.data.remote.InteractionsClient.extractAndCleanSessionTitle(rawHopOutput)
+            rawHopOutput = cleanedHopOutput
+            if (!hopTitle.isNullOrBlank()) {
+                agentSessionTitle = hopTitle
+            }
+
             val (localCalls, cleanedOutput) = extractLocalToolCalls(
                 rawHopOutput,
                 allowShellFallback = (hop == 0 && !executedAnyLocalTool)
@@ -796,7 +804,11 @@ object LocalAndroidAgent {
                 if (executedAnyLocalTool) {
                     candidateFinal = stripRefusalDisclaimers(candidateFinal)
                 }
-                finalOutputText = candidateFinal
+                val (cleanFinal, finalTitle) = com.antigravity.studio.data.remote.InteractionsClient.extractAndCleanSessionTitle(candidateFinal)
+                if (!finalTitle.isNullOrBlank()) {
+                    agentSessionTitle = finalTitle
+                }
+                finalOutputText = cleanFinal
                 if (finalOutputText.isNotEmpty()) {
                     stepsRecorded.put(
                         JSONObject()
@@ -858,5 +870,10 @@ object LocalAndroidAgent {
                     .put("output_tokens", totalOut)
                     .put("total_tokens", totalTok)
             )
+            .apply {
+                if (!agentSessionTitle.isNullOrBlank()) {
+                    put("_agent_session_title", agentSessionTitle)
+                }
+            }
     }
 }

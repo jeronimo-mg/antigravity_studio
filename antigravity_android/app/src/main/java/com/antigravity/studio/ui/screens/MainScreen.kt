@@ -89,6 +89,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.antigravity.studio.data.model.TurnModel
+import com.antigravity.studio.data.model.formatDateTimePtBr
+import com.antigravity.studio.data.model.formatShortDateTimePtBr
 import com.antigravity.studio.ui.StudioViewModel
 import com.antigravity.studio.ui.components.ApiKeyDialog
 import com.antigravity.studio.ui.components.CodeAndExportDialog
@@ -242,7 +244,7 @@ fun MainScreen(viewModel: StudioViewModel) {
                                 ) {
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
-                                            text = sess.title,
+                                            text = "${if (sess.titleLockedByUser) "🔒 " else "🤖 "}${sess.title}",
                                             style = MaterialTheme.typography.bodyMedium,
                                             fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                                             maxLines = 1,
@@ -258,6 +260,17 @@ fun MainScreen(viewModel: StudioViewModel) {
                                                 text = "• ${sess.turnCount} turnos",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = Slate400
+                                            )
+                                        }
+                                        val lastPromptFormatted = formatShortDateTimePtBr(
+                                            sess.lastPromptAt.ifBlank { sess.updatedAt }
+                                        )
+                                        if (lastPromptFormatted.isNotBlank()) {
+                                            Text(
+                                                text = "🕒 $lastPromptFormatted",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = Slate400,
+                                                fontFamily = FontFamily.Monospace
                                             )
                                         }
                                         if (sess.environmentId.isNotBlank()) {
@@ -800,11 +813,28 @@ fun TurnCard(
                 }
             }
 
-            // Chips de IDs (clicáveis para copiar)
+            val promptDateTime = formatDateTimePtBr(turn.createdAt)
+
+            // Chips de IDs e Data/Hora (clicáveis para copiar)
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
+                if (promptDateTime.isNotBlank()) {
+                    Surface(
+                        color = Slate800,
+                        shape = RoundedCornerShape(6.dp)
+                    ) {
+                        Text(
+                            text = "🕒 $promptDateTime",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = Sky400,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+
                 Surface(
                     color = Slate800,
                     shape = RoundedCornerShape(6.dp),
@@ -865,12 +895,26 @@ fun TurnCard(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(10.dp)) {
-                    Text(
-                        "👤 Você",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Sky400,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            "👤 Você",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Sky400,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        if (promptDateTime.isNotBlank()) {
+                            Text(
+                                text = "🕒 $promptDateTime",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Slate400,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
                     Spacer(Modifier.height(4.dp))
                     SelectionContainer {
                         Text(

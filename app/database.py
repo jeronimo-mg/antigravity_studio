@@ -34,6 +34,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                title_locked_by_user INTEGER DEFAULT 0,
                 mode TEXT NOT NULL DEFAULT 'agent',
                 execution_mode TEXT NOT NULL DEFAULT 'remote',
                 local_workdir TEXT DEFAULT '',
@@ -64,6 +65,10 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE sessions ADD COLUMN local_workdir TEXT DEFAULT ''")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN title_locked_by_user INTEGER DEFAULT 0")
         except Exception:
             pass
         try:
@@ -137,6 +142,7 @@ def create_session(
     updated_at: Optional[str] = None,
     execution_mode: str = "remote",
     local_workdir: str = "",
+    title_locked_by_user: bool = False,
 ) -> Dict[str, Any]:
     effective_id = (session_id or "").strip() or f"sess_{uuid.uuid4().hex[:12]}"
     ts = now_iso()
@@ -146,20 +152,22 @@ def create_session(
     eff_exec_mode = (execution_mode or "remote").strip().lower()
     if eff_exec_mode not in ("remote", "local"):
         eff_exec_mode = "remote"
+    locked_int = 1 if title_locked_by_user else 0
     conn = get_connection()
     with conn:
         conn.execute(
             """
             INSERT OR IGNORE INTO sessions (
-                id, title, mode, execution_mode, local_workdir,
+                id, title, title_locked_by_user, mode, execution_mode, local_workdir,
                 agent_name, model_name, environment_id, last_interaction_id,
                 max_total_tokens, system_instruction, sources_json,
                 uploaded_files_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 effective_id,
                 title,
+                locked_int,
                 mode,
                 eff_exec_mode,
                 local_workdir or "",
@@ -182,6 +190,7 @@ def create_session(
 def update_session(session_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
     allowed = {
         "title",
+        "title_locked_by_user",
         "mode",
         "execution_mode",
         "local_workdir",
@@ -200,6 +209,8 @@ def update_session(session_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
         kwargs["sources_json"] = json.dumps(kwargs.pop("sources"))
     if "uploaded_files" in kwargs and kwargs["uploaded_files"] is not None:
         kwargs["uploaded_files_json"] = json.dumps(kwargs.pop("uploaded_files"))
+    if "title_locked_by_user" in kwargs and kwargs["title_locked_by_user"] is not None:
+        kwargs["title_locked_by_user"] = 1 if kwargs["title_locked_by_user"] else 0
 
     fields = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
     if not fields:
@@ -221,9 +232,10 @@ def list_sessions() -> List[Dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT s.*,
-               (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id) AS turn_count
+               (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id) AS turn_count,
+               (SELECT MAX(t.created_at) FROM turns t WHERE t.session_id = s.id) AS last_prompt_at
         FROM sessions s
-        ORDER BY s.updated_at DESC
+        ORDER BY COALESCE((SELECT MAX(t.created_at) FROM turns t WHERE t.session_id = s.id), s.updated_at) DESC
         """
     ).fetchall()
     conn.close()
@@ -232,6 +244,8 @@ def list_sessions() -> List[Dict[str, Any]]:
         d = dict(r)
         d.setdefault("execution_mode", "remote")
         d.setdefault("local_workdir", "")
+        d["title_locked_by_user"] = bool(d.get("title_locked_by_user"))
+        d["last_prompt_at"] = d.get("last_prompt_at") or d.get("updated_at") or d.get("created_at") or ""
         d["sources"] = json.loads(d.pop("sources_json", None) or "[]")
         d["uploaded_files"] = json.loads(d.pop("uploaded_files_json", None) or "[]")
         results.append(d)
@@ -247,6 +261,7 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     session_dict = dict(row)
     session_dict.setdefault("execution_mode", "remote")
     session_dict.setdefault("local_workdir", "")
+    session_dict["title_locked_by_user"] = bool(session_dict.get("title_locked_by_user"))
     session_dict["sources"] = json.loads(session_dict.pop("sources_json", None) or "[]")
     session_dict["uploaded_files"] = json.loads(session_dict.pop("uploaded_files_json", None) or "[]")
     turns_rows = conn.execute(
@@ -263,6 +278,9 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         td["raw"] = json.loads(td.pop("raw_json") or "{}")
         turns.append(td)
     session_dict["turns"] = turns
+    session_dict["last_prompt_at"] = (
+        turns[-1].get("created_at") if turns else (session_dict.get("updated_at") or session_dict.get("created_at") or "")
+    )
     return session_dict
 
 

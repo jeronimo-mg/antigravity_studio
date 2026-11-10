@@ -142,6 +142,47 @@ async function loadSessionsList() {
   }
 }
 
+function formatDateTimePtBr(isoStr) {
+  if (!isoStr || typeof isoStr !== "string") return "";
+  const raw = isoStr.trim();
+  if (!raw) return "";
+  try {
+    const normalized = raw.includes("T") ? raw : raw.replace(" ", "T") + (raw.endsWith("Z") ? "" : "Z");
+    const dt = new Date(normalized);
+    if (isNaN(dt.getTime())) return raw;
+    return dt.toLocaleString("pt-BR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch (e) {
+    return raw;
+  }
+}
+
+function formatShortDateTimePtBr(isoStr) {
+  if (!isoStr || typeof isoStr !== "string") return "";
+  const raw = isoStr.trim();
+  if (!raw) return "";
+  try {
+    const normalized = raw.includes("T") ? raw : raw.replace(" ", "T") + (raw.endsWith("Z") ? "" : "Z");
+    const dt = new Date(normalized);
+    if (isNaN(dt.getTime())) return raw;
+    return dt.toLocaleString("pt-BR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch (e) {
+    return raw;
+  }
+}
+
 function renderSessionsSidebar() {
   const container = document.getElementById("sessionsList");
   if (!sessionsList.length) {
@@ -162,6 +203,10 @@ function renderSessionsSidebar() {
         : s.environment_id
         ? `<span class="text-[10px] font-mono text-purple-300 bg-purple-500/10 px-1.5 py-0.5 rounded">${escapeHtml(s.environment_id.slice(0, 12))}</span>`
         : `<span class="text-[10px] font-mono text-blue-300 bg-blue-500/10 px-1.5 py-0.5 rounded">☁️ Remoto</span>`;
+      const lastPromptStr = formatShortDateTimePtBr(s.last_prompt_at || s.updated_at || s.created_at || "");
+      const lockIcon = s.title_locked_by_user
+        ? `<span class="text-[10px] text-amber-300 shrink-0" title="Nome definido pelo usuário (travado contra alterações do agente)">🔒</span>`
+        : `<span class="text-[10px] text-blue-300/70 shrink-0" title="Nome criado e atualizado automaticamente pelo agente">🤖</span>`;
       return `
         <div
           onclick="selectSession('${s.id}')"
@@ -172,23 +217,94 @@ function renderSessionsSidebar() {
           }"
         >
           <div class="min-w-0 flex-1 pr-2">
-            <div class="font-medium truncate">${escapeHtml(s.title || "Sem título")}</div>
-            <div class="flex items-center gap-1.5 mt-1 text-[10px] text-gray-400">
+            <div class="font-medium truncate flex items-center gap-1" title="${escapeHtml(s.title || "Sem título")}">
+              ${lockIcon}
+              <span class="truncate">${escapeHtml(s.title || "Sem título")}</span>
+            </div>
+            <div class="flex flex-wrap items-center gap-1.5 mt-1 text-[10px] text-gray-400">
               <span>${s.turn_count || 0} turnos</span>
               ${modeBadge}
             </div>
+            ${
+              lastPromptStr
+                ? `<div class="mt-0.5 text-[10px] text-gray-500 font-mono truncate" title="Data e hora do último prompt">🕒 ${escapeHtml(lastPromptStr)}</div>`
+                : ""
+            }
           </div>
-          <button
-            onclick="event.stopPropagation(); removeSession('${s.id}')"
-            class="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 px-1 transition"
-            title="Excluir sessão"
-          >
-            ✕
-          </button>
+          <div class="flex items-center gap-0.5 shrink-0">
+            <button
+              onclick="event.stopPropagation(); renameSessionById('${s.id}')"
+              class="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-blue-300 px-1 transition"
+              title="Renomear sessão (trava o nome para o agente não alterar)"
+            >
+              ✏️
+            </button>
+            <button
+              onclick="event.stopPropagation(); removeSession('${s.id}')"
+              class="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 px-1 transition"
+              title="Excluir sessão"
+            >
+              ✕
+            </button>
+          </div>
         </div>
       `;
     })
     .join("");
+}
+
+async function renameSessionById(sessionId) {
+  const target = sessionsList.find((s) => s.id === sessionId) || (currentSession && currentSession.id === sessionId ? currentSession : null);
+  const currentTitle = target ? (target.title || "") : "";
+  const nextTitle = prompt(
+    "Digite o novo nome para esta sessão (ao definir manualmente, o agente não alterará mais o nome):",
+    currentTitle
+  );
+  if (nextTitle === null) return;
+  const cleaned = nextTitle.trim();
+  if (!cleaned) return;
+  try {
+    const res = await fetch(`/api/sessions/${sessionId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: cleaned,
+        title_locked_by_user: true,
+      }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      if (currentSession && currentSession.id === sessionId) {
+        currentSession = updated;
+        syncInputsFromSession();
+      }
+      await loadSessionsList();
+    }
+  } catch (err) {
+    alert("Erro ao renomear sessão: " + err.message);
+  }
+}
+
+async function toggleSessionTitleLock() {
+  if (!currentSession) return;
+  const nextLocked = !Boolean(currentSession.title_locked_by_user);
+  try {
+    const res = await fetch(`/api/sessions/${currentSession.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: document.getElementById("sessionTitleInput").value.trim() || currentSession.title,
+        title_locked_by_user: nextLocked,
+      }),
+    });
+    if (res.ok) {
+      currentSession = await res.json();
+      syncInputsFromSession();
+      await loadSessionsList();
+    }
+  } catch (err) {
+    console.error("Erro ao alternar trava de título:", err);
+  }
 }
 
 async function createNewSession() {
@@ -251,6 +367,18 @@ async function removeSession(sessionId) {
 function syncInputsFromSession() {
   if (!currentSession) return;
   document.getElementById("sessionTitleInput").value = currentSession.title || "";
+  const lockBtn = document.getElementById("sessionTitleLockBtn");
+  if (lockBtn) {
+    if (currentSession.title_locked_by_user) {
+      lockBtn.textContent = "🔒";
+      lockBtn.className = "text-xs px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 transition";
+      lockBtn.title = "🔒 Nome definido pelo usuário (o agente não alterará). Clique para liberar ao agente.";
+    } else {
+      lockBtn.textContent = "🤖";
+      lockBtn.className = "text-xs px-1.5 py-0.5 rounded bg-studio-card border border-studio-border text-blue-300 hover:text-white transition";
+      lockBtn.title = "🤖 Nome criado/atualizado automaticamente pelo agente. Clique para fixar o nome atual.";
+    }
+  }
   document.getElementById("agentSelect").value =
     currentSession.agent_name || "antigravity-preview-09-2026";
   document.getElementById("modelSelect").value = "gemini-4-argon";
@@ -813,6 +941,8 @@ function renderSingleTurnCard(turn, turnNumber) {
     `
       : "";
 
+  const promptDateTimeStr = formatDateTimePtBr(turn.created_at);
+
   return `
     <div class="max-w-4xl mx-auto bg-studio-panel border border-studio-border rounded-2xl overflow-hidden shadow-lg">
       <!-- Turn Metadata Header -->
@@ -820,6 +950,11 @@ function renderSingleTurnCard(turn, turnNumber) {
         <div class="flex flex-wrap items-center gap-2">
           <span class="font-bold text-white bg-blue-500/20 border border-blue-500/40 px-2 py-0.5 rounded">Turno #${turnNumber}</span>
           <span class="px-2 py-0.5 rounded border ${badgeClass} font-mono">${escapeHtml(status)}</span>
+          ${
+            promptDateTimeStr
+              ? `<span class="text-sky-300 bg-sky-500/10 border border-sky-500/30 px-2 py-0.5 rounded font-mono" title="Data e hora do envio do prompt pelo usuário (${escapeHtml(turn.created_at || "")})">🕒 ${escapeHtml(promptDateTimeStr)}</span>`
+              : ""
+          }
           <span class="text-gray-400 font-mono" title="ID desta interação">
             id: <code class="text-blue-300">${escapeHtml(turn.interaction_id)}</code>
             <button onclick="navigator.clipboard.writeText('${turn.interaction_id}')" class="hover:text-white ml-0.5" title="Copiar ID">📋</button>
@@ -867,7 +1002,14 @@ function renderSingleTurnCard(turn, turnNumber) {
       <div class="p-4 space-y-4">
         <!-- User Input -->
         <div class="bg-studio-card/90 border border-studio-border rounded-xl p-3.5">
-          <div class="text-[11px] font-semibold uppercase tracking-wider text-blue-300 mb-1">👤 Usuário (User Input)</div>
+          <div class="flex items-center justify-between gap-2 mb-1">
+            <div class="text-[11px] font-semibold uppercase tracking-wider text-blue-300">👤 Usuário (User Input)</div>
+            ${
+              promptDateTimeStr
+                ? `<div class="text-[11px] font-mono text-gray-400" title="Data/Hora do prompt">🕒 ${escapeHtml(promptDateTimeStr)}</div>`
+                : ""
+            }
+          </div>
           <div class="text-sm text-gray-100 whitespace-pre-wrap">${escapeHtml(turn.user_input_text || "(Input não retornado)")}</div>
         </div>
 

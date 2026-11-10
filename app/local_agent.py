@@ -20,8 +20,10 @@ import httpx
 from .interactions_client import (
     INTERACTIONS_BASE_URL,
     build_headers,
+    extract_and_clean_session_title,
     extract_text_from_document_bytes,
     resolve_api_key,
+    synthesize_agent_session_title,
 )
 
 GENERATE_CONTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -1070,6 +1072,7 @@ def build_local_agent_system_instruction(
         '- `web_search` / `browse_url`: `{"tool": "web_search", "arguments": {"queries": ["..."]}}` / `{"tool": "browse_url", "arguments": {"urls": ["..."]}}`',
         "",
         "Assim que você responder com o bloco ```json:local-action, o meu aplicativo executará a ação localmente aqui no meu computador e enviará a saída real (`stdout`/`stderr`) na mensagem seguinte para você analisar e concluir a resposta.",
+        "Ao concluir sua resposta final (quando não houver mais blocos ```json:local-action pendentes), inclua ao final uma tag `<session_title>Título Curto da Sessão</session_title>` (3 a 7 palavras) que dê um nome claro para esta sessão, atualizando-o livremente conforme o assunto da sessão evoluir.",
     ]
     if custom_instruction and custom_instruction.strip():
         base_lines.extend(["", "Observações adicionais do meu projeto:", custom_instruction.strip()])
@@ -1634,6 +1637,7 @@ async def run_local_agent_turn(
     headers = build_headers(api_key)
     underlying_model = "gemini-4-argon"
     executed_any_local_tool = False
+    extracted_agent_title: Optional[str] = None
 
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
@@ -1694,6 +1698,11 @@ async def run_local_agent_turn(
                     if out_txts:
                         raw_hop_output = "\n\n".join(out_txts).strip()
 
+                hop_title, raw_hop_output = extract_and_clean_session_title(raw_hop_output)
+                if hop_title:
+                    extracted_agent_title = hop_title
+                    run_state["_agent_session_title"] = extracted_agent_title
+
                 local_calls, cleaned_output = _extract_local_tool_calls_from_text(
                     raw_hop_output,
                     allow_shell_fallback=(hop == 0 and not executed_any_local_tool),
@@ -1708,6 +1717,9 @@ async def run_local_agent_turn(
 
                 if not local_calls:
                     candidate_final = cleaned_output or raw_hop_output
+                    cand_title, candidate_final = extract_and_clean_session_title(candidate_final)
+                    if cand_title:
+                        extracted_agent_title = cand_title
                     if executed_any_local_tool:
                         candidate_final = _strip_sandbox_refusal_disclaimers(candidate_final)
                         if not candidate_final.strip():
@@ -1725,10 +1737,12 @@ async def run_local_agent_turn(
                     break
 
                 if cleaned_output:
-                    accumulated_steps.append({
-                        "type": "thought",
-                        "content": [{"type": "text", "text": cleaned_output}],
-                    })
+                    _, cleaned_output = extract_and_clean_session_title(cleaned_output)
+                    if cleaned_output:
+                        accumulated_steps.append({
+                            "type": "thought",
+                            "content": [{"type": "text", "text": cleaned_output}],
+                        })
 
                 tool_results_feedback: List[str] = []
                 for fc in local_calls:
@@ -1775,7 +1789,8 @@ async def run_local_agent_turn(
                     + "\n\n".join(tool_results_feedback)
                     + "\n\nSe mais alguma ação precisar ser executada na minha máquina para concluir o pedido, "
                     "inclua apenas o próximo bloco ```json:local-action. "
-                    "Caso a tarefa já tenha sido concluída, apresente o resumo final para mim com base nos resultados reais acima."
+                    "Caso a tarefa já tenha sido concluída, apresente o resumo final para mim com base nos resultados reais acima "
+                    "e inclua ao final uma tag `<session_title>Título Curto da Sessão</session_title>` (3 a 7 palavras)."
                 )
 
     except Exception as exc:
@@ -1788,9 +1803,11 @@ async def run_local_agent_turn(
         })
 
     _notify(accumulated_steps, final_output_text, final_status)
+    effective_agent_title = extracted_agent_title or synthesize_agent_session_title(prompt, final_output_text)
     result_payload = {
         "id": final_api_id if not interaction_id_override else local_turn_id,
         "_api_interaction_id": final_api_id,
+        "_agent_session_title": effective_agent_title,
         "previous_interaction_id": clean_prev,
         "environment_id": f"local:{abs_workdir}",
         "execution_mode": "local",

@@ -29,16 +29,19 @@ from .interactions_client import (
     create_remote_environment,
     delete_session_from_files_api,
     download_environment_snapshot,
+    extract_and_clean_session_title,
     extract_texts_from_interaction,
     format_session_as_markdown,
     get_interaction,
     get_synced_session_from_files_api,
+    is_default_session_title,
     list_environment_files,
     list_synced_sessions_from_files_api,
     pack_files_as_tar_gz,
     push_session_to_files_api,
     recover_conversation_chain,
     resolve_api_key,
+    synthesize_agent_session_title,
     upload_file_to_environment,
 )
 from .local_agent import (
@@ -83,6 +86,7 @@ class SettingsUpdate(BaseModel):
 
 class SessionCreateRequest(BaseModel):
     title: Optional[str] = "Nova Conversa Antigravity"
+    title_locked_by_user: Optional[bool] = False
     mode: Optional[str] = "agent"
     execution_mode: Optional[str] = "remote"
     local_workdir: Optional[str] = ""
@@ -98,6 +102,7 @@ class SessionCreateRequest(BaseModel):
 
 class SessionUpdateRequest(BaseModel):
     title: Optional[str] = None
+    title_locked_by_user: Optional[bool] = None
     mode: Optional[str] = None
     execution_mode: Optional[str] = None
     local_workdir: Optional[str] = None
@@ -238,6 +243,58 @@ class LoadChainRequest(BaseModel):
     api_key: Optional[str] = None
 
 
+def _resolve_next_session_title(
+    session: Dict[str, Any],
+    user_prompt: str = "",
+    output_text: str = "",
+    explicit_agent_title: Optional[str] = None,
+    turn_index: int = 1,
+) -> Optional[str]:
+    """
+    Calcula o próximo título da sessão gerenciado pelo agente:
+    - Se `title_locked_by_user` for True, retorna None (respeitando o nome escolhido pelo usuário).
+    - Se o agente emitiu `<session_title>...</session_title>` (`explicit_agent_title`), usa o novo título do agente
+      (permitindo ao agente renomear a sessão livremente conforme ela progride).
+    - Se ainda não houver tag explícita (ex: turno em andamento ou 1º turno), sintetiza um nome descritivo
+      a partir do tópico do turno.
+    """
+    if session.get("title_locked_by_user"):
+        return None
+
+    current_title = (session.get("title") or "").strip()
+    if explicit_agent_title and explicit_agent_title.strip():
+        return explicit_agent_title.strip()
+
+    tag_from_out, _ = extract_and_clean_session_title(output_text or "")
+    if tag_from_out:
+        return tag_from_out
+
+    clean_prompt_low = (user_prompt or "").strip().lower()
+    is_short_continuation = clean_prompt_low in (
+        "continue",
+        "continuar",
+        "ok",
+        "sim",
+        "pode fazer",
+        "prosseguir",
+        "prossiga",
+        "1",
+        "2",
+    ) or len(clean_prompt_low) < 6
+
+    if is_default_session_title(current_title) or turn_index <= 1:
+        return synthesize_agent_session_title(user_prompt, output_text, current_title)
+
+    # Em turnos subsequentes (turn_index > 1), se o prompt trouxer uma nova instrução substancial
+    # ou a resposta tiver um cabeçalho temático claro, atualiza o título da sessão
+    if not is_short_continuation and (output_text or len(clean_prompt_low) >= 15):
+        candidate = synthesize_agent_session_title(user_prompt, output_text, current_title)
+        if candidate and not is_default_session_title(candidate):
+            return candidate
+
+    return current_title or "Sessão Antigravity"
+
+
 async def _load_chain_into_session(
     session_id: str,
     target_id: str,
@@ -271,19 +328,18 @@ async def _load_chain_into_session(
         or ""
     )
 
-    first_user_text, _ = extract_texts_from_interaction(chain[0], "")
-    current_title = (existing.get("title") or "").strip()
-    if not current_title or current_title in ("Nova Conversa Antigravity", "Nova Conversa", "Conversa Antigravity"):
-        auto_title = (
-            first_user_text[:48] + "..."
-            if len(first_user_text) > 48
-            else (first_user_text or f"Conversa ({clean_target[:12]}...)")
-        )
-    else:
-        auto_title = current_title
+    latest_agent_title: Optional[str] = None
+    last_u_text = ""
+    last_out_text = ""
 
     for idx, item in enumerate(chain, start=1):
         u_text, out_text = extract_texts_from_interaction(item)
+        if item.get("_agent_session_title"):
+            latest_agent_title = str(item["_agent_session_title"])
+        if u_text:
+            last_u_text = u_text
+        if out_text:
+            last_out_text = out_text
         item_env = clean_environment_id(
             item.get("environment_id")
             or (item.get("environment") if isinstance(item.get("environment"), str) else "")
@@ -301,8 +357,23 @@ async def _load_chain_into_session(
             steps=item.get("steps", []) or [],
             usage=item.get("usage", {}) or {},
             raw=item,
-            created_at=item.get("created"),
+            created_at=item.get("created") or item.get("createTime"),
         )
+
+    current_title = (existing.get("title") or "").strip()
+    if existing.get("title_locked_by_user") and not is_default_session_title(current_title):
+        auto_title = current_title
+    elif latest_agent_title:
+        auto_title = latest_agent_title
+    elif is_default_session_title(current_title):
+        first_user_text, first_out_text = extract_texts_from_interaction(chain[0], "")
+        auto_title = synthesize_agent_session_title(
+            last_u_text or first_user_text,
+            last_out_text or first_out_text,
+            f"Sessão ({clean_target[:12]}...)",
+        )
+    else:
+        auto_title = current_title
 
     update_kwargs: Dict[str, Any] = {
         "title": auto_title,
@@ -330,8 +401,11 @@ async def api_create_session(body: SessionCreateRequest) -> Dict[str, Any]:
     if eff_exec_mode not in ("remote", "local"):
         eff_exec_mode = "remote"
     eff_workdir = (body.local_workdir or "").strip() or get_default_local_workdir()
+    custom_title = (body.title or "Nova Conversa Antigravity").strip()
+    locked_by_user = bool(body.title_locked_by_user) or not is_default_session_title(custom_title)
     session = create_session(
-        title=body.title or "Nova Conversa Antigravity",
+        title=custom_title,
+        title_locked_by_user=locked_by_user,
         mode=body.mode or "agent",
         execution_mode=eff_exec_mode,
         local_workdir=eff_workdir,
@@ -368,6 +442,11 @@ async def api_update_session(session_id: str, body: SessionUpdateRequest) -> Dic
     if not existing:
         raise HTTPException(status_code=404, detail="Sessão não encontrada.")
     patch_data = body.model_dump(exclude_unset=True)
+    if "title" in patch_data and patch_data["title"] is not None:
+        new_title_clean = str(patch_data["title"]).strip()
+        old_title_clean = str(existing.get("title") or "").strip()
+        if new_title_clean and new_title_clean != old_title_clean and "title_locked_by_user" not in patch_data:
+            patch_data["title_locked_by_user"] = True
     new_env = patch_data.get("environment_id")
     if new_env and not existing.get("uploaded_files") and "uploaded_files" not in patch_data:
         inherited = _find_uploaded_files_for_environment(new_env)
@@ -422,7 +501,7 @@ async def api_load_chain_into_existing_session(
         raise HTTPException(status_code=400, detail=str(exc))
 
     turns = (updated or {}).get("turns", [])
-    asyncio.create_task(_bg_push_session_sync(session_id, api_key=api_key))
+    asyncio.create_task(_bg_push_session_sync(session_id, api_key=body.api_key if body else None))
     return {
         "session": updated,
         "imported_turns": len(turns),
@@ -485,6 +564,7 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
         r_last_id = (rmeta.get("last_interaction_id") or "").strip()
         r_env_id = clean_environment_id(rmeta.get("environment_id") or "")
         r_title = (rmeta.get("title") or "Conversa Antigravity").strip()
+        r_locked = bool(rmeta.get("title_locked_by_user"))
         r_mode = (rmeta.get("mode") or "agent").strip()
         r_agent = (rmeta.get("agent_name") or "antigravity-preview-09-2026").strip()
         r_model = (rmeta.get("model_name") or "gemini-4-argon").strip()
@@ -495,6 +575,7 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
         if not local_sess:
             create_session(
                 title=r_title,
+                title_locked_by_user=r_locked,
                 mode=r_mode,
                 agent_name=r_agent,
                 model_name=r_model,
@@ -518,11 +599,15 @@ async def api_sync_sessions_cloud(api_key: Optional[str] = None) -> Dict[str, An
             local_uploads = local_sess.get("uploaded_files") or []
             merged_uploads = _merge_uploaded_files(local_uploads, r_uploads)
             uploads_changed = len(merged_uploads) != len(local_uploads)
+            should_update_title = not local_sess.get("title_locked_by_user") and (
+                is_default_session_title(local_sess.get("title")) or r_locked
+            )
 
             if r_last_id and ((r_last_id != local_last_id and r_last_id not in existing_turn_ids) or not local_turns):
                 update_session(
                     sid,
-                    title=r_title if local_sess.get("title") in ("Nova Conversa Antigravity", "Nova Conversa") else None,
+                    title=r_title if should_update_title else None,
+                    title_locked_by_user=True if r_locked else None,
                     environment_id=r_env_id or local_env_id or None,
                     last_interaction_id=r_last_id,
                     uploaded_files=merged_uploads if uploads_changed else None,
@@ -618,10 +703,13 @@ async def api_import_chain(body: ImportChainRequest) -> Dict[str, Any]:
     if not target_id:
         raise HTTPException(status_code=400, detail="O interaction_id é obrigatório.")
 
+    user_supplied_title = bool(body.title and body.title.strip())
+
     if not body.fetch_history:
-        title = body.title.strip() if body.title else f"Continuação ({target_id[:14]}...)"
+        title = body.title.strip() if user_supplied_title else f"Continuação ({target_id[:14]}...)"
         session = create_session(
             title=title,
+            title_locked_by_user=user_supplied_title,
             mode=body.mode or "agent",
             agent_name=body.agent_name or "antigravity-preview-09-2026",
             model_name=body.model_name or "gemini-4-argon",
@@ -661,15 +749,27 @@ async def api_import_chain(body: ImportChainRequest) -> Dict[str, Any]:
         or (body.environment_id or "").strip()
     )
 
-    first_user_text, _ = extract_texts_from_interaction(chain[0], "")
+    first_user_text, first_out_text = extract_texts_from_interaction(chain[0], "")
+    last_user_text, last_out_text = extract_texts_from_interaction(last_item, "")
+    latest_agent_title = last_item.get("_agent_session_title") or chain[0].get("_agent_session_title")
+
     auto_title = (
         body.title.strip()
-        if body.title and body.title.strip()
-        else (first_user_text[:48] + "..." if len(first_user_text) > 48 else (first_user_text or f"Importada ({target_id[:12]}...)"))
+        if user_supplied_title
+        else (
+            str(latest_agent_title)
+            if latest_agent_title
+            else synthesize_agent_session_title(
+                last_user_text or first_user_text,
+                last_out_text or first_out_text,
+                f"Importada ({target_id[:12]}...)",
+            )
+        )
     )
 
     session = create_session(
         title=auto_title,
+        title_locked_by_user=user_supplied_title,
         mode=detected_mode,
         agent_name=detected_agent,
         model_name=detected_model,
@@ -696,7 +796,7 @@ async def api_import_chain(body: ImportChainRequest) -> Dict[str, Any]:
             steps=item.get("steps", []) or [],
             usage=item.get("usage", {}) or {},
             raw=item,
-            created_at=item.get("created"),
+            created_at=item.get("created") or item.get("createTime"),
         )
 
     full_session = get_session(session["id"])
@@ -869,10 +969,16 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
     )
     turns = session.get("turns", [])
     next_index = len(turns) + 1
+    prompt_created_at = now_iso()
 
-    new_title = session.get("title", "Nova Conversa Antigravity")
-    if next_index == 1 and new_title in ("Nova Conversa Antigravity", "Nova Conversa"):
-        new_title = prompt[:48] + ("..." if len(prompt) > 48 else "")
+    initial_agent_title = _resolve_next_session_title(
+        session=session,
+        user_prompt=prompt,
+        output_text="",
+        explicit_agent_title=None,
+        turn_index=next_index,
+    )
+    new_title = initial_agent_title or session.get("title", "Nova Conversa Antigravity")
 
     # ==========================================================================
     # EXECUÇÃO NO MODO MÁQUINA LOCAL (CLI / LOCAL OS & FILESYSTEM AGENT)
@@ -880,7 +986,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
     if execution_mode == "local":
         local_env_label = f"local:{local_workdir}"
         local_turn_id = f"local_{_uuid.uuid4().hex[:16]}"
-        created_ts = now_iso()
+        created_ts = prompt_created_at
 
         if body.background:
             initial_steps = [{"type": "user_input", "content": [{"type": "text", "text": prompt}]}]
@@ -913,7 +1019,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
             )
             update_session(
                 session_id,
-                title=new_title,
+                title=new_title if not session.get("title_locked_by_user") else None,
                 mode=mode,
                 execution_mode="local",
                 local_workdir=local_workdir,
@@ -927,7 +1033,8 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
 
             async def _bg_local_worker() -> None:
                 def _on_step(steps_now: List[Dict[str, Any]], out_now: str, status_now: str) -> None:
-                    cur_usage = (ACTIVE_LOCAL_RUNS.get(local_turn_id) or {}).get("usage") or {}
+                    cur_state = ACTIVE_LOCAL_RUNS.get(local_turn_id) or initial_raw
+                    cur_usage = cur_state.get("usage") or {}
                     upsert_turn(
                         session_id=session_id,
                         interaction_id=local_turn_id,
@@ -939,9 +1046,14 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                         status=status_now,
                         steps=steps_now,
                         usage=cur_usage,
-                        raw=ACTIVE_LOCAL_RUNS.get(local_turn_id) or initial_raw,
+                        raw=cur_state,
                         created_at=created_ts,
                     )
+                    hop_agent_title = cur_state.get("_agent_session_title")
+                    if hop_agent_title:
+                        latest_sess = get_session(session_id)
+                        if latest_sess and not latest_sess.get("title_locked_by_user"):
+                            update_session(session_id, title=str(hop_agent_title))
 
                 final_res = await run_local_agent_turn(
                     prompt=prompt,
@@ -955,6 +1067,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                     on_progress=_on_step,
                 )
                 fin_status = final_res.get("status", "completed")
+                fin_out = final_res.get("output_text", "")
                 upsert_turn(
                     session_id=session_id,
                     interaction_id=local_turn_id,
@@ -962,7 +1075,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                     previous_interaction_id=prev_id or "",
                     environment_id=local_env_label,
                     user_input_text=prompt,
-                    output_text=final_res.get("output_text", ""),
+                    output_text=fin_out,
                     status=fin_status,
                     steps=final_res.get("steps", []),
                     usage=final_res.get("usage", {}),
@@ -974,8 +1087,17 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                     if fin_status not in ("failed", "cancelled")
                     else (prev_id or "")
                 )
+                latest_sess = get_session(session_id) or session
+                resolved_fin_title = _resolve_next_session_title(
+                    session=latest_sess,
+                    user_prompt=prompt,
+                    output_text=fin_out,
+                    explicit_agent_title=final_res.get("_agent_session_title"),
+                    turn_index=next_index,
+                )
                 update_session(
                     session_id,
+                    title=resolved_fin_title,
                     execution_mode="local",
                     local_workdir=local_workdir,
                     environment_id=local_env_label,
@@ -1007,6 +1129,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
             interaction_id_override=local_turn_id,
         )
         fin_status = local_res.get("status", "completed")
+        fin_out = local_res.get("output_text", "")
         upsert_turn(
             session_id=session_id,
             interaction_id=local_turn_id,
@@ -1014,21 +1137,29 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
             previous_interaction_id=prev_id or "",
             environment_id=local_env_label,
             user_input_text=prompt,
-            output_text=local_res.get("output_text", ""),
+            output_text=fin_out,
             status=fin_status,
             steps=local_res.get("steps", []),
             usage=local_res.get("usage", {}),
             raw=local_res,
-            created_at=local_res.get("created"),
+            created_at=local_res.get("created") or created_ts,
         )
         next_valid_last = (
             local_res.get("_api_interaction_id") or local_turn_id
             if fin_status not in ("failed", "cancelled")
             else (prev_id or "")
         )
+        latest_sess = get_session(session_id) or session
+        resolved_fin_title = _resolve_next_session_title(
+            session=latest_sess,
+            user_prompt=prompt,
+            output_text=fin_out,
+            explicit_agent_title=local_res.get("_agent_session_title"),
+            turn_index=next_index,
+        )
         update_session(
             session_id,
-            title=new_title,
+            title=resolved_fin_title,
             mode=mode,
             execution_mode="local",
             local_workdir=local_workdir,
@@ -1106,6 +1237,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                     f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
                 )
 
+    allow_naming = not bool(session.get("title_locked_by_user"))
     payload = build_create_payload(
         prompt=effective_prompt,
         mode=mode,
@@ -1118,6 +1250,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         background=body.background,
         sources=sources,
         uploaded_files=uploaded_files,
+        allow_agent_session_naming=allow_naming,
     )
 
     try:
@@ -1142,6 +1275,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
     turn_status = interaction_resp.get("status", "completed")
 
     next_index = len(turns) + 1
+    turn_created_at = interaction_resp.get("created") or interaction_resp.get("createTime") or prompt_created_at
 
     upsert_turn(
         session_id=session_id,
@@ -1155,14 +1289,22 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         steps=interaction_resp.get("steps", []) or [],
         usage=interaction_resp.get("usage", {}) or {},
         raw=interaction_resp,
-        created_at=interaction_resp.get("created"),
+        created_at=turn_created_at,
     )
 
     next_last_id = new_interaction_id if turn_status not in ("failed", "cancelled") else ""
+    latest_sess = get_session(session_id) or session
+    resolved_remote_title = _resolve_next_session_title(
+        session=latest_sess,
+        user_prompt=prompt,
+        output_text=out_text,
+        explicit_agent_title=interaction_resp.get("_agent_session_title"),
+        turn_index=next_index,
+    )
 
     update_session(
         session_id,
-        title=new_title,
+        title=resolved_remote_title,
         mode=mode,
         execution_mode="remote",
         local_workdir=local_workdir,
@@ -1206,6 +1348,8 @@ async def api_poll_turn(
         if local_state:
             turn_index = existing_turn["turn_index"] if existing_turn else len(turns) + 1
             u_text = existing_turn.get("user_input_text", "") if existing_turn else ""
+            l_out = local_state.get("output_text", "")
+            l_status = local_state.get("status", "in_progress")
             upsert_turn(
                 session_id=session_id,
                 interaction_id=interaction_id,
@@ -1213,13 +1357,23 @@ async def api_poll_turn(
                 previous_interaction_id=local_state.get("previous_interaction_id", ""),
                 environment_id=local_state.get("environment_id", ""),
                 user_input_text=u_text,
-                output_text=local_state.get("output_text", ""),
-                status=local_state.get("status", "in_progress"),
+                output_text=l_out,
+                status=l_status,
                 steps=local_state.get("steps", []),
                 usage=local_state.get("usage", {}),
                 raw=local_state,
-                created_at=local_state.get("created"),
+                created_at=local_state.get("created") or (existing_turn.get("created_at") if existing_turn else None),
             )
+            if not session.get("title_locked_by_user") and (l_status != "in_progress" or local_state.get("_agent_session_title")):
+                polled_title = _resolve_next_session_title(
+                    session=session,
+                    user_prompt=u_text,
+                    output_text=l_out,
+                    explicit_agent_title=local_state.get("_agent_session_title"),
+                    turn_index=turn_index,
+                )
+                if polled_title and polled_title != session.get("title"):
+                    update_session(session_id, title=polled_title)
             return {
                 "session": get_session(session_id),
                 "latest_interaction": local_state,
@@ -1292,6 +1446,7 @@ async def api_poll_turn(
             background=True,
             sources=session.get("sources", []),
             uploaded_files=uploaded_files,
+            allow_agent_session_naming=not bool(session.get("title_locked_by_user")),
         )
         try:
             retry_resp = await create_interaction(
@@ -1321,7 +1476,7 @@ async def api_poll_turn(
                     steps=retry_resp.get("steps", []) or [],
                     usage=retry_resp.get("usage", {}) or {},
                     raw=retry_resp,
-                    created_at=retry_resp.get("created"),
+                    created_at=retry_resp.get("created") or (existing_turn.get("created_at") if existing_turn else None),
                 )
                 update_session(
                     session_id,
@@ -1354,15 +1509,39 @@ async def api_poll_turn(
         steps=interaction_resp.get("steps", []) or [],
         usage=interaction_resp.get("usage", {}) or {},
         raw=interaction_resp,
-        created_at=interaction_resp.get("created"),
+        created_at=interaction_resp.get("created") or interaction_resp.get("createTime") or (existing_turn.get("created_at") if existing_turn else None),
     )
 
+    polled_remote_title: Optional[str] = None
+    if not session.get("title_locked_by_user") and (turn_status != "in_progress" or interaction_resp.get("_agent_session_title")):
+        polled_remote_title = _resolve_next_session_title(
+            session=session,
+            user_prompt=u_text,
+            output_text=out_text,
+            explicit_agent_title=interaction_resp.get("_agent_session_title"),
+            turn_index=turn_index,
+        )
+
     if turn_status in ("failed", "cancelled"):
-        update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id="")
+        update_session(
+            session_id,
+            title=polled_remote_title,
+            environment_id=clean_environment_id(returned_env_id),
+            last_interaction_id="",
+        )
     elif returned_env_id:
-        update_session(session_id, environment_id=clean_environment_id(returned_env_id), last_interaction_id=interaction_id)
+        update_session(
+            session_id,
+            title=polled_remote_title,
+            environment_id=clean_environment_id(returned_env_id),
+            last_interaction_id=interaction_id,
+        )
     else:
-        update_session(session_id, last_interaction_id=interaction_id)
+        update_session(
+            session_id,
+            title=polled_remote_title,
+            last_interaction_id=interaction_id,
+        )
 
     if turn_status != "in_progress":
         asyncio.create_task(_bg_push_session_sync(session_id, api_key=api_key))

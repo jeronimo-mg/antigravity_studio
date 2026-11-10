@@ -94,6 +94,104 @@ if __name__ == "__main__":
             print(f"Erro em {p}: {e}")
 """
 
+    private val SESSION_TITLE_TAG_REGEX = Regex(
+        "<session_title>\\s*([^<\\r\\n]{2,90}?)\\s*</session_title>",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+    )
+
+    private const val SESSION_TITLE_PROMPT_NOTE =
+        "\n\n[NOTA DE TÍTULO DA SESSÃO]: Ao final da sua resposta, inclua em uma única linha a tag " +
+            "`<session_title>Título Curto e Descritivo do Tópico (3 a 7 palavras)</session_title>` " +
+            "criando ou atualizando o nome desta sessão conforme o progresso da conversa."
+
+    private val STOPWORDS_PT = setOf(
+        "o", "a", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das",
+        "em", "no", "na", "nos", "nas", "por", "para", "com", "sem", "que", "se", "ao",
+        "aos", "ou", "e", "eu", "voce", "você", "meu", "minha", "meus", "minhas", "seu",
+        "sua", "como", "qual", "quais", "quero", "gostaria", "preciso", "faca", "faça",
+        "fazer", "veja", "ver", "sobre", "isso", "isto", "esse", "essa", "este", "esta",
+        "vamos", "pode", "poderia", "seria", "agora", "entao", "então", "mais", "muito"
+    )
+
+    fun isDefaultSessionTitle(title: String?): Boolean {
+        val clean = (title ?: "").trim()
+        if (clean.isEmpty()) return true
+        val defaultTitles = setOf(
+            "Nova Conversa Antigravity",
+            "Nova Conversa",
+            "Conversa Antigravity",
+            "Sessão Local CLI"
+        )
+        return clean in defaultTitles || clean.startsWith("Continuação (") || clean.startsWith("Conversa (")
+    }
+
+    fun extractAndCleanSessionTitle(text: String?): Pair<String, String?> {
+        if (text.isNullOrBlank()) return (text ?: "") to null
+        val matches = SESSION_TITLE_TAG_REGEX.findAll(text).toList()
+        var extracted: String? = null
+        if (matches.isNotEmpty()) {
+            val rawCandidate = matches.last().groupValues[1].trim()
+                .trim('"', '\'', '`', '.', ':', '-', ' ')
+            if (rawCandidate.length >= 2) {
+                extracted = rawCandidate.take(64).trim()
+            }
+        }
+        val cleaned = SESSION_TITLE_TAG_REGEX.replace(text, "").trim()
+        return cleaned to extracted
+    }
+
+    fun synthesizeAgentSessionTitle(
+        userPrompt: String = "",
+        outputText: String = "",
+        currentTitle: String = ""
+    ): String {
+        val (_, tagFromOut) = extractAndCleanSessionTitle(outputText)
+        if (!tagFromOut.isNullOrBlank()) return tagFromOut
+
+        if (outputText.isNotBlank()) {
+            for (line in outputText.lines()) {
+                val s = line.trim()
+                if (s.startsWith("#")) {
+                    val heading = s.trimStart('#').trim().trim('*', '`', ':', '-', ' ')
+                    if (heading.length in 4..62 && !heading.lowercase().startsWith("turno")) {
+                        return heading
+                    }
+                }
+            }
+        }
+
+        val promptClean = (userPrompt.lines().firstOrNull { it.isNotBlank() } ?: "").trim()
+        if (promptClean.isNotBlank()) {
+            var cleaned = Regex("^(ol[aá]|oi|bom dia|boa tarde|boa noite)[,!.:\\s]*", RegexOption.IGNORE_CASE)
+                .replace(promptClean, "")
+            cleaned = Regex(
+                "^(por favor|gostaria que|quero que|preciso que|voce pode|você pode|vamos|veja| implemente|adicione|crie)\\s+",
+                RegexOption.IGNORE_CASE
+            ).replace(cleaned, "")
+            cleaned = cleaned.trim(' ', '-', ':', ',', '.', '?', '!')
+            val words = Regex("[A-Za-zÀ-ÿ0-9_./-]+").findAll(cleaned).map { it.value }.toList()
+            if (words.isNotEmpty()) {
+                val chosen = mutableListOf<String>()
+                for (w in words) {
+                    if (chosen.isEmpty() && w.lowercase() in STOPWORDS_PT && words.size > 3) continue
+                    chosen.add(w)
+                    if (chosen.size >= 7) break
+                }
+                if (chosen.isEmpty()) chosen.addAll(words.take(6))
+                var candidate = chosen.joinToString(" ").trim()
+                if (candidate.isNotEmpty()) {
+                    candidate = candidate.replaceFirstChar { it.uppercase() }
+                    return if (candidate.length > 60) "${candidate.take(57).trimEnd()}..." else candidate
+                }
+            }
+        }
+
+        if (currentTitle.isNotBlank() && !isDefaultSessionTitle(currentTitle)) {
+            return currentTitle
+        }
+        return "Sessão Antigravity"
+    }
+
     fun cleanEnvironmentId(environmentId: String?): String {
         val raw = (environmentId ?: "").trim()
         return if (raw.startsWith("environments/")) {
@@ -168,47 +266,76 @@ if __name__ == "__main__":
         if (userInputStr.contains(marker)) {
             userInputStr = userInputStr.substringBefore(marker).trim()
         }
+        val titleMarker = "[NOTA DE TÍTULO DA SESSÃO]:"
+        if (userInputStr.contains(titleMarker)) {
+            userInputStr = userInputStr.substringBefore(titleMarker).trim()
+        }
         val historyMarker = "[NOVA INSTRUÇÃO DO USUÁRIO]:\n"
         if (userInputStr.contains(historyMarker)) {
             userInputStr = userInputStr.substringAfter(historyMarker).trim()
         }
 
-        val outputStr = outputTexts.filter { it.isNotBlank() }.joinToString("\n\n").trim()
+        val rawOutputStr = outputTexts.filter { it.isNotBlank() }.joinToString("\n\n").trim()
+        val (outputStr, extractedTitle) = extractAndCleanSessionTitle(rawOutputStr)
+        if (!extractedTitle.isNullOrBlank()) {
+            data.put("_agent_session_title", extractedTitle)
+            if (steps != null) {
+                for (i in 0 until steps.length()) {
+                    val step = steps.optJSONObject(i) ?: continue
+                    if (step.optString("type") == "model_output") {
+                        val contents = step.optJSONArray("content") ?: continue
+                        for (j in 0 until contents.length()) {
+                            val c = contents.optJSONObject(j) ?: continue
+                            if (c.optString("type") == "text") {
+                                val (cleanStepTxt, _) = extractAndCleanSessionTitle(c.optString("text", ""))
+                                c.put("text", cleanStepTxt)
+                            }
+                        }
+                    }
+                }
+            }
+        }
         return userInputStr to outputStr
     }
 
     fun enrichAgentPromptForSandbox(
         prompt: String,
-        uploadedFiles: List<UploadedFileRecord> = emptyList()
+        uploadedFiles: List<UploadedFileRecord> = emptyList(),
+        allowAgentSessionNaming: Boolean = true
     ): String {
         if (prompt.trim().equals("continue", ignoreCase = true)) return prompt
 
         val docRegex = Regex("\\.(pdf|odt|odp|ods|docx|pptx|xlsx)\\b", RegexOption.IGNORE_CASE)
         val hasDocExt = docRegex.containsMatchIn(prompt)
         val hasUploads = uploadedFiles.isNotEmpty()
-        if (!hasDocExt && !hasUploads) return prompt
-
-        val notes = mutableListOf(
-            "\n\n---",
-            "[NOTA TÉCNICA DO AMBIENTE SANDBOX (ANTIGRAVITY STUDIO)]:"
-        )
-        if (hasUploads) {
-            val paths = uploadedFiles.mapNotNull { it.targetPath.takeIf { p -> p.isNotBlank() } }.distinct()
-            if (paths.isNotEmpty()) {
-                val formatted = paths.joinToString(", ") { "`$it`" }
-                notes.add("- Arquivos/pastas enviados via Environments API estão localizados em: $formatted (use `find_by_name` ou `execute_bash` com `ls -la` para listar os nomes exatos).")
-            }
-        }
-        notes.addAll(
-            listOf(
-                "- REGRA CRÍTICA (PREVENÇÃO DE ERRO HTTP 500 NA API): NUNCA use a ferramenta `view_file` diretamente em arquivos `.pdf`, `.odt`, `.odp`, `.ods`, `.docx`, `.pptx` ou `.xlsx`.",
-                "- COMO LER ESSES DOCUMENTOS COM SEGURANÇA:",
-                "  1. Verifique primeiro se já existem arquivos `.extracted.txt` gerados automaticamente ao lado dos documentos ou o script `_extract_docs_helper.py`.",
-                "  2. Caso precise extrair texto de `.odt` ou `.odp`, use `execute_bash` com `python3` lendo `content.xml` via `zipfile.ZipFile` e `xml.etree.ElementTree`.",
-                "  3. Caso precise extrair texto de `.pdf`, use `execute_bash` com `python3` (`pypdf` ou `pymupdf`) salvando o texto em `/tmp/*.txt`."
+        var enriched = prompt
+        if (hasDocExt || hasUploads) {
+            val notes = mutableListOf(
+                "\n\n---",
+                "[NOTA TÉCNICA DO AMBIENTE SANDBOX (ANTIGRAVITY STUDIO)]:"
             )
-        )
-        return prompt + notes.joinToString("\n")
+            if (hasUploads) {
+                val paths = uploadedFiles.mapNotNull { it.targetPath.takeIf { p -> p.isNotBlank() } }.distinct()
+                if (paths.isNotEmpty()) {
+                    val formatted = paths.joinToString(", ") { "`$it`" }
+                    notes.add("- Arquivos/pastas enviados via Environments API estão localizados em: $formatted (use `find_by_name` ou `execute_bash` com `ls -la` para listar os nomes exatos).")
+                }
+            }
+            notes.addAll(
+                listOf(
+                    "- REGRA CRÍTICA (PREVENÇÃO DE ERRO HTTP 500 NA API): NUNCA use a ferramenta `view_file` diretamente em arquivos `.pdf`, `.odt`, `.odp`, `.ods`, `.docx`, `.pptx` ou `.xlsx`.",
+                    "- COMO LER ESSES DOCUMENTOS COM SEGURANÇA:",
+                    "  1. Verifique primeiro se já existem arquivos `.extracted.txt` gerados automaticamente ao lado dos documentos ou o script `_extract_docs_helper.py`.",
+                    "  2. Caso precise extrair texto de `.odt` ou `.odp`, use `execute_bash` com `python3` lendo `content.xml` via `zipfile.ZipFile` e `xml.etree.ElementTree`.",
+                    "  3. Caso precise extrair texto de `.pdf`, use `execute_bash` com `python3` (`pypdf` ou `pymupdf`) salvando o texto em `/tmp/*.txt`."
+                )
+            )
+            enriched += notes.joinToString("\n")
+        }
+        if (allowAgentSessionNaming) {
+            enriched += SESSION_TITLE_PROMPT_NOTE
+        }
+        return enriched
     }
 
     fun buildCreatePayload(
@@ -222,12 +349,17 @@ if __name__ == "__main__":
         systemInstruction: String? = null,
         background: Boolean = false,
         sources: List<SourceItem> = emptyList(),
-        uploadedFiles: List<UploadedFileRecord> = emptyList()
+        uploadedFiles: List<UploadedFileRecord> = emptyList(),
+        allowAgentSessionNaming: Boolean = true
     ): JSONObject {
         val effectivePrompt = if (mode == "agent") {
-            enrichAgentPromptForSandbox(prompt, uploadedFiles)
+            enrichAgentPromptForSandbox(prompt, uploadedFiles, allowAgentSessionNaming)
         } else {
-            prompt
+            if (allowAgentSessionNaming && !prompt.trim().equals("continue", ignoreCase = true)) {
+                prompt + SESSION_TITLE_PROMPT_NOTE
+            } else {
+                prompt
+            }
         }
 
         val payload = JSONObject().apply {
@@ -1291,6 +1423,9 @@ if __name__ == "__main__":
         sb.appendLine("- **Modelo:** `${session.modelName}`")
         sb.appendLine("- **Environment ID:** `${session.environmentId.ifBlank { "remote (novo)" }}`")
         sb.appendLine("- **Último Interaction ID:** `${session.lastInteractionId.ifBlank { "N/A" }}`")
+        if (session.lastPromptAt.isNotBlank()) {
+            sb.appendLine("- **Data/Hora do Último Prompt:** `${session.lastPromptAt}`")
+        }
 
         if (session.uploadedFiles.isNotEmpty()) {
             sb.appendLine("- **Arquivos Enviados via Environments API:**")
@@ -1305,6 +1440,9 @@ if __name__ == "__main__":
         session.turns.forEachIndexed { idx, turn ->
             sb.appendLine("## Turno ${idx + 1}")
             sb.appendLine("- **Interaction ID:** `${turn.interactionId}`")
+            if (turn.createdAt.isNotBlank()) {
+                sb.appendLine("- **Data/Hora do Prompt:** `${turn.createdAt}`")
+            }
             if (turn.previousInteractionId.isNotBlank()) {
                 sb.appendLine("- **Previous Interaction ID:** `${turn.previousInteractionId}`")
             }
@@ -1430,6 +1568,7 @@ print(interaction.output_text)
     data class SyncedSessionMeta(
         val id: String,
         val title: String,
+        val titleLockedByUser: Boolean = false,
         val lastInteractionId: String,
         val environmentId: String,
         val mode: String,
@@ -1505,6 +1644,7 @@ print(interaction.output_text)
         val meta = JSONObject().apply {
             put("id", session.id.trim())
             put("t", session.title.trim().take(56).ifBlank { "Conversa Antigravity" })
+            put("tl", if (session.titleLockedByUser) 1 else 0)
             put("last", lastId)
             put("env", envId)
             put("m", session.mode.trim().ifBlank { "agent" })
@@ -1565,6 +1705,7 @@ print(interaction.output_text)
             SyncedSessionMeta(
                 id = sid,
                 title = obj.optString("t", "Conversa Antigravity").trim().ifBlank { "Conversa Antigravity" },
+                titleLockedByUser = obj.optInt("tl", 0) != 0,
                 lastInteractionId = obj.optString("last", "").trim(),
                 environmentId = envId,
                 mode = obj.optString("m", "agent").trim().ifBlank { "agent" },

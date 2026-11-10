@@ -108,8 +108,17 @@
           type="text"
           value="Nova Conversa Antigravity"
           class="bg-transparent hover:bg-studio-card focus:bg-studio-card focus:outline-none focus:ring-1 focus:ring-blue-400/50 text-sm font-medium text-white px-2 py-1 rounded transition truncate w-64"
-          title="Clique para editar o título da sessão"
+          title="Clique para editar o nome da sessão (ao alterar manualmente, o agente não modificará mais o nome)"
         />
+        <button
+          id="sessionTitleLockBtn"
+          type="button"
+          onclick="toggleSessionTitleLock()"
+          class="text-xs px-1.5 py-0.5 rounded bg-studio-card border border-studio-border text-gray-400 hover:text-white transition"
+          title="🤖 Nome gerenciado pelo agente (clique para travar/destravar)"
+        >
+          🤖
+        </button>
       </div>
 
       <!-- Status Pills: previous_interaction_id & environment_id -->

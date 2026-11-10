@@ -344,6 +344,29 @@ class StudioViewModel(
         }
     }
 
+    private fun resolveNextSessionTitle(
+        session: SessionModel,
+        userPrompt: String = "",
+        outputText: String = "",
+        agentProposedTitle: String? = null
+    ): String? {
+        if (session.titleLockedByUser) return null
+        val curTitle = session.title.trim()
+        val proposed = agentProposedTitle?.trim().orEmpty()
+        if (proposed.isNotEmpty() && proposed != curTitle) return proposed
+        if (InteractionsClient.isDefaultSessionTitle(curTitle) || outputText.trim().isNotEmpty()) {
+            val synthesized = InteractionsClient.synthesizeAgentSessionTitle(
+                userPrompt = userPrompt,
+                outputText = outputText,
+                currentTitle = curTitle
+            ).trim()
+            if (synthesized.isNotEmpty() && (InteractionsClient.isDefaultSessionTitle(curTitle) || !agentProposedTitle.isNullOrBlank())) {
+                if (synthesized != curTitle) return synthesized
+            }
+        }
+        return null
+    }
+
     private suspend fun populateChainIntoSession(
         sessionId: String,
         targetInteractionId: String,
@@ -371,25 +394,19 @@ class StudioViewModel(
                 .ifBlank { existing.environmentId }
         )
 
-        val (firstUserText, _) = InteractionsClient.extractTextsFromInteraction(chain.first())
-        val firstKnownLocal = repository.findTurnByInteractionId(chain.first().optString("id"))?.userInputText.orEmpty()
-        val effectiveFirstUser = firstUserText.ifBlank { firstKnownLocal }
-
-        val defaultTitles = setOf("Nova Conversa Antigravity", "Nova Conversa", "Conversa Antigravity")
-        val autoTitle = if (existing.title.isBlank() || existing.title in defaultTitles || existing.title.startsWith("Continuação (")) {
-            when {
-                effectiveFirstUser.length > 48 -> "${effectiveFirstUser.take(48)}..."
-                effectiveFirstUser.isNotBlank() -> effectiveFirstUser
-                else -> "Conversa (${cleanTarget.take(12)}...)"
-            }
-        } else {
-            existing.title
-        }
+        var latestAgentTitle: String? = null
+        var lastUserForTitle = ""
+        var lastOutForTitle = ""
 
         chain.forEachIndexed { idx, item ->
             val itemId = item.optString("id", "turn_${idx + 1}")
             val (uText, outText) = InteractionsClient.extractTextsFromInteraction(item)
+            val itemTitle = item.optString("_agent_session_title", "").trim()
+            if (itemTitle.isNotEmpty()) latestAgentTitle = itemTitle
             val knownLocalUser = repository.findTurnByInteractionId(itemId)?.userInputText.orEmpty()
+            val effUser = uText.ifBlank { knownLocalUser }
+            if (effUser.isNotBlank()) lastUserForTitle = effUser
+            if (outText.isNotBlank()) lastOutForTitle = outText
             val itemEnv = InteractionsClient.cleanEnvironmentId(
                 item.optString("environment_id").ifBlank { detectedEnv }
             )
@@ -399,7 +416,7 @@ class StudioViewModel(
                 turnIndex = idx + 1,
                 previousInteractionId = item.optString("previous_interaction_id", ""),
                 environmentId = itemEnv,
-                userInputText = uText.ifBlank { knownLocalUser },
+                userInputText = effUser,
                 outputText = outText,
                 status = item.optString("status", "completed"),
                 stepsJson = item.optJSONArray("steps")?.toString() ?: "[]",
@@ -408,6 +425,13 @@ class StudioViewModel(
                 createdAt = item.optString("created").takeIf { it.isNotBlank() }
             )
         }
+
+        val autoTitle = resolveNextSessionTitle(
+            session = existing,
+            userPrompt = lastUserForTitle,
+            outputText = lastOutForTitle,
+            agentProposedTitle = latestAgentTitle
+        ) ?: existing.title
 
         return repository.updateSession(
             sessionId = sessionId,
@@ -460,6 +484,7 @@ class StudioViewModel(
 
     fun updateActiveSessionSettings(
         title: String? = null,
+        titleLockedByUser: Boolean? = null,
         mode: String? = null,
         agentName: String? = null,
         modelName: String? = null,
@@ -470,10 +495,16 @@ class StudioViewModel(
         sources: List<SourceItem>? = null
     ) {
         val current = _uiState.value.activeSession ?: return
+        val effectiveLock = titleLockedByUser ?: if (!title.isNullOrBlank() && title.trim() != current.title.trim()) {
+            true
+        } else {
+            null
+        }
         viewModelScope.launch {
             var updated = repository.updateSession(
                 sessionId = current.id,
                 title = title,
+                titleLockedByUser = effectiveLock,
                 mode = mode,
                 agentName = agentName,
                 modelName = modelName,
@@ -572,6 +603,7 @@ class StudioViewModel(
         viewModelScope.launch {
             _uiState.update { it.copy(isSending = true, errorMessage = null) }
             try {
+                val promptSentAt = nowIso()
                 if (LocalAndroidAgent.isLocalEnvironment(session.environmentId)) {
                     val workdir = LocalAndroidAgent.extractWorkdirFromEnvId(
                         session.environmentId,
@@ -592,10 +624,12 @@ class StudioViewModel(
                     val turnStatus = resp.optString("status", "completed")
                     val nextIndex = session.turns.size + 1
 
-                    var newTitle = session.title
-                    if (nextIndex == 1 && newTitle in listOf("Nova Conversa Antigravity", "Nova Conversa")) {
-                        newTitle = if (prompt.length > 48) "${prompt.take(48)}..." else prompt
-                    }
+                    val newTitle = resolveNextSessionTitle(
+                        session = session,
+                        userPrompt = prompt,
+                        outputText = outText,
+                        agentProposedTitle = resp.optString("_agent_session_title").takeIf { it.isNotBlank() }
+                    ) ?: session.title
 
                     repository.upsertTurn(
                         sessionId = session.id,
@@ -608,7 +642,8 @@ class StudioViewModel(
                         status = turnStatus,
                         stepsJson = resp.optJSONArray("steps")?.toString() ?: "[]",
                         usageJson = resp.optJSONObject("usage")?.toString() ?: "{}",
-                        rawJson = resp.toString()
+                        rawJson = resp.toString(),
+                        createdAt = promptSentAt
                     )
 
                     val updatedSession = repository.updateSession(
@@ -728,7 +763,8 @@ class StudioViewModel(
                     systemInstruction = session.systemInstruction,
                     background = _uiState.value.backgroundMode,
                     sources = session.sources,
-                    uploadedFiles = uploadedFiles
+                    uploadedFiles = uploadedFiles,
+                    allowAgentSessionNaming = !session.titleLockedByUser
                 )
 
                 val resp = InteractionsClient.createInteraction(
@@ -751,10 +787,12 @@ class StudioViewModel(
                 val turnStatus = resp.optString("status", "completed")
                 val nextIndex = session.turns.size + 1
 
-                var newTitle = session.title
-                if (nextIndex == 1 && newTitle in listOf("Nova Conversa Antigravity", "Nova Conversa")) {
-                    newTitle = if (prompt.length > 48) "${prompt.take(48)}..." else prompt
-                }
+                val newTitle = resolveNextSessionTitle(
+                    session = session,
+                    userPrompt = prompt,
+                    outputText = outText,
+                    agentProposedTitle = resp.optString("_agent_session_title").takeIf { it.isNotBlank() }
+                ) ?: session.title
 
                 repository.upsertTurn(
                     sessionId = session.id,
@@ -768,7 +806,7 @@ class StudioViewModel(
                     stepsJson = resp.optJSONArray("steps")?.toString() ?: "[]",
                     usageJson = resp.optJSONObject("usage")?.toString() ?: "{}",
                     rawJson = resp.toString(),
-                    createdAt = resp.optString("created").takeIf { it.isNotBlank() }
+                    createdAt = resp.optString("created").takeIf { it.isNotBlank() } ?: promptSentAt
                 )
 
                 val nextLastId = if (turnStatus !in listOf("failed", "cancelled")) newInteractionId else ""
@@ -888,7 +926,8 @@ class StudioViewModel(
                     systemInstruction = session.systemInstruction,
                     background = true,
                     sources = session.sources,
-                    uploadedFiles = uploadedFiles
+                    uploadedFiles = uploadedFiles,
+                    allowAgentSessionNaming = !session.titleLockedByUser
                 )
                 val retryResp = InteractionsClient.createInteraction(
                     payload = retryPayload,
@@ -916,7 +955,7 @@ class StudioViewModel(
                     stepsJson = retryResp.optJSONArray("steps")?.toString() ?: "[]",
                     usageJson = retryResp.optJSONObject("usage")?.toString() ?: "{}",
                     rawJson = retryResp.toString(),
-                    createdAt = retryResp.optString("created").takeIf { it.isNotBlank() }
+                    createdAt = existingTurn?.createdAt ?: retryResp.optString("created").takeIf { it.isNotBlank() }
                 )
                 val updated = repository.updateSession(
                     sessionId = session.id,
@@ -948,7 +987,7 @@ class StudioViewModel(
             stepsJson = resp.optJSONArray("steps")?.toString() ?: existingTurn?.stepsJson ?: "[]",
             usageJson = resp.optJSONObject("usage")?.toString() ?: existingTurn?.usageJson ?: "{}",
             rawJson = resp.toString(),
-            createdAt = resp.optString("created").takeIf { it.isNotBlank() } ?: existingTurn?.createdAt
+            createdAt = existingTurn?.createdAt ?: resp.optString("created").takeIf { it.isNotBlank() }
         )
 
         val nextLastId = if (turnStatus in listOf("failed", "cancelled")) {
@@ -957,8 +996,16 @@ class StudioViewModel(
             interactionId
         }
 
+        val nextTitle = resolveNextSessionTitle(
+            session = session,
+            userPrompt = uText,
+            outputText = outText,
+            agentProposedTitle = resp.optString("_agent_session_title").takeIf { it.isNotBlank() }
+        )
+
         val updated = repository.updateSession(
             sessionId = session.id,
+            title = nextTitle,
             environmentId = returnedEnvId,
             lastInteractionId = nextLastId
         )
