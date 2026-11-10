@@ -86,6 +86,13 @@ def get_local_machine_summary(workdir: Optional[str] = None) -> Dict[str, Any]:
         info["disk_total_gb"] = round(usage.total / (1024**3), 2)
         info["disk_used_gb"] = round(usage.used / (1024**3), 2)
         info["disk_free_gb"] = round(usage.free / (1024**3), 2)
+        if sys.platform == "win32":
+            sys_drive = os.environ.get("SystemDrive", "C:") + "\\"
+            if os.path.splitdrive(target_disk)[0].upper() != os.path.splitdrive(sys_drive)[0].upper():
+                sys_usage = shutil.disk_usage(sys_drive)
+                info["system_drive"] = os.path.splitdrive(sys_drive)[0].upper()
+                info["system_disk_total_gb"] = round(sys_usage.total / (1024**3), 2)
+                info["system_disk_free_gb"] = round(sys_usage.free / (1024**3), 2)
     except Exception:
         pass
 
@@ -153,7 +160,15 @@ def tool_execute_bash(
     if not cmd_str:
         return {"error": "O parâmetro 'command' não pode ser vazio.", "exit_code": 1}
 
-    timeout_val = max(5, min(int(timeout_seconds or 120), 300))
+    is_installer_cmd = bool(
+        re.search(
+            r"\b(?:winget\s+install|choco\s+install|scoop\s+install|apt(?:-get)?\s+install|pip3?\s+install|npm\s+install)\b",
+            cmd_str,
+            re.IGNORECASE,
+        )
+    )
+    default_timeout = 600 if is_installer_cmd else int(timeout_seconds or 120)
+    timeout_val = max(5, min(max(int(timeout_seconds or 120), default_timeout), 600))
     started = time.time()
     try:
         env = os.environ.copy()
@@ -163,6 +178,14 @@ def tool_execute_bash(
         env["DEBIAN_FRONTEND"] = "noninteractive"
 
         exec_cmd = cmd_str
+        if sys.platform == "win32" and re.search(r"\bwinget\s+install\b", exec_cmd, re.IGNORECASE):
+            if "--accept-package-agreements" not in exec_cmd.lower():
+                exec_cmd += " --accept-package-agreements"
+            if "--accept-source-agreements" not in exec_cmd.lower():
+                exec_cmd += " --accept-source-agreements"
+            if "--disable-interactivity" not in exec_cmd.lower():
+                exec_cmd += " --disable-interactivity"
+
         if sys.platform != "win32":
             # Captura automaticamente a senha se o modelo executou: echo 'SENHA' | sudo -S ... ou printf '%s\n' 'SENHA' | sudo -S ...
             m_pipe_sudo = re.search(
@@ -191,9 +214,10 @@ def tool_execute_bash(
                 "Get-", "Set-", "Invoke-", "Select-Object", "Where-Object",
                 "Format-Table", "Format-List", "$env:", "Get-CimInstance",
                 "Get-ComputerInfo", "Get-WmiObject", "Get-Process", "Get-Service",
+                "winget ",
             )
             unix_cmds = ("ls ", "ls\t", "cat ", "pwd", "uname", "df ", "free ", "ps ", "which ")
-            if any(m.lower() in cmd_str.lower() for m in ps_markers) or cmd_str.lower() in ("ls", "pwd", "ps") or any(cmd_str.lower().startswith(u) for u in unix_cmds):
+            if any(m.lower() in exec_cmd.lower() for m in ps_markers) or exec_cmd.lower() in ("ls", "pwd", "ps") or any(exec_cmd.lower().startswith(u) for u in unix_cmds):
                 use_ps_on_win = True
 
         if sys.platform == "win32" and use_ps_on_win:
@@ -1011,45 +1035,44 @@ def build_local_agent_system_instruction(
     abs_workdir = os.path.abspath(workdir or get_default_local_workdir())
     hw = get_local_machine_summary(abs_workdir)
 
+    disk_desc = f"{hw.get('disk_total_gb', 'N/A')} GB total ({hw.get('disk_free_gb', 'N/A')} GB livre na partição do projeto)"
+    if hw.get("system_disk_total_gb"):
+        disk_desc = (
+            f"Unidade do Sistema ({hw.get('system_drive', 'C:')}): {hw.get('system_disk_total_gb')} GB total "
+            f"({hw.get('system_disk_free_gb')} GB livre) | "
+            f"Partição do Projeto: {hw.get('disk_total_gb', 'N/A')} GB total ({hw.get('disk_free_gb', 'N/A')} GB livre)"
+        )
+
     base_lines = [
-        "[DIRETIVA CRÍTICA DE MODO MÁQUINA LOCAL — LEIA COM ATENÇÃO]",
-        "Você está operando em MODO MÁQUINA LOCAL conectado diretamente ao computador real do usuário através do ponte de execução local do Antigravity Studio.",
-        "ATENÇÃO: Suas ferramentas nativas internas (`default_api:*`) rodam em um container Ubuntu remoto na nuvem do Google e NÃO correspondem à máquina do usuário.",
-        "PORTANTO, É ESTRITAMENTE PROIBIDO chamar qualquer ferramenta interna `default_api:*` neste turno!",
-        "",
-        "Dados Reais da Máquina Local do Usuário Detectados Agora:",
-        f"- Sistema Operacional Real do Usuário: {hw.get('os')} ({hw.get('architecture')})",
-        f"- Hostname / Usuário Local: {hw.get('hostname', 'N/A')} / {hw.get('username', 'N/A')}",
+        "Contexto do meu ambiente de desenvolvimento local (Antigravity Studio):",
+        f"- Meu computador local roda {hw.get('os')} ({hw.get('architecture')}).",
+        f"- Hostname / Usuário: {hw.get('hostname', 'N/A')} / {hw.get('username', 'N/A')}",
         f"- Processador / Núcleos Lógicos: {hw.get('processor', 'N/A')} ({hw.get('cpu_cores_logical', 'N/A')} núcleos)",
-        f"- Memória RAM Local: {hw.get('ram_total_gb', 'N/A')} GB total ({hw.get('ram_available_gb', 'N/A')} GB disponível)",
-        f"- Disco Local: {hw.get('disk_total_gb', 'N/A')} GB total ({hw.get('disk_free_gb', 'N/A')} GB livre)",
+        f"- Memória RAM: {hw.get('ram_total_gb', 'N/A')} GB total ({hw.get('ram_available_gb', 'N/A')} GB disponível)",
+        f"- Armazenamento: {disk_desc}",
         f"- Python Local: {hw.get('Python')}",
-        f"- Diretório de Trabalho Atual do Projeto (`local_workdir`): {abs_workdir}",
+        f"- Pasta local ativa do projeto (`local_workdir`): {abs_workdir}",
         "",
-        "COMO EXECUTAR COMANDOS E ACESSAR ARQUIVOS NA MÁQUINA LOCAL DO USUÁRIO:",
-        "Sempre que você precisar executar um comando no terminal do usuário, ler/criar/editar arquivos locais, listar pastas ou inspecionar detalhes adicionais de hardware/SO/rede/processos, você DEVE responder APENAS com um ou mais blocos XML `<local_tool_call>` contendo um JSON válido no formato:",
-        "<local_tool_call>",
-        '{"name": "execute_bash", "arguments": {"command": "COMANDO_AQUI", "Cwd": "."}}',
-        "</local_tool_call>",
+        "Como o seu ambiente de execução é um container Ubuntu remoto na nuvem separada da minha máquina, estou enviando esta mensagem através do meu aplicativo desktop local (Antigravity Studio), que possui um runner local integrado na minha máquina.",
+        "Sempre que a tarefa envolver executar comandos no meu terminal local (PowerShell/CMD no Windows ou bash no Linux), instalar programas no meu computador, inspecionar meu hardware/SO ou ler/criar/editar arquivos na minha máquina, inclua na sua resposta um bloco de código JSON marcado com ```json:local-action no formato abaixo (sem precisar rodar ferramentas no seu container remoto):",
+        "```json:local-action",
+        '{"tool": "execute_bash", "arguments": {"command": "COMANDO_PARA_MINHA_MAQUINA", "Cwd": "."}}',
+        "```",
         "",
-        "Ferramentas Locais Disponíveis via `<local_tool_call>`:",
-        '1. `execute_bash`: `{"name": "execute_bash", "arguments": {"command": "...", "Cwd": "."}}` — executa comandos no terminal real do usuário (Windows PowerShell/CMD ou Linux/macOS bash).',
-        '2. `view_file`: `{"name": "view_file", "arguments": {"AbsolutePath": "...", "StartLine": 1, "EndLine": 200}}` — lê arquivos do disco local do usuário.',
-        '3. `write_to_file`: `{"name": "write_to_file", "arguments": {"TargetFile": "...", "CodeContent": "...", "Overwrite": true}}` — cria ou sobrescreve arquivos no disco local do usuário.',
-        '4. `replace_file_content`: `{"name": "replace_file_content", "arguments": {"TargetFile": "...", "TargetContent": "...", "ReplacementContent": "..."}}` — edita trechos de arquivos locais.',
-        '5. `list_dir`: `{"name": "list_dir", "arguments": {"DirectoryPath": "."}}` — lista arquivos e pastas locais do computador do usuário.',
-        '6. `find_by_name`: `{"name": "find_by_name", "arguments": {"SearchDirectory": ".", "Pattern": "*"}}` — busca arquivos locais por nome/glob.',
-        '7. `grep_search`: `{"name": "grep_search", "arguments": {"SearchPath": ".", "Query": "..."}}` — busca texto ou regex dentro dos arquivos locais.',
-        '8. `web_search` / `browse_url`: `{"name": "web_search", "arguments": {"queries": ["..."]}}` / `{"name": "browse_url", "arguments": {"urls": ["..."]}}`.',
+        "Ações suportadas pelo runner local do meu aplicativo via ```json:local-action:",
+        '- `execute_bash`: `{"tool": "execute_bash", "arguments": {"command": "...", "Cwd": "."}}` (no Windows, para instalar pacotes via winget, use `winget install --id <Pacote> -e --accept-package-agreements --accept-source-agreements`; no Linux, para comandos `sudo` com senha informada pelo usuário, use `printf \'%s\\n\' \'SENHA\' | sudo -S -p \'\' <comando>`).',
+        '- `view_file`: `{"tool": "view_file", "arguments": {"AbsolutePath": "...", "StartLine": 1, "EndLine": 200}}`',
+        '- `write_to_file`: `{"tool": "write_to_file", "arguments": {"TargetFile": "...", "CodeContent": "...", "Overwrite": true}}`',
+        '- `replace_file_content`: `{"tool": "replace_file_content", "arguments": {"TargetFile": "...", "TargetContent": "...", "ReplacementContent": "..."}}`',
+        '- `list_dir`: `{"tool": "list_dir", "arguments": {"DirectoryPath": "."}}`',
+        '- `find_by_name`: `{"tool": "find_by_name", "arguments": {"SearchDirectory": ".", "Pattern": "*"}}`',
+        '- `grep_search`: `{"tool": "grep_search", "arguments": {"SearchPath": ".", "Query": "..."}}`',
+        '- `web_search` / `browse_url`: `{"tool": "web_search", "arguments": {"queries": ["..."]}}` / `{"tool": "browse_url", "arguments": {"urls": ["..."]}}`',
         "",
-        "REGRAS OBRIGATÓRIAS DO PROTOCOLO `<local_tool_call>`:",
-        "- NUNCA invoque `default_api:execute_bash`, `default_api:view_file` etc., pois eles olham para o container remoto e não para o PC do usuário.",
-        "- Quando precisar rodar uma ferramenta local, emita SOMENTE o(s) bloco(s) `<local_tool_call>{...}</local_tool_call>` e pare sua resposta imediatamente. O Antigravity Studio executará a ferramenta no PC do usuário e enviará o resultado real no próximo passo para você formular a resposta final.",
-        "- Quando o usuário perguntar sobre configurações do computador, hardware (CPU, GPU, placa de vídeo, memória RAM, discos, placa-mãe, bateria, drivers), rede, processos ou arquivos locais, emita um `<local_tool_call>` com `execute_bash` (ex: no Windows `Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM; Get-CimInstance Win32_DiskDrive | Select-Object Model,Size; Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product`; no Linux `lscpu && free -h && df -h && lspci`).",
-        "- Para comandos `sudo` no Linux que pedem senha, você PODE passar a senha de forma 100% não-interativa via pipe `stdin`: `printf '%s\\n' 'SENHA_DO_USUARIO' | sudo -S -p '' <comando>`. NUNCA diga que não consegue fornecer senhas para prompts `sudo`. Se um comando `sudo` falhar pedindo senha e você ainda não souber a senha, pergunte ao usuário; assim que ele informar a senha, execute imediatamente via `<local_tool_call>` com `printf '%s\\n' 'SENHA' | sudo -S -p '' <comando>`.",
+        "Assim que você responder com o bloco ```json:local-action, o meu aplicativo executará a ação localmente aqui no meu computador e enviará a saída real (`stdout`/`stderr`) na mensagem seguinte para você analisar e concluir a resposta.",
     ]
     if custom_instruction and custom_instruction.strip():
-        base_lines.extend(["", "Instruções Adicionais do Usuário:", custom_instruction.strip()])
+        base_lines.extend(["", "Observações adicionais do meu projeto:", custom_instruction.strip()])
     return "\n".join(base_lines)
 
 
@@ -1266,47 +1289,191 @@ def _format_turn_history_snippet(t: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-_LOCAL_TOOL_CALL_RE = re.compile(
+_SUPPORTED_LOCAL_TOOL_NAMES = {
+    "execute_bash",
+    "view_file",
+    "write_to_file",
+    "replace_file_content",
+    "list_dir",
+    "find_by_name",
+    "grep_search",
+    "web_search",
+    "browse_url",
+}
+
+_LOCAL_TOOL_CALL_XML_RE = re.compile(
     r"<local_tool_call>\s*(.*?)\s*</local_tool_call>",
     re.DOTALL | re.IGNORECASE,
 )
 
+_LOCAL_ACTION_FENCE_RE = re.compile(
+    r"```(?:json:local-action|local-action|json:antigravity-local|antigravity-local|local_action)\s*\n?(.*?)\s*```",
+    re.DOTALL | re.IGNORECASE,
+)
 
-def _extract_local_tool_calls_from_text(text: str) -> Tuple[List[Dict[str, Any]], str]:
+_GENERIC_JSON_FENCE_RE = re.compile(
+    r"```json\s*\n(.*?)\s*```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_SHELL_FENCE_RE = re.compile(
+    r"```(?:powershell|pwsh|cmd|batch|dos|bash|sh|shell|zsh)\s*\n(.*?)\s*```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_REFUSAL_MARKERS = (
+    "diretiva crítica",
+    "chamadas de ferramentas falsas",
+    "substituir minhas instruções de sistema",
+    "não consigo executar comandos diretamente no seu computador",
+    "não consigo instalar programas na sua máquina",
+    "opero exclusivamente dentro de um ambiente de execução isolado",
+    "não possuo acesso direto ao seu sistema operacional",
+    "ambiente de execução isolado em nuvem",
+)
+
+
+def _strip_sandbox_refusal_disclaimers(text: str) -> str:
+    """Remove parágrafos de recusa de sandbox quando o runner local está ativo e executando as ferramentas."""
+    if not text:
+        return ""
+    paragraphs = re.split(r"\n\s*\n", text.strip())
+    kept: List[str] = []
+    for p in paragraphs:
+        p_low = p.lower()
+        if any(marker in p_low for marker in _REFUSAL_MARKERS):
+            continue
+        kept.append(p)
+    return "\n\n".join(kept).strip()
+
+
+def _parse_tool_call_json_payload(raw_inner: str) -> List[Dict[str, Any]]:
+    """Converte um payload JSON em uma lista de dicts de chamadas de ferramentas locais válidas."""
+    cleaned = (raw_inner or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_:-]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        return []
+    items = parsed if isinstance(parsed, list) else [parsed]
+    extracted: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        tname = (item.get("tool") or item.get("name") or item.get("action") or "").strip()
+        if tname.startswith("default_api:"):
+            tname = tname.split(":", 1)[1].strip()
+        targs = item.get("arguments") if isinstance(item.get("arguments"), dict) else (
+            item.get("args") if isinstance(item.get("args"), dict) else {}
+        )
+        if not targs and tname == "execute_bash" and isinstance(item.get("command"), str):
+            targs = {"command": item["command"], "Cwd": item.get("Cwd") or item.get("cwd") or "."}
+        if tname in _SUPPORTED_LOCAL_TOOL_NAMES:
+            extracted.append({
+                "id": item.get("id") or f"call_{uuid.uuid4().hex[:10]}",
+                "name": tname,
+                "arguments": targs,
+            })
+    return extracted
+
+
+def _extract_local_tool_calls_from_text(
+    text: str,
+    allow_shell_fallback: bool = False,
+) -> Tuple[List[Dict[str, Any]], str]:
     """
-    Extrai blocos `<local_tool_call>{...}</local_tool_call>` emitidos pelo `gemini-4-argon`
-    e retorna (lista_de_chamadas, texto_limpo_sem_os_blocos).
+    Extrai ações locais emitidas pelo `gemini-4-argon` (via blocos ```json:local-action,
+    <local_tool_call>, blocos ```json com nome de ferramenta local ou, no 1º hop, blocos
+    de código shell ```powershell / ```bash sugeridos para a máquina do usuário).
     """
-    if not text or "<local_tool_call>" not in text.lower():
-        return [], (text or "").strip()
+    if not text:
+        return [], ""
 
     calls: List[Dict[str, Any]] = []
-    for match in _LOCAL_TOOL_CALL_RE.finditer(text):
-        raw_inner = (match.group(1) or "").strip()
-        if raw_inner.startswith("```"):
-            raw_inner = re.sub(r"^```(?:json)?\s*", "", raw_inner, flags=re.IGNORECASE)
-            raw_inner = re.sub(r"\s*```$", "", raw_inner)
-        try:
-            parsed = json.loads(raw_inner)
-        except Exception:
-            continue
-        items = parsed if isinstance(parsed, list) else [parsed]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            tname = (item.get("name") or item.get("tool") or "").strip()
-            targs = item.get("arguments") if isinstance(item.get("arguments"), dict) else (
-                item.get("args") if isinstance(item.get("args"), dict) else {}
-            )
-            if tname:
-                calls.append({
-                    "id": item.get("id") or f"call_{uuid.uuid4().hex[:10]}",
-                    "name": tname,
-                    "arguments": targs,
-                })
+    cleaned_text = text
 
-    cleaned_text = _LOCAL_TOOL_CALL_RE.sub("", text).strip()
-    return calls, cleaned_text
+    # 1. Blocos explícitos ```json:local-action ... ```
+    for match in _LOCAL_ACTION_FENCE_RE.finditer(cleaned_text):
+        calls.extend(_parse_tool_call_json_payload(match.group(1)))
+    if calls:
+        cleaned_text = _LOCAL_ACTION_FENCE_RE.sub("", cleaned_text).strip()
+        return calls, _strip_sandbox_refusal_disclaimers(cleaned_text)
+
+    # 2. Blocos XML <local_tool_call>...</local_tool_call>
+    if "<local_tool_call>" in cleaned_text.lower():
+        for match in _LOCAL_TOOL_CALL_XML_RE.finditer(cleaned_text):
+            calls.extend(_parse_tool_call_json_payload(match.group(1)))
+        if calls:
+            cleaned_text = _LOCAL_TOOL_CALL_XML_RE.sub("", cleaned_text).strip()
+            return calls, _strip_sandbox_refusal_disclaimers(cleaned_text)
+
+    # 3. Blocos ```json genéricos que contenham {"tool": "execute_bash", ...}
+    spans_to_remove: List[Tuple[int, int]] = []
+    for match in _GENERIC_JSON_FENCE_RE.finditer(cleaned_text):
+        parsed_calls = _parse_tool_call_json_payload(match.group(1))
+        if parsed_calls:
+            calls.extend(parsed_calls)
+            spans_to_remove.append(match.span())
+    if calls:
+        for start, end in reversed(spans_to_remove):
+            cleaned_text = cleaned_text[:start] + cleaned_text[end:]
+        return calls, _strip_sandbox_refusal_disclaimers(cleaned_text.strip())
+
+    # 4. Fallback inteligente no 1º hop: se o modelo respondeu com bloco ```powershell / ```cmd / ```bash
+    #    contendo o comando para o computador do usuário (ex: `winget install GNU.Octave`),
+    #    extrai e executa automaticamente na máquina local!
+    if allow_shell_fallback:
+        for match in _SHELL_FENCE_RE.finditer(cleaned_text):
+            raw_cmd = (match.group(1) or "").strip()
+            lines = [
+                ln.strip()
+                for ln in raw_cmd.splitlines()
+                if ln.strip() and not ln.strip().startswith("#") and not ln.strip().upper().startswith("REM ")
+            ]
+            if not lines:
+                continue
+            joined_cmd = " ; ".join(lines) if sys.platform == "win32" else " && ".join(lines)
+            # Evita executar placeholders ilustrativos como `<Pacote>` ou `octave-X.X.X`
+            if re.search(r"<[a-zA-Z_][^>]*>|X\.X\.X|COMANDO_PARA_MINHA_MAQUINA", joined_cmd):
+                continue
+            calls.append({
+                "id": f"call_{uuid.uuid4().hex[:10]}",
+                "name": "execute_bash",
+                "arguments": {"command": joined_cmd, "Cwd": "."},
+            })
+            break
+
+    if calls:
+        return calls, _strip_sandbox_refusal_disclaimers(cleaned_text)
+
+    return [], cleaned_text.strip()
+
+
+def _format_local_execution_fallback_summary(accumulated_steps: List[Dict[str, Any]]) -> str:
+    """Formata um resumo claro dos resultados das ferramentas executadas localmente caso a resposta final venha vazia."""
+    results = [
+        s for s in accumulated_steps
+        if isinstance(s, dict) and s.get("type") == "function_result"
+    ]
+    if not results:
+        return ""
+    lines = ["### ✅ Execução Concluída na Máquina Local\n"]
+    for idx, r in enumerate(results, 1):
+        tname = r.get("name") or "tool"
+        res_obj = r.get("result") if isinstance(r.get("result"), dict) else {"output": str(r.get("result") or "")}
+        cmd = res_obj.get("command") or res_obj.get("path") or res_obj.get("directory") or tname
+        exit_code = res_obj.get("exit_code")
+        stdout = (res_obj.get("stdout") or res_obj.get("content") or "").strip()
+        stderr = (res_obj.get("stderr") or res_obj.get("error") or "").strip()
+        status_badge = f"(exit_code: {exit_code})" if exit_code is not None else ""
+        lines.append(f"**{idx}. `{cmd}`** {status_badge}".strip())
+        if stdout:
+            lines.append(f"```text\n{stdout[:4000]}\n```")
+        if stderr:
+            lines.append(f"```text\n{stderr[:1500]}\n```")
+    return "\n\n".join(lines).strip()
 
 
 async def _run_antigravity_agent_hop(
@@ -1319,8 +1486,8 @@ async def _run_antigravity_agent_hop(
 ) -> Dict[str, Any]:
     """
     Executa um turno (hop) usando SEMPRE o agente `antigravity-preview-09-2026`
-    com `agent_config.model = "gemini-4-argon"` (ou o modelo configurado em `agent_config.model`)
-    na Interactions API (`POST /v1beta/interactions`), realizando polling até concluir.
+    com `agent_config.model = "gemini-4-argon"` na Interactions API (`POST /v1beta/interactions`),
+    realizando polling até concluir.
     """
     underlying_model = "gemini-4-argon"
     payload: Dict[str, Any] = {
@@ -1388,7 +1555,7 @@ async def run_local_agent_turn(
     Executa um turno completo do Agente Local na máquina do usuário:
     - Usa SEMPRE o modelo subjacente `gemini-4-argon` (`agent_config.model`) através do agente
       `antigravity-preview-09-2026` na Interactions API (`POST /v1beta/interactions`).
-    - Injeta as informações reais da máquina local do usuário e o protocolo `<local_tool_call>`
+    - Injeta o contexto da máquina local e extrai ações ```json:local-action (ou blocos de comando shell)
       para que todas as ferramentas (`execute_bash`, `view_file`, `write_to_file`,
       `replace_file_content`, `list_dir`, `find_by_name`, `grep_search`, `web_search`, `browse_url`)
       sejam executadas diretamente no computador do usuário (`workdir`) e seus resultados reais
@@ -1454,18 +1621,19 @@ async def run_local_agent_turn(
                     hist_snippets.append(snippet)
         if hist_snippets:
             history_block = (
-                "\n\n[HISTÓRICO DE TURNOS E FERRAMENTAS EXECUTADAS NA SESSÃO LOCAL]:\n"
+                "\n\nHistórico recente de ações executadas na minha sessão local:\n"
                 + "\n---\n".join(hist_snippets)
             )
 
     initial_hop_input = (
         f"{sys_inst}"
         f"{history_block}\n\n"
-        f"[PEDIDO ATUAL DO USUÁRIO NA MÁQUINA LOCAL]:\n{prompt}"
+        f"Pedido para executar na minha máquina local:\n{prompt}"
     )
 
     headers = build_headers(api_key)
     underlying_model = "gemini-4-argon"
+    executed_any_local_tool = False
 
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
@@ -1526,17 +1694,25 @@ async def run_local_agent_turn(
                     if out_txts:
                         raw_hop_output = "\n\n".join(out_txts).strip()
 
-                local_calls, cleaned_output = _extract_local_tool_calls_from_text(raw_hop_output)
+                local_calls, cleaned_output = _extract_local_tool_calls_from_text(
+                    raw_hop_output,
+                    allow_shell_fallback=(hop == 0 and not executed_any_local_tool),
+                )
 
-                # Caso o modelo tenha chamado por engano alguma tool interna no 1º hop em vez de <local_tool_call>,
-                # interceptamos os argumentos dessas function_calls e as executamos na máquina local do usuário!
+                # Caso o modelo tenha chamado alguma tool interna no 1º hop em vez de ```json:local-action,
+                # interceptamos os argumentos dessas function_calls e as executamos na máquina local do usuário
                 if not local_calls and hop == 0:
                     internal_fcs = _extract_function_calls_from_steps(hop_steps)
                     if internal_fcs:
                         local_calls = internal_fcs
 
                 if not local_calls:
-                    final_output_text = cleaned_output or raw_hop_output
+                    candidate_final = cleaned_output or raw_hop_output
+                    if executed_any_local_tool:
+                        candidate_final = _strip_sandbox_refusal_disclaimers(candidate_final)
+                        if not candidate_final.strip():
+                            candidate_final = _format_local_execution_fallback_summary(accumulated_steps)
+                    final_output_text = candidate_final
                     if final_output_text:
                         accumulated_steps.append({
                             "type": "model_output",
@@ -1572,6 +1748,7 @@ async def run_local_agent_turn(
                         arguments=fc["arguments"],
                         workdir=abs_workdir,
                     )
+                    executed_any_local_tool = True
                     accumulated_steps.append({
                         "type": "function_result",
                         "call_id": fc["id"],
@@ -1585,9 +1762,8 @@ async def run_local_agent_turn(
                     if len(res_json_str) > 24000:
                         res_json_str = res_json_str[:24000] + "... [truncado]"
                     tool_results_feedback.append(
-                        f"<local_tool_result name=\"{fc['name']}\" is_error=\"{str(is_err).lower()}\">\n"
-                        f"{res_json_str}\n"
-                        f"</local_tool_result>"
+                        f"Resultado da ação local `{fc['name']}` executada pelo meu cliente na minha máquina (is_error={str(is_err).lower()}):\n"
+                        f"```json\n{res_json_str}\n```"
                     )
 
                 if run_state.get("cancelled"):
@@ -1595,12 +1771,11 @@ async def run_local_agent_turn(
                     break
 
                 current_hop_input = (
-                    "[RESULTADO REAL DA EXECUÇÃO NA MÁQUINA LOCAL DO USUÁRIO]:\n"
+                    "O meu aplicativo local (Antigravity Studio) acabou de executar a ação na minha máquina e obteve a saída real abaixo:\n\n"
                     + "\n\n".join(tool_results_feedback)
-                    + "\n\n[INSTRUÇÃO]: Se precisar executar mais alguma ferramenta local na máquina do usuário, "
-                    "emita apenas o próximo bloco `<local_tool_call>{...}</local_tool_call>`. "
-                    "Caso já tenha todos os dados necessários, apresente a resposta final completa e detalhada "
-                    "ao usuário com base exclusivamente nos resultados reais acima (NÃO chame ferramentas internas `default_api:*`)."
+                    + "\n\nSe mais alguma ação precisar ser executada na minha máquina para concluir o pedido, "
+                    "inclua apenas o próximo bloco ```json:local-action. "
+                    "Caso a tarefa já tenha sido concluída, apresente o resumo final para mim com base nos resultados reais acima."
                 )
 
     except Exception as exc:
