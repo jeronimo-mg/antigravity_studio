@@ -1,6 +1,7 @@
 package com.antigravity.studio.data.local
 
 import android.content.Context
+import android.database.sqlite.SQLiteBlobTooBigException
 import androidx.room.ColumnInfo
 import androidx.room.Dao
 import androidx.room.Database
@@ -81,6 +82,21 @@ data class SettingEntity(
     val value: String
 )
 
+data class TurnMetadataProjection(
+    @ColumnInfo(name = "interaction_id") val interactionId: String,
+    @ColumnInfo(name = "session_id") val sessionId: String,
+    @ColumnInfo(name = "turn_index") val turnIndex: Int,
+    @ColumnInfo(name = "previous_interaction_id") val previousInteractionId: String,
+    @ColumnInfo(name = "environment_id") val environmentId: String,
+    val status: String,
+    @ColumnInfo(name = "usage_json") val usageJson: String,
+    @ColumnInfo(name = "created_at") val createdAt: String,
+    @ColumnInfo(name = "user_input_len") val userInputLen: Int,
+    @ColumnInfo(name = "output_len") val outputLen: Int,
+    @ColumnInfo(name = "steps_len") val stepsLen: Int,
+    @ColumnInfo(name = "raw_len") val rawLen: Int
+)
+
 @Dao
 interface StudioDao {
     @Query("SELECT value FROM settings WHERE `key` = :key LIMIT 1")
@@ -103,6 +119,64 @@ interface StudioDao {
 
     @Query("SELECT * FROM turns WHERE session_id = :sessionId ORDER BY turn_index ASC")
     suspend fun getTurnsForSession(sessionId: String): List<TurnEntity>
+
+    @Query(
+        """
+        SELECT interaction_id, session_id, turn_index, previous_interaction_id,
+               environment_id, status, usage_json, created_at,
+               LENGTH(user_input_text) AS user_input_len,
+               LENGTH(output_text) AS output_len,
+               LENGTH(steps_json) AS steps_len,
+               LENGTH(raw_json) AS raw_len
+        FROM turns
+        WHERE session_id = :sessionId
+        ORDER BY turn_index ASC
+        """
+    )
+    suspend fun getTurnMetadataForSession(sessionId: String): List<TurnMetadataProjection>
+
+    @Query(
+        """
+        SELECT interaction_id, session_id, turn_index, previous_interaction_id,
+               environment_id, status, usage_json, created_at,
+               LENGTH(user_input_text) AS user_input_len,
+               LENGTH(output_text) AS output_len,
+               LENGTH(steps_json) AS steps_len,
+               LENGTH(raw_json) AS raw_len
+        FROM turns
+        WHERE session_id = :sessionId AND interaction_id = :interactionId
+        LIMIT 1
+        """
+    )
+    suspend fun getTurnMetadataByKey(sessionId: String, interactionId: String): TurnMetadataProjection?
+
+    @Query("SELECT SUBSTR(user_input_text, :start, :length) FROM turns WHERE session_id = :sessionId AND interaction_id = :interactionId LIMIT 1")
+    suspend fun getTurnUserInputChunk(sessionId: String, interactionId: String, start: Int, length: Int): String?
+
+    @Query("SELECT SUBSTR(output_text, :start, :length) FROM turns WHERE session_id = :sessionId AND interaction_id = :interactionId LIMIT 1")
+    suspend fun getTurnOutputChunk(sessionId: String, interactionId: String, start: Int, length: Int): String?
+
+    @Query("SELECT SUBSTR(steps_json, :start, :length) FROM turns WHERE session_id = :sessionId AND interaction_id = :interactionId LIMIT 1")
+    suspend fun getTurnStepsChunk(sessionId: String, interactionId: String, start: Int, length: Int): String?
+
+    @Query("SELECT SUBSTR(raw_json, :start, :length) FROM turns WHERE session_id = :sessionId AND interaction_id = :interactionId LIMIT 1")
+    suspend fun getTurnRawChunk(sessionId: String, interactionId: String, start: Int, length: Int): String?
+
+    @Query("SELECT created_at FROM turns WHERE session_id = :sessionId AND interaction_id = :interactionId LIMIT 1")
+    suspend fun getTurnCreatedAt(sessionId: String, interactionId: String): String?
+
+    @Query("SELECT LENGTH(user_input_text) FROM turns WHERE session_id = :sessionId AND interaction_id = :interactionId LIMIT 1")
+    suspend fun getTurnUserInputLength(sessionId: String, interactionId: String): Int?
+
+    @Query(
+        """
+        SELECT session_id FROM turns
+        WHERE interaction_id = :interactionId
+        ORDER BY CASE WHEN LENGTH(user_input_text) > 0 THEN 0 ELSE 1 END, created_at DESC
+        LIMIT 1
+        """
+    )
+    suspend fun findAnySessionIdForInteractionId(interactionId: String): String?
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertSession(session: SessionEntity)
@@ -200,7 +274,7 @@ class StudioRepository(private val dao: StudioDao) {
 
     suspend fun getSession(sessionId: String): SessionModel? {
         val entity = dao.getSessionRaw(sessionId) ?: return null
-        val turnEntities = dao.getTurnsForSession(sessionId)
+        val turnEntities = getTurnsForSessionSafe(sessionId)
         val turns = turnEntities.map { it.toDomain() }
         val lastPrompt = turns.maxOfOrNull { it.createdAt }.orEmpty()
         return entity.toDomain(turns = turns, turnCount = turns.size, lastPromptAt = lastPrompt)
@@ -329,7 +403,14 @@ class StudioRepository(private val dao: StudioDao) {
     suspend fun findTurnByInteractionId(interactionId: String): TurnModel? {
         val clean = interactionId.trim()
         if (clean.isBlank()) return null
-        return dao.findAnyTurnByInteractionId(clean)?.toDomain()
+        return try {
+            dao.findAnyTurnByInteractionId(clean)?.toDomain()
+        } catch (e: Exception) {
+            if (!isBlobTooBigException(e)) throw e
+            val sid = dao.findAnySessionIdForInteractionId(clean) ?: return null
+            val meta = dao.getTurnMetadataByKey(sid, clean) ?: return null
+            loadTurnFromMetadata(meta).toDomain()
+        }
     }
 
     suspend fun upsertTurn(
@@ -346,11 +427,22 @@ class StudioRepository(private val dao: StudioDao) {
         rawJson: String,
         createdAt: String? = null
     ) {
-        val existing = dao.getTurnRaw(sessionId, interactionId)
+        val existingCreatedAt = dao.getTurnCreatedAt(sessionId, interactionId)
         val finalUserText = when {
             userInputText.isNotBlank() -> userInputText
-            !existing?.userInputText.isNullOrBlank() -> existing!!.userInputText
-            else -> dao.findAnyTurnByInteractionId(interactionId)?.userInputText ?: ""
+            else -> {
+                val ownText = readTurnUserInputSafe(sessionId, interactionId)
+                if (ownText.isNotBlank()) {
+                    ownText
+                } else {
+                    val otherSessionId = dao.findAnySessionIdForInteractionId(interactionId)
+                    if (!otherSessionId.isNullOrBlank()) {
+                        readTurnUserInputSafe(otherSessionId, interactionId)
+                    } else {
+                        ""
+                    }
+                }
+            }
         }
         val entity = TurnEntity(
             interactionId = interactionId,
@@ -363,10 +455,113 @@ class StudioRepository(private val dao: StudioDao) {
             status = status.ifBlank { "completed" },
             stepsJson = stepsJson.ifBlank { "[]" },
             usageJson = usageJson.ifBlank { "{}" },
-            rawJson = rawJson.ifBlank { "{}" },
-            createdAt = createdAt ?: existing?.createdAt ?: nowIso()
+            rawJson = compactRawJsonForStorage(rawJson),
+            createdAt = createdAt ?: existingCreatedAt ?: nowIso()
         )
         dao.insertTurn(entity)
+    }
+
+    private suspend fun getTurnsForSessionSafe(sessionId: String): List<TurnEntity> {
+        return try {
+            dao.getTurnsForSession(sessionId)
+        } catch (e: Exception) {
+            if (!isBlobTooBigException(e)) throw e
+            dao.getTurnMetadataForSession(sessionId).map { meta ->
+                loadTurnFromMetadata(meta)
+            }
+        }
+    }
+
+    private suspend fun loadTurnFromMetadata(meta: TurnMetadataProjection): TurnEntity {
+        val userInput = readChunkedText(meta.userInputLen) { start, len ->
+            dao.getTurnUserInputChunk(meta.sessionId, meta.interactionId, start, len)
+        }
+        val output = readChunkedText(meta.outputLen) { start, len ->
+            dao.getTurnOutputChunk(meta.sessionId, meta.interactionId, start, len)
+        }
+        val steps = readChunkedText(meta.stepsLen) { start, len ->
+            dao.getTurnStepsChunk(meta.sessionId, meta.interactionId, start, len)
+        }.ifBlank { "[]" }
+        val raw = if (meta.rawLen in 1..MAX_STORED_RAW_JSON_CHARS) {
+            readChunkedText(meta.rawLen) { start, len ->
+                dao.getTurnRawChunk(meta.sessionId, meta.interactionId, start, len)
+            }.ifBlank { "{}" }
+        } else {
+            "{}"
+        }
+        return TurnEntity(
+            interactionId = meta.interactionId,
+            sessionId = meta.sessionId,
+            turnIndex = meta.turnIndex,
+            previousInteractionId = meta.previousInteractionId,
+            environmentId = meta.environmentId,
+            userInputText = userInput,
+            outputText = output,
+            status = meta.status,
+            stepsJson = steps,
+            usageJson = meta.usageJson,
+            rawJson = raw,
+            createdAt = meta.createdAt
+        )
+    }
+
+    private suspend fun readTurnUserInputSafe(sessionId: String, interactionId: String): String {
+        val len = dao.getTurnUserInputLength(sessionId, interactionId) ?: 0
+        if (len <= 0) return ""
+        return readChunkedText(len) { start, chunkLen ->
+            dao.getTurnUserInputChunk(sessionId, interactionId, start, chunkLen)
+        }
+    }
+
+    private suspend fun readChunkedText(
+        totalLength: Int,
+        chunkSize: Int = CURSOR_TEXT_CHUNK_CHARS,
+        fetchChunk: suspend (start: Int, length: Int) -> String?
+    ): String {
+        if (totalLength <= 0) return ""
+        if (totalLength <= chunkSize) {
+            return fetchChunk(1, totalLength) ?: ""
+        }
+        val sb = StringBuilder(totalLength)
+        var offset = 1
+        while (offset <= totalLength) {
+            val part = fetchChunk(offset, chunkSize) ?: break
+            if (part.isEmpty()) break
+            sb.append(part)
+            if (part.length < chunkSize) break
+            offset += part.length
+        }
+        return sb.toString()
+    }
+
+    private fun compactRawJsonForStorage(rawJson: String): String {
+        val trimmed = rawJson.ifBlank { "{}" }
+        return if (trimmed.length <= MAX_STORED_RAW_JSON_CHARS) {
+            trimmed
+        } else {
+            """{"truncated":true,"original_length":${trimmed.length}}"""
+        }
+    }
+
+    private fun isBlobTooBigException(t: Throwable?): Boolean {
+        var cur = t
+        while (cur != null) {
+            if (cur is SQLiteBlobTooBigException) return true
+            val msg = cur.message.orEmpty()
+            if (msg.contains("SQLiteBlobTooBigException", ignoreCase = true) ||
+                msg.contains("Row too big to fit into CursorWindow", ignoreCase = true) ||
+                msg.contains("CursorWindow", ignoreCase = true)
+            ) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    companion object {
+        private const val CURSOR_TEXT_CHUNK_CHARS = 250_000
+        private const val MAX_STORED_RAW_JSON_CHARS = 200_000
     }
 
     suspend fun forkSession(
