@@ -21,7 +21,9 @@ from .interactions_client import (
     create_interaction,
     extract_texts_from_interaction,
     get_interaction,
+    is_default_session_title,
     resolve_api_key,
+    synthesize_agent_session_title,
 )
 from .local_agent import (
     ANTIGRAVITY_SUPPORTED_TOOLS_METADATA,
@@ -168,6 +170,15 @@ async def execute_cli_prompt(
         )
         new_id = res.get("id", f"local_{next_index}")
         env_label = f"local:{workdir}"
+        out_text = res.get("output_text", "")
+        new_title = None
+        if not session.get("title_locked_by_user"):
+            proposed = (res.get("_agent_session_title") or "").strip()
+            if proposed:
+                new_title = proposed
+            elif is_default_session_title(session.get("title")):
+                new_title = synthesize_agent_session_title(prompt, out_text, session.get("title", ""))
+
         upsert_turn(
             session_id=session["id"],
             interaction_id=new_id,
@@ -175,7 +186,7 @@ async def execute_cli_prompt(
             previous_interaction_id=prev_id,
             environment_id=env_label,
             user_input_text=prompt,
-            output_text=res.get("output_text", ""),
+            output_text=out_text,
             status=res.get("status", "completed"),
             steps=res.get("steps", []),
             usage=res.get("usage", {}),
@@ -184,26 +195,55 @@ async def execute_cli_prompt(
         )
         update_session(
             session["id"],
+            title=new_title,
             execution_mode="local",
             local_workdir=workdir,
-            last_interaction_id=new_id if res.get("status") == "completed" else prev_id,
+            last_interaction_id=new_id if res.get("status") in ("completed", "incomplete") else prev_id,
             environment_id=env_label,
         )
         return res
     else:
         print(f"{Colors.DIM}⏳ Enviando para o Sandbox Remoto (Google Antigravity)...{Colors.RESET}", flush=True)
+        remote_prev_id = prev_id.strip()
+        if remote_prev_id.startswith("local_"):
+            remote_prev_id = ""
+
+        raw_env = (session.get("environment_id") or "").strip()
+        remote_env = "" if raw_env.startswith("local:") else raw_env
+
+        history_lines: List[str] = []
+        for t in turns[-6:]:
+            if t.get("status") in ("completed", "incomplete"):
+                u_txt = (t.get("user_input_text") or "").strip()
+                o_txt = (t.get("output_text") or "").strip()
+                if u_txt or o_txt:
+                    history_lines.append(f"Usuário: {u_txt[:600]}\nAgente: {o_txt[:1200]}")
+        fallback_history = "\n---\n".join(history_lines) if history_lines else None
+
+        effective_prompt = prompt
+        if not remote_prev_id and fallback_history:
+            effective_prompt = (
+                f"[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n{fallback_history}\n\n"
+                f"[NOVA INSTRUÇÃO DO USUÁRIO]:\n{prompt}"
+            )
+
         payload = build_create_payload(
-            prompt=prompt,
+            prompt=effective_prompt,
             mode="agent",
             agent_name=agent_name,
             model_name=model_name,
-            previous_interaction_id=prev_id,
-            environment_id=session.get("environment_id", ""),
+            previous_interaction_id=remote_prev_id or None,
+            environment_id=remote_env,
             background=True,
             sources=session.get("sources", []),
             uploaded_files=session.get("uploaded_files", []),
+            allow_agent_session_naming=not session.get("title_locked_by_user"),
         )
-        interaction_resp = await create_interaction(payload, api_key=api_key)
+        interaction_resp = await create_interaction(
+            payload,
+            api_key=api_key,
+            fallback_history_text=fallback_history,
+        )
         inter_id = interaction_resp.get("id", "")
         status = interaction_resp.get("status", "in_progress")
         printed_count = 0
@@ -220,12 +260,23 @@ async def execute_cli_prompt(
                     print(line, flush=True)
 
         _, out_text = extract_texts_from_interaction(interaction_resp, fallback_user_input=prompt)
-        ret_env = clean_environment_id(interaction_resp.get("environment_id") or session.get("environment_id", ""))
+        ret_env = clean_environment_id(interaction_resp.get("environment_id") or remote_env)
+        if ret_env.startswith("local:"):
+            ret_env = ""
+
+        new_title = None
+        if not session.get("title_locked_by_user"):
+            proposed = (interaction_resp.get("_agent_session_title") or "").strip()
+            if proposed:
+                new_title = proposed
+            elif is_default_session_title(session.get("title")):
+                new_title = synthesize_agent_session_title(prompt, out_text, session.get("title", ""))
+
         upsert_turn(
             session_id=session["id"],
             interaction_id=inter_id,
             turn_index=next_index,
-            previous_interaction_id=prev_id,
+            previous_interaction_id=remote_prev_id,
             environment_id=ret_env,
             user_input_text=prompt,
             output_text=out_text,
@@ -237,9 +288,10 @@ async def execute_cli_prompt(
         )
         update_session(
             session["id"],
+            title=new_title,
             execution_mode="remote",
             environment_id=ret_env,
-            last_interaction_id=inter_id if status == "completed" else prev_id,
+            last_interaction_id=inter_id if status in ("completed", "incomplete") else remote_prev_id,
         )
         interaction_resp["output_text"] = out_text
         return interaction_resp
@@ -273,7 +325,7 @@ def run_cli_main(argv: Optional[List[str]] = None) -> int:
     if args.api_key:
         set_setting("gemini_api_key", args.api_key.strip())
 
-    workdir = resolve_local_path(".", args.workdir)
+    workdir = resolve_local_path(args.workdir, get_default_local_workdir())
     os.makedirs(workdir, exist_ok=True)
     execution_mode = args.mode
     model_name = args.model
@@ -373,7 +425,14 @@ def run_cli_main(argv: Optional[List[str]] = None) -> int:
 
         if user_in.lower() == "/remote":
             execution_mode = "remote"
-            update_session(session["id"], execution_mode="remote", environment_id="")
+            cur_sess = get_session(session["id"]) or {}
+            cur_last = (cur_sess.get("last_interaction_id") or "").strip()
+            update_session(
+                session["id"],
+                execution_mode="remote",
+                environment_id="",
+                last_interaction_id="" if cur_last.startswith("local_") else None,
+            )
             print(f"✅ Alternado para {Colors.MAGENTA}Modo: Sandbox Remoto (Google){Colors.RESET}")
             continue
 

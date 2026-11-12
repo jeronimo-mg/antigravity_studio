@@ -209,7 +209,7 @@ function renderSessionsSidebar() {
         : `<span class="text-[10px] text-blue-300/70 shrink-0" title="Nome criado e atualizado automaticamente pelo agente">🤖</span>`;
       return `
         <div
-          onclick="selectSession('${s.id}')"
+          onclick="selectSession(${escapeJsAttr(s.id)})"
           class="group flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer transition text-xs ${
             isSelected
               ? "bg-blue-600/20 border border-blue-500/40 text-white"
@@ -233,14 +233,14 @@ function renderSessionsSidebar() {
           </div>
           <div class="flex items-center gap-0.5 shrink-0">
             <button
-              onclick="event.stopPropagation(); renameSessionById('${s.id}')"
+              onclick="event.stopPropagation(); renameSessionById(${escapeJsAttr(s.id)})"
               class="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-blue-300 px-1 transition"
               title="Renomear sessão (trava o nome para o agente não alterar)"
             >
               ✏️
             </button>
             <button
-              onclick="event.stopPropagation(); removeSession('${s.id}')"
+              onclick="event.stopPropagation(); removeSession(${escapeJsAttr(s.id)})"
               class="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 px-1 transition"
               title="Excluir sessão"
             >
@@ -891,7 +891,7 @@ function renderSingleTurnCard(turn, turnNumber) {
     (currentSession && currentSession.execution_mode === "local");
 
   const renderedOutput = turn.output_text
-    ? marked.parse(turn.output_text)
+    ? sanitizeMarkdownHtml(marked.parse(turn.output_text))
     : status === "in_progress"
     ? `<div class="text-amber-300 text-xs flex items-center gap-2">⏳ ${
         isLocalTurn
@@ -908,7 +908,7 @@ function renderSingleTurnCard(turn, turnNumber) {
           ⚠️ <strong>Interação pausada (status: incomplete)</strong> — O limite de <code>max_total_tokens</code> ou passos foi atingido. O estado e o ambiente estão preservados.
         </div>
         <button
-          onclick="continueIncompleteTurn('${turn.interaction_id}', '${turn.environment_id || ""}')"
+          onclick="continueIncompleteTurn(${escapeJsAttr(turn.interaction_id)}, ${escapeJsAttr(turn.environment_id || "")})"
           class="px-3 py-1.5 rounded-lg bg-orange-500 hover:bg-orange-400 text-gray-950 font-semibold shrink-0 ml-3"
         >
           ▶️ Continuar de onde parou
@@ -926,13 +926,13 @@ function renderSingleTurnCard(turn, turnNumber) {
         </div>
         <div class="flex items-center gap-2">
           <button
-            onclick="pollTurnOnce('${currentSession.id}', '${turn.interaction_id}')"
+            onclick="pollTurnOnce(${escapeJsAttr(currentSession.id)}, ${escapeJsAttr(turn.interaction_id)})"
             class="px-2.5 py-1 rounded bg-studio-card hover:bg-gray-700 text-gray-200 border border-studio-border"
           >
             ↻ Atualizar agora
           </button>
           <button
-            onclick="cancelRunningTurn('${currentSession.id}', '${turn.interaction_id}', this)"
+            onclick="cancelRunningTurn(${escapeJsAttr(currentSession.id)}, ${escapeJsAttr(turn.interaction_id)}, this)"
             class="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 font-medium transition"
           >
             ⏹ Cancelar
@@ -958,7 +958,7 @@ function renderSingleTurnCard(turn, turnNumber) {
           }
           <span class="text-gray-400 font-mono" title="ID desta interação">
             id: <code class="text-blue-300">${escapeHtml(turn.interaction_id)}</code>
-            <button onclick="navigator.clipboard.writeText('${turn.interaction_id}')" class="hover:text-white ml-0.5" title="Copiar ID">📋</button>
+            <button onclick="navigator.clipboard.writeText(${escapeJsAttr(turn.interaction_id)})" class="hover:text-white ml-0.5" title="Copiar ID">📋</button>
           </span>
           ${
             turn.previous_interaction_id
@@ -983,14 +983,14 @@ function renderSingleTurnCard(turn, turnNumber) {
               : ""
           }
           <button
-            onclick="useTurnAsPreviousId('${turn.interaction_id}', '${turn.environment_id || ""}')"
+            onclick="useTurnAsPreviousId(${escapeJsAttr(turn.interaction_id)}, ${escapeJsAttr(turn.environment_id || "")})"
             class="px-2 py-0.5 rounded bg-studio-bg hover:bg-gray-800 text-blue-300 border border-studio-border transition"
             title="Definir este turno como o previous_interaction_id ativo"
           >
             🎯 Apontar ID aqui
           </button>
           <button
-            onclick="forkFromTurn('${turn.interaction_id}')"
+            onclick="forkFromTurn(${escapeJsAttr(turn.interaction_id)})"
             class="px-2 py-0.5 rounded bg-studio-bg hover:bg-gray-800 text-emerald-300 border border-studio-border transition"
             title="Criar uma nova sessão ramificando a conversa a partir deste turno"
           >
@@ -1540,6 +1540,51 @@ function escapeHtml(str) {
     .replace(/'/g, "&#039;");
 }
 
+function escapeJsAttr(val) {
+  return escapeHtml(JSON.stringify(val === undefined || val === null ? "" : val));
+}
+
+function sanitizeMarkdownHtml(rawHtml) {
+  if (!rawHtml) return "";
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(String(rawHtml), "text/html");
+    const blockedTags = [
+      "script", "iframe", "object", "embed", "form", "input", "button",
+      "textarea", "select", "style", "link", "meta", "base", "svg", "math",
+    ];
+    doc.querySelectorAll(blockedTags.join(",")).forEach((el) => el.remove());
+
+    const allNodes = doc.body.querySelectorAll("*");
+    allNodes.forEach((el) => {
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase();
+        const val = (attr.value || "").replace(/[\u0000-\u0020]+/g, "").toLowerCase();
+        if (name.startsWith("on") || name === "srcdoc" || name === "formaction" || name === "style") {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        if (
+          (name === "href" || name === "src" || name === "xlink:href" || name === "action") &&
+          (val.startsWith("javascript:") || val.startsWith("vbscript:") || val.startsWith("data:text/html"))
+        ) {
+          el.removeAttribute(attr.name);
+        }
+      }
+      if (el.tagName.toLowerCase() === "a") {
+        el.setAttribute("rel", "noopener noreferrer");
+        const href = el.getAttribute("href") || "";
+        if (/^https?:\/\//i.test(href)) {
+          el.setAttribute("target", "_blank");
+        }
+      }
+    });
+    return doc.body.innerHTML;
+  } catch (_) {
+    return escapeHtml(rawHtml);
+  }
+}
+
 // GERENCIAMENTO DE SOURCES (REPOSITÓRIOS GITHUB / GCS / INLINE)
 function renderSourcesList() {
   const container = document.getElementById("sourcesList");
@@ -1783,7 +1828,7 @@ function renderUploadedFilesList() {
           </div>
           <div class="flex items-center gap-1 shrink-0">
             <button
-              onclick='downloadSpecificEnvFile(${JSON.stringify(targetPath)}, this)'
+              onclick="downloadSpecificEnvFile(${escapeJsAttr(targetPath)}, this)"
               class="text-blue-300 hover:text-white bg-blue-500/15 hover:bg-blue-500/30 border border-blue-500/30 px-1.5 py-0.5 rounded text-[10px] transition"
               title="Baixar este arquivo/pasta do ambiente"
             >
@@ -2469,13 +2514,13 @@ async function refreshEnvFilesList() {
         <div class="space-y-1.5">
       `;
       for (const entry of entries) {
-        const safePathJson = JSON.stringify(entry.fullPath);
+        const safePathAttr = escapeJsAttr(entry.fullPath);
         if (entry.isDir) {
           html += `
             <div data-filepath="${escapeHtml(entry.fullPath)}" class="env-file-row flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-studio-card hover:bg-gray-800/80 border border-studio-border text-xs font-mono transition">
               <button
                 type="button"
-                onclick='navigateEnvFolder(${safePathJson})'
+                onclick="navigateEnvFolder(${safePathAttr})"
                 class="flex items-center gap-2 text-left text-amber-200 hover:text-amber-100 truncate min-w-0 flex-1"
                 title="Clique para abrir esta pasta"
               >
@@ -2485,7 +2530,7 @@ async function refreshEnvFilesList() {
               <div class="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
-                  onclick='navigateEnvFolder(${safePathJson})'
+                  onclick="navigateEnvFolder(${safePathAttr})"
                   class="px-2 py-1 rounded bg-purple-600/20 hover:bg-purple-600/35 text-purple-200 border border-purple-500/30 text-[10px]"
                   title="Abrir pasta"
                 >
@@ -2493,7 +2538,7 @@ async function refreshEnvFilesList() {
                 </button>
                 <button
                   type="button"
-                  onclick='downloadSpecificEnvFile(${safePathJson}, this)'
+                  onclick="downloadSpecificEnvFile(${safePathAttr}, this)"
                   class="px-2 py-1 rounded bg-blue-600/20 hover:bg-blue-600/35 text-blue-200 border border-blue-500/30 text-[10px]"
                   title="Baixar pasta como .tar.gz"
                 >
@@ -2513,7 +2558,7 @@ async function refreshEnvFilesList() {
               <div class="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
-                  onclick='copyEnvFilePath(${safePathJson}, this)'
+                  onclick="copyEnvFilePath(${safePathAttr}, this)"
                   class="px-2 py-1 rounded bg-studio-bg hover:bg-gray-700 text-gray-300 border border-studio-border text-[10px]"
                   title="Copiar caminho completo do arquivo"
                 >
@@ -2521,7 +2566,7 @@ async function refreshEnvFilesList() {
                 </button>
                 <button
                   type="button"
-                  onclick='downloadSpecificEnvFile(${safePathJson}, this)'
+                  onclick="downloadSpecificEnvFile(${safePathAttr}, this)"
                   class="px-2.5 py-1 rounded bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 font-semibold text-[10px] transition"
                   title="Baixar este arquivo"
                 >
@@ -2554,7 +2599,7 @@ async function refreshEnvFilesList() {
                 <span>• ${escapeHtml(u.target_path)} (${formatBytesSize(u.size_bytes || 0)})</span>
                 <button
                   type="button"
-                  onclick='downloadSpecificEnvFile(${JSON.stringify(u.target_path)}, this)'
+                  onclick="downloadSpecificEnvFile(${escapeJsAttr(u.target_path)}, this)"
                   class="px-2 py-0.5 rounded bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 text-[10px]"
                 >
                   ⬇️ Baixar

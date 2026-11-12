@@ -1887,18 +1887,33 @@ def encode_session_sync_display_name(session: Dict[str, Any]) -> str:
     import json as _json
 
     last_id = (session.get("last_interaction_id") or "").strip()
+    if last_id.startswith("local_"):
+        resolved_v1 = ""
+        for t in reversed(session.get("turns") or []):
+            if t.get("interaction_id") == last_id:
+                cand_v1 = str(((t.get("raw") or {}).get("_api_interaction_id")) or "").strip()
+                if cand_v1.startswith("v1_"):
+                    resolved_v1 = cand_v1
+                break
+        last_id = resolved_v1
     if not last_id and session.get("turns"):
         for t in reversed(session["turns"]):
             if t.get("status") not in ("failed", "cancelled") and t.get("interaction_id"):
-                last_id = str(t["interaction_id"]).strip()
-                break
+                tid = str(t["interaction_id"]).strip()
+                if tid.startswith("v1_"):
+                    last_id = tid
+                    break
 
     env_id = clean_environment_id(session.get("environment_id") or "")
+    if env_id.startswith("local:"):
+        env_id = ""
     turn_count = _compute_session_turn_count(session)
     raw_uploads = session.get("uploaded_files") or []
     upload_paths: List[str] = []
     for uf in raw_uploads:
         if isinstance(uf, dict):
+            if uf.get("upload_mode") == "local_disk" or str(uf.get("environment_id") or "").startswith("local:"):
+                continue
             tp = str(uf.get("target_path") or "").strip()
             if tp and tp not in upload_paths:
                 upload_paths.append(tp)
@@ -1949,6 +1964,11 @@ def decode_session_sync_display_name(display_name: str) -> Optional[Dict[str, An
         if not isinstance(data, dict) or not data.get("id"):
             return None
         env_id = clean_environment_id(str(data.get("env") or ""))
+        if env_id.startswith("local:"):
+            env_id = ""
+        last_id = str(data.get("last") or "").strip()
+        if last_id.startswith("local_"):
+            last_id = ""
         raw_up = data.get("up")
         uploaded_files: List[Dict[str, Any]] = []
         if isinstance(raw_up, list):
@@ -1972,7 +1992,7 @@ def decode_session_sync_display_name(display_name: str) -> Optional[Dict[str, An
             "id": str(data.get("id") or "").strip(),
             "title": str(data.get("t") or "Conversa Antigravity").strip(),
             "title_locked_by_user": bool(data.get("tl")),
-            "last_interaction_id": str(data.get("last") or "").strip(),
+            "last_interaction_id": last_id,
             "environment_id": env_id,
             "mode": str(data.get("m") or "agent").strip(),
             "agent_name": str(data.get("ag") or "antigravity-preview-09-2026").strip(),

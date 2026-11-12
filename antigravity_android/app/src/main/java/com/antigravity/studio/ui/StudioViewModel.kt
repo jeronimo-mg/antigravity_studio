@@ -587,7 +587,11 @@ class StudioViewModel(
         } else {
             if (LocalAndroidAgent.isLocalEnvironment(current.environmentId)) "" else current.environmentId
         }
-        updateActiveSessionSettings(environmentId = newEnvId)
+        val clearedLastId = if (!useLocal && current.lastInteractionId.trim().startsWith("local_")) "" else null
+        updateActiveSessionSettings(
+            environmentId = newEnvId,
+            lastInteractionId = clearedLastId
+        )
     }
 
     fun sendMessage(promptText: String) {
@@ -708,7 +712,7 @@ class StudioViewModel(
                 }
 
                 val prevId = if (isManualFork) customPrev else session.lastInteractionId.trim()
-                if (prevId.isNotBlank() && session.turns.isEmpty()) {
+                if (prevId.isNotBlank() && !prevId.startsWith("local_") && session.turns.isEmpty()) {
                     try {
                         val loaded = populateChainIntoSession(session.id, prevId, apiKey)
                         if (loaded != null) {
@@ -717,7 +721,7 @@ class StudioViewModel(
                     } catch (_: Exception) {
                     }
                 }
-                val envId = session.environmentId
+                val envId = if (LocalAndroidAgent.isLocalEnvironment(session.environmentId)) "" else session.environmentId
                 val uploadedFiles = session.uploadedFiles.ifEmpty {
                     repository.findUploadedFilesForEnvironment(envId)
                 }
@@ -733,11 +737,17 @@ class StudioViewModel(
                 val fallbackHistory = historyLines.takeIf { it.isNotEmpty() }?.joinToString("\n---\n")
 
                 // Se algum turno anterior apontando para prevId (ou o último turno da sessão)
-                // falhou ou foi cancelado, inicia uma nova cadeia limpa mantendo environmentId e histórico
+                // falhou/foi cancelado, ou se prevId for um pseudo-ID local_, inicia cadeia limpa mantendo histórico
                 var effectivePrevForRequest = prevId.trim()
                 var effectivePrompt = prompt
                 var proactivelyDroppedPrev = false
-                if (effectivePrevForRequest.isNotEmpty() && session.turns.isNotEmpty()) {
+                if (effectivePrevForRequest.startsWith("local_")) {
+                    effectivePrevForRequest = ""
+                    proactivelyDroppedPrev = true
+                    if (!fallbackHistory.isNullOrBlank()) {
+                        effectivePrompt = "[HISTÓRICO RESUMIDO DA SESSÃO ANTERIOR]:\n$fallbackHistory\n\n[NOVA INSTRUÇÃO DO USUÁRIO]:\n$prompt"
+                    }
+                } else if (effectivePrevForRequest.isNotEmpty() && session.turns.isNotEmpty()) {
                     val chainPoisoned = session.turns.any { t ->
                         t.status in listOf("failed", "cancelled") &&
                             (t.previousInteractionId.trim() == effectivePrevForRequest ||
@@ -1245,6 +1255,68 @@ class StudioViewModel(
         }
     }
 
+    private fun resolveSafeLocalTarget(baseDir: File, relOrTargetPath: String): File {
+        val baseCanon = baseDir.canonicalFile
+        var rel = relOrTargetPath.trim().replace("\\", "/")
+        when {
+            rel == "/workspace" || rel == "workspace" || rel == "/" || rel == "." -> rel = ""
+            rel.startsWith("/workspace/") -> rel = rel.removePrefix("/workspace/")
+            rel.startsWith("workspace/") -> rel = rel.removePrefix("workspace/")
+            else -> rel = rel.trimStart('/')
+        }
+        val candidate = if (rel.isEmpty()) baseCanon else File(baseCanon, rel).canonicalFile
+        val basePrefix = baseCanon.path.trimEnd(File.separatorChar) + File.separator
+        if (candidate.path != baseCanon.path && !candidate.path.startsWith(basePrefix)) {
+            throw IllegalArgumentException("Caminho relativo inválido fora do diretório local permitido.")
+        }
+        return candidate
+    }
+
+    private fun writeFilesLocally(
+        baseDir: File,
+        targetPath: String,
+        filesPairs: List<Pair<String, ByteArray>>,
+        overwrite: Boolean
+    ): Pair<String, Long> {
+        val targetRoot = resolveSafeLocalTarget(baseDir, targetPath)
+        var totalWritten = 0L
+        if (filesPairs.size == 1 && targetPath.trimEnd('/') !in listOf("", "/", ".", "/workspace", "workspace") && !targetRoot.isDirectory) {
+            val (singleName, singleBytes) = filesPairs.first()
+            if (!overwrite && targetRoot.exists()) {
+                throw IllegalStateException("O arquivo '${targetRoot.name}' já existe e overwrite=false.")
+            }
+            targetRoot.parentFile?.mkdirs()
+            targetRoot.writeBytes(singleBytes)
+            totalWritten += singleBytes.size
+            val extracted = InteractionsClient.extractTextFromDocumentBytes(singleName, singleBytes)
+            if (!extracted.isNullOrBlank()) {
+                File(targetRoot.parentFile, "${targetRoot.name}.extracted.txt").writeText(extracted, Charsets.UTF_8)
+            }
+            return targetRoot.absolutePath to totalWritten
+        }
+
+        targetRoot.mkdirs()
+        for ((relName, bytes) in filesPairs) {
+            val dest = resolveSafeLocalTarget(targetRoot, relName)
+            if (!overwrite && dest.exists()) {
+                throw IllegalStateException("O arquivo '${dest.name}' já existe e overwrite=false.")
+            }
+            dest.parentFile?.mkdirs()
+            dest.writeBytes(bytes)
+            totalWritten += bytes.size
+            val extracted = InteractionsClient.extractTextFromDocumentBytes(dest.name, bytes)
+            if (!extracted.isNullOrBlank()) {
+                File(dest.parentFile, "${dest.name}.extracted.txt").writeText(extracted, Charsets.UTF_8)
+            }
+        }
+        val savedTarget = if (filesPairs.size == 1) {
+            resolveSafeLocalTarget(targetRoot, filesPairs.first().first).absolutePath
+        } else {
+            targetRoot.absolutePath
+        }
+        return savedTarget to totalWritten
+    }
+
     fun uploadUrisToEnvironment(
         context: Context,
         uris: List<Uri>,
@@ -1261,16 +1333,6 @@ class StudioViewModel(
         viewModelScope.launch {
             _uiState.update { it.copy(isUploading = true, errorMessage = null) }
             try {
-                var envId = InteractionsClient.cleanEnvironmentId(session.environmentId)
-                if (envId.isBlank() || envId == "remote") {
-                    val envResp = InteractionsClient.createRemoteEnvironment(
-                        sources = session.sources,
-                        apiKey = apiKey
-                    )
-                    envId = InteractionsClient.cleanEnvironmentId(envResp.optString("id"))
-                    repository.updateSession(session.id, environmentId = envId)
-                }
-
                 val filesPairs = mutableListOf<Pair<String, ByteArray>>()
                 for (uri in uris) {
                     val name = resolveFileName(context, uri)
@@ -1280,6 +1342,63 @@ class StudioViewModel(
                 }
                 if (filesPairs.isEmpty()) {
                     throw IllegalStateException("Não foi possível ler os arquivos selecionados.")
+                }
+
+                if (LocalAndroidAgent.isLocalEnvironment(session.environmentId)) {
+                    val workdir = LocalAndroidAgent.extractWorkdirFromEnvId(
+                        session.environmentId,
+                        LocalAndroidAgent.getDefaultAndroidWorkdir()
+                    )
+                    val baseDir = File(workdir).apply { mkdirs() }
+                    val localEnvId = "local:${baseDir.absolutePath}"
+                    val (savedPath, totalBytes) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        writeFilesLocally(baseDir, targetPath, filesPairs, overwrite)
+                    }
+                    val summaryLabel = if (filesPairs.size > 1) {
+                        "Pacote (${filesPairs.size} arquivo(s))"
+                    } else {
+                        filesPairs.first().first
+                    }
+                    val record = UploadedFileRecord(
+                        label = summaryLabel,
+                        summary = summaryLabel,
+                        targetPath = savedPath,
+                        sizeBytes = totalBytes,
+                        mimeType = "application/octet-stream",
+                        extract = false,
+                        overwrite = overwrite,
+                        resumable = false,
+                        uploadMode = "local_disk",
+                        fileCount = filesPairs.size,
+                        environmentId = localEnvId,
+                        uploadedAt = nowIso()
+                    )
+                    val currentUploads = session.uploadedFiles.toMutableList().apply { add(record) }
+                    val updated = repository.updateSession(
+                        sessionId = session.id,
+                        environmentId = localEnvId,
+                        uploadedFiles = currentUploads
+                    )
+                    _uiState.update {
+                        it.copy(
+                            isUploading = false,
+                            sessions = repository.listSessions(),
+                            activeSession = updated,
+                            statusMessage = "Salvo localmente em $savedPath!"
+                        )
+                    }
+                    loadEnvironmentFiles(path = "")
+                    return@launch
+                }
+
+                var envId = InteractionsClient.cleanEnvironmentId(session.environmentId)
+                if (envId.isBlank() || envId == "remote") {
+                    val envResp = InteractionsClient.createRemoteEnvironment(
+                        sources = session.sources,
+                        apiKey = apiKey
+                    )
+                    envId = InteractionsClient.cleanEnvironmentId(envResp.optString("id"))
+                    repository.updateSession(session.id, environmentId = envId)
                 }
 
                 val shouldPack = packAsTarGz || filesPairs.size > 1
@@ -1355,7 +1474,7 @@ class StudioViewModel(
                 _uiState.update {
                     it.copy(
                         isUploading = false,
-                        errorMessage = e.message ?: "Erro ao enviar arquivos para o sandbox."
+                        errorMessage = e.message ?: "Erro ao enviar arquivos para o ambiente."
                     )
                 }
             }
@@ -1384,6 +1503,51 @@ class StudioViewModel(
                     throw IllegalStateException("A pasta selecionada está vazia.")
                 }
 
+                val folderName = rootDoc.name ?: "pasta"
+                val label = "Pasta '$folderName' (${filesPairs.size} arquivos)"
+
+                if (LocalAndroidAgent.isLocalEnvironment(session.environmentId)) {
+                    val workdir = LocalAndroidAgent.extractWorkdirFromEnvId(
+                        session.environmentId,
+                        LocalAndroidAgent.getDefaultAndroidWorkdir()
+                    )
+                    val baseDir = File(workdir).apply { mkdirs() }
+                    val localEnvId = "local:${baseDir.absolutePath}"
+                    val (savedPath, totalBytes) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        writeFilesLocally(baseDir, targetPath, filesPairs, overwrite)
+                    }
+                    val record = UploadedFileRecord(
+                        label = label,
+                        summary = label,
+                        targetPath = savedPath,
+                        sizeBytes = totalBytes,
+                        mimeType = "inode/directory",
+                        extract = true,
+                        overwrite = overwrite,
+                        resumable = false,
+                        uploadMode = "local_disk",
+                        fileCount = filesPairs.size,
+                        environmentId = localEnvId,
+                        uploadedAt = nowIso()
+                    )
+                    val currentUploads = session.uploadedFiles.toMutableList().apply { add(record) }
+                    val updated = repository.updateSession(
+                        sessionId = session.id,
+                        environmentId = localEnvId,
+                        uploadedFiles = currentUploads
+                    )
+                    _uiState.update {
+                        it.copy(
+                            isUploading = false,
+                            sessions = repository.listSessions(),
+                            activeSession = updated,
+                            statusMessage = "Pasta '$folderName' copiada em $savedPath!"
+                        )
+                    }
+                    loadEnvironmentFiles(path = "")
+                    return@launch
+                }
+
                 var envId = InteractionsClient.cleanEnvironmentId(session.environmentId)
                 if (envId.isBlank() || envId == "remote") {
                     val envResp = InteractionsClient.createRemoteEnvironment(
@@ -1406,8 +1570,6 @@ class StudioViewModel(
                     apiKey = apiKey
                 )
 
-                val folderName = rootDoc.name ?: "pasta"
-                val label = "Pasta '$folderName' (${filesPairs.size} arquivos)"
                 val record = UploadedFileRecord(
                     label = label,
                     summary = label,
@@ -1473,6 +1635,56 @@ class StudioViewModel(
 
     fun loadEnvironmentFiles(path: String = "workspace") {
         val session = _uiState.value.activeSession ?: return
+        if (LocalAndroidAgent.isLocalEnvironment(session.environmentId)) {
+            val workdir = LocalAndroidAgent.extractWorkdirFromEnvId(
+                session.environmentId,
+                LocalAndroidAgent.getDefaultAndroidWorkdir()
+            )
+            viewModelScope.launch {
+                _uiState.update { it.copy(isListingFiles = true, errorMessage = null) }
+                try {
+                    val (resolvedPath, entries) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        val baseDir = File(workdir).apply { mkdirs() }.canonicalFile
+                        val targetDir = resolveSafeLocalTarget(baseDir, path)
+                        val list = mutableListOf<EnvFileEntry>()
+                        if (targetDir.exists()) {
+                            targetDir.walkTopDown()
+                                .maxDepth(6)
+                                .filter { it != targetDir }
+                                .take(500)
+                                .forEach { f ->
+                                    val rel = f.relativeTo(baseDir).invariantSeparatorsPath
+                                    list.add(
+                                        EnvFileEntry(
+                                            name = f.name,
+                                            path = rel,
+                                            sizeBytes = if (f.isFile) f.length() else 0L,
+                                            type = if (f.isDirectory) "directory" else "file"
+                                        )
+                                    )
+                                }
+                        }
+                        targetDir.absolutePath to list
+                    }
+                    _uiState.update {
+                        it.copy(
+                            isListingFiles = false,
+                            envCurrentPath = resolvedPath,
+                            envFiles = entries
+                        )
+                    }
+                } catch (e: Exception) {
+                    _uiState.update {
+                        it.copy(
+                            isListingFiles = false,
+                            errorMessage = e.message ?: "Erro ao listar arquivos locais."
+                        )
+                    }
+                }
+            }
+            return
+        }
+
         val envId = InteractionsClient.cleanEnvironmentId(session.environmentId)
         val apiKey = _uiState.value.apiKey
         if (envId.isBlank() || envId == "remote") {
@@ -1515,9 +1727,10 @@ class StudioViewModel(
         path: String? = null
     ) {
         val session = _uiState.value.activeSession ?: return
+        val isLocal = LocalAndroidAgent.isLocalEnvironment(session.environmentId)
         val envId = InteractionsClient.cleanEnvironmentId(session.environmentId)
         val apiKey = _uiState.value.apiKey
-        if (envId.isBlank() || envId == "remote") {
+        if (!isLocal && (envId.isBlank() || envId == "remote")) {
             showError("Nenhum environment_id ativo para download.")
             return
         }
@@ -1525,14 +1738,50 @@ class StudioViewModel(
         viewModelScope.launch {
             _uiState.update { it.copy(isDownloadingSnapshot = true, errorMessage = null) }
             try {
-                val knownPaths = session.uploadedFiles.map { it.targetPath } +
-                    session.sources.map { it.target }
-                val resource = InteractionsClient.downloadEnvironmentSnapshot(
-                    environmentId = envId,
-                    path = path,
-                    knownPaths = knownPaths,
-                    apiKey = apiKey
-                )
+                val resource = if (isLocal) {
+                    val workdir = LocalAndroidAgent.extractWorkdirFromEnvId(
+                        session.environmentId,
+                        LocalAndroidAgent.getDefaultAndroidWorkdir()
+                    )
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        val baseDir = File(workdir).apply { mkdirs() }.canonicalFile
+                        val target = resolveSafeLocalTarget(baseDir, path.orEmpty())
+                        if (!target.exists()) {
+                            throw IllegalArgumentException("Caminho local não encontrado: ${path.orEmpty()}")
+                        }
+                        if (target.isFile) {
+                            com.antigravity.studio.data.remote.DownloadedResource(
+                                bytes = target.readBytes(),
+                                fileName = target.name,
+                                mimeType = "application/octet-stream"
+                            )
+                        } else {
+                            val pairs = target.walkTopDown()
+                                .filter { it.isFile }
+                                .map { f -> f.relativeTo(target).invariantSeparatorsPath to f.readBytes() }
+                                .toList()
+                            if (pairs.isEmpty()) {
+                                throw IllegalStateException("Nenhum arquivo encontrado na pasta local para compactar.")
+                            }
+                            val tarGz = InteractionsClient.packFilesAsTarGz(pairs)
+                            val slug = target.name.ifBlank { "workspace" }
+                            com.antigravity.studio.data.remote.DownloadedResource(
+                                bytes = tarGz,
+                                fileName = "local_snapshot_$slug.tar.gz",
+                                mimeType = "application/gzip"
+                            )
+                        }
+                    }
+                } else {
+                    val knownPaths = session.uploadedFiles.map { it.targetPath } +
+                        session.sources.map { it.target }
+                    InteractionsClient.downloadEnvironmentSnapshot(
+                        environmentId = envId,
+                        path = path,
+                        knownPaths = knownPaths,
+                        apiKey = apiKey
+                    )
+                }
 
                 val exportDir = File(context.cacheDir, "exports").apply { mkdirs() }
                 val outFile = File(exportDir, resource.fileName)
@@ -1564,7 +1813,7 @@ class StudioViewModel(
                 _uiState.update {
                     it.copy(
                         isDownloadingSnapshot = false,
-                        errorMessage = e.message ?: "Erro no download do sandbox."
+                        errorMessage = e.message ?: "Erro no download do ambiente."
                     )
                 }
             }

@@ -35,7 +35,7 @@ ACTIVE_LOCAL_RUNS: Dict[str, Dict[str, Any]] = {}
 
 def get_default_local_workdir() -> str:
     """Retorna o diretório de trabalho local padrão na máquina do usuário."""
-    env_dir = os.environ.get("ANTIGRAVITY_WORKDIR", "").strip()
+    env_dir = os.path.expanduser(os.environ.get("ANTIGRAVITY_WORKDIR", "").strip())
     if env_dir and os.path.isdir(env_dir):
         return os.path.abspath(env_dir)
     try:
@@ -49,7 +49,8 @@ def get_default_local_workdir() -> str:
 
 def resolve_local_path(raw_path: str, workdir: str) -> str:
     """Resolve um caminho relativo ou absoluto em relação ao diretório do projeto local."""
-    base = os.path.abspath(workdir or get_default_local_workdir())
+    base_raw = os.path.expanduser((workdir or "").strip()) or get_default_local_workdir()
+    base = os.path.abspath(base_raw)
     cleaned = (raw_path or "").strip()
     if not cleaned or cleaned == ".":
         return base
@@ -1330,6 +1331,8 @@ _REFUSAL_MARKERS = (
     "chamadas de ferramentas falsas",
     "substituir minhas instruções de sistema",
     "não consigo executar comandos diretamente no seu computador",
+    "não tenho acesso direto",
+    "cannot execute commands directly",
     "não consigo instalar programas na sua máquina",
     "opero exclusivamente dentro de um ambiente de execução isolado",
     "não possuo acesso direto ao seu sistema operacional",
@@ -1425,27 +1428,33 @@ def _extract_local_tool_calls_from_text(
             cleaned_text = cleaned_text[:start] + cleaned_text[end:]
         return calls, _strip_sandbox_refusal_disclaimers(cleaned_text.strip())
 
-    # 4. Fallback inteligente no 1º hop: se o modelo respondeu com bloco ```powershell / ```cmd / ```bash
-    #    contendo o comando para o computador do usuário (ex: `winget install GNU.Octave`),
-    #    extrai e executa automaticamente na máquina local!
-    if allow_shell_fallback:
+    # 4. Fallback inteligente no 1º hop: apenas quando a resposta contiver aviso/recusa de sandbox
+    #    junto de um bloco ```powershell / ```cmd / ```bash destinado à máquina local, extrai o script
+    #    preservando quebras de linha (sem corromper estruturas multilinhas com `&&`) e bloqueando
+    #    exemplos ilustrativos ou destrutivos.
+    has_refusal_context = any(marker in cleaned_text.lower() for marker in _REFUSAL_MARKERS)
+    if allow_shell_fallback and has_refusal_context:
         for match in _SHELL_FENCE_RE.finditer(cleaned_text):
             raw_cmd = (match.group(1) or "").strip()
-            lines = [
-                ln.strip()
+            active_lines = [
+                ln
                 for ln in raw_cmd.splitlines()
                 if ln.strip() and not ln.strip().startswith("#") and not ln.strip().upper().startswith("REM ")
             ]
-            if not lines:
+            if not active_lines:
                 continue
-            joined_cmd = " ; ".join(lines) if sys.platform == "win32" else " && ".join(lines)
-            # Evita executar placeholders ilustrativos como `<Pacote>` ou `octave-X.X.X`
-            if re.search(r"<[a-zA-Z_][^>]*>|X\.X\.X|COMANDO_PARA_MINHA_MAQUINA", joined_cmd):
+            script_cmd = "\n".join(active_lines).strip()
+            # Evita executar placeholders ilustrativos ou comandos destrutivos de exemplo
+            if re.search(
+                r"<[a-zA-Z_][^>]*>|X\.X\.X|COMANDO_PARA_MINHA_MAQUINA|\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+/|\bmkfs\b|\bformat\s+[a-zA-Z]:|\bdd\s+if=",
+                script_cmd,
+                flags=re.IGNORECASE,
+            ):
                 continue
             calls.append({
                 "id": f"call_{uuid.uuid4().hex[:10]}",
                 "name": "execute_bash",
-                "arguments": {"command": joined_cmd, "Cwd": "."},
+                "arguments": {"command": script_cmd, "Cwd": "."},
             })
             break
 
@@ -1526,7 +1535,8 @@ async def _run_antigravity_agent_hop(
     while status == "in_progress" and interaction_id and poll_count < 150:
         if run_state.get("cancelled"):
             try:
-                await client.post(f"{INTERACTIONS_BASE_URL}/{interaction_id}/cancel", headers=headers)
+                cancel_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+                await client.post(f"{INTERACTIONS_BASE_URL}/{interaction_id}/cancel", headers=cancel_headers)
             except Exception:
                 pass
             data["status"] = "cancelled"
@@ -1565,8 +1575,16 @@ async def run_local_agent_turn(
       sejam executadas diretamente no computador do usuário (`workdir`) e seus resultados reais
       sejam devolvidos ao modelo até concluir a resposta final.
     """
-    abs_workdir = resolve_local_path(".", workdir or get_default_local_workdir())
+    abs_workdir = resolve_local_path(workdir or ".", get_default_local_workdir())
     os.makedirs(abs_workdir, exist_ok=True)
+
+    if len(ACTIVE_LOCAL_RUNS) > 200:
+        finished_keys = [
+            k for k, v in list(ACTIVE_LOCAL_RUNS.items())
+            if v.get("status") != "in_progress"
+        ]
+        for old_k in finished_keys[: len(ACTIVE_LOCAL_RUNS) - 100]:
+            ACTIVE_LOCAL_RUNS.pop(old_k, None)
 
     local_turn_id = interaction_id_override or f"local_{uuid.uuid4().hex[:16]}"
     run_state: Dict[str, Any] = {
@@ -1793,6 +1811,18 @@ async def run_local_agent_turn(
                     "Caso a tarefa já tenha sido concluída, apresente o resumo final para mim com base nos resultados reais acima "
                     "e inclua ao final uma tag `<session_title>Título Curto da Sessão</session_title>` (3 a 7 palavras)."
                 )
+
+            if not final_output_text and final_status not in ("cancelled", "failed") and executed_any_local_tool:
+                summary = _format_local_execution_fallback_summary(accumulated_steps)
+                final_output_text = (
+                    f"{summary}\n\n⚠️ *Limite de {max_iterations} iterações locais atingido neste turno. "
+                    "Envie `continue` para prosseguir de onde parou.*"
+                ).strip()
+                final_status = "incomplete"
+                accumulated_steps.append({
+                    "type": "model_output",
+                    "content": [{"type": "text", "text": final_output_text}],
+                })
 
     except Exception as exc:
         final_status = "failed"

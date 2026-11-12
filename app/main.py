@@ -822,26 +822,38 @@ def api_fork_session(session_id: str, body: ForkSessionRequest) -> Dict[str, Any
     turns = source.get("turns", [])
     selected_turns = []
     target_env = source.get("environment_id", "")
+    found_target = False
 
     for t in turns:
         selected_turns.append(t)
         if t.get("environment_id"):
             target_env = t["environment_id"]
         if t.get("interaction_id") == body.up_to_interaction_id:
+            found_target = True
             break
 
+    if turns and body.up_to_interaction_id and not found_target:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Turno '{body.up_to_interaction_id}' não encontrado na sessão original.",
+        )
+
+    effective_last_id = selected_turns[-1]["interaction_id"] if selected_turns else body.up_to_interaction_id
     new_title = body.title or f"Fork: {source.get('title', 'Conversa')} (Turno {len(selected_turns)})"
     forked = create_session(
         title=new_title,
+        title_locked_by_user=bool(body.title and body.title.strip()),
         mode=source.get("mode", "agent"),
         execution_mode=source.get("execution_mode", "remote"),
         local_workdir=source.get("local_workdir", ""),
         agent_name=source.get("agent_name", "antigravity-preview-09-2026"),
         model_name=source.get("model_name", "gemini-4-argon"),
         environment_id=target_env,
-        last_interaction_id=body.up_to_interaction_id,
+        last_interaction_id=effective_last_id,
         max_total_tokens=source.get("max_total_tokens", 0),
         system_instruction=source.get("system_instruction", ""),
+        sources=source.get("sources", []),
+        uploaded_files=source.get("uploaded_files", []),
     )
 
     for idx, t in enumerate(selected_turns, start=1):
@@ -892,8 +904,8 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
         execution_mode = "remote"
 
     local_workdir = resolve_local_path(
-        ".",
-        (body.local_workdir or session.get("local_workdir") or get_default_local_workdir()).strip(),
+        (body.local_workdir or session.get("local_workdir") or ".").strip(),
+        get_default_local_workdir(),
     )
 
     # PROTEÇÃO PRE-FLIGHT CONTRA DESSINCRONIZAÇÃO (SPLIT-BRAIN):
@@ -1776,7 +1788,7 @@ async def api_download_session_environment(
     )
 
 
-@app.get("/api/environments/{environment_id}/download")
+@app.get("/api/environments/{environment_id:path}/download")
 async def api_download_environment_by_id(
     environment_id: str,
     path: Optional[str] = None,
@@ -2006,8 +2018,8 @@ async def api_upload_to_session_environment(
 
     if exec_mode == "local" or raw_env_id.startswith("local:"):
         base_dir = resolve_local_path(
-            ".",
-            session.get("local_workdir") or raw_env_id.removeprefix("local:") or get_default_local_workdir(),
+            (session.get("local_workdir") or raw_env_id.removeprefix("local:") or ".").strip(),
+            get_default_local_workdir(),
         )
         os.makedirs(base_dir, exist_ok=True)
         rel_target = (parsed["target_path"] or "").strip()
@@ -2024,6 +2036,26 @@ async def api_upload_to_session_environment(
                 dest_full = resolve_local_path(os.path.join(rel_target, rel_item), base_dir)
             else:
                 dest_full = resolve_local_path(rel_item, base_dir)
+
+            if not (rel_target and os.path.isabs(os.path.expanduser(rel_target))):
+                try:
+                    if os.path.commonpath([base_dir, dest_full]) != base_dir:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Caminho de upload inválido fora do diretório local do projeto: '{rel_item}'.",
+                        )
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Caminho de upload inválido fora do diretório local do projeto: '{rel_item}'.",
+                    )
+
+            if not parsed["overwrite"] and os.path.exists(dest_full):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"O arquivo '{dest_full}' já existe e overwrite=false.",
+                )
+
             os.makedirs(os.path.dirname(dest_full) or base_dir, exist_ok=True)
             with open(dest_full, "wb") as fp:
                 fp.write(item["bytes"])
@@ -2199,7 +2231,7 @@ async def api_upload_to_session_environment(
     }
 
 
-@app.post("/api/environments/{environment_id}/upload")
+@app.post("/api/environments/{environment_id:path}/upload")
 async def api_upload_to_environment_by_id(
     environment_id: str,
     request: Request,
@@ -2298,7 +2330,7 @@ def api_list_local_files(
     workdir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Lista arquivos e diretórios diretamente do disco da máquina local."""
-    base_dir = (workdir or "").strip() or get_default_local_workdir()
+    base_dir = resolve_local_path((workdir or ".").strip(), get_default_local_workdir())
     target = resolve_local_path(path or ".", base_dir)
     res = tool_list_dir(target, default_workdir=base_dir)
     if res.get("error"):
@@ -2319,7 +2351,7 @@ class LocalToolRequest(BaseModel):
 @app.post("/api/local/tool")
 async def api_execute_local_tool(body: LocalToolRequest) -> Dict[str, Any]:
     """Permite executar diretamente qualquer Supported Tool na máquina local."""
-    base_dir = resolve_local_path(".", (body.workdir or "").strip() or get_default_local_workdir())
+    base_dir = resolve_local_path((body.workdir or ".").strip(), get_default_local_workdir())
     res, is_err = await execute_local_tool_call(
         tool_name=body.tool_name,
         arguments=body.arguments,
@@ -2349,7 +2381,10 @@ async def api_list_session_environment_files(
     raw_env = (session.get("environment_id") or "").strip()
 
     if exec_mode == "local" or raw_env.startswith("local:"):
-        base_dir = session.get("local_workdir") or raw_env.removeprefix("local:") or get_default_local_workdir()
+        base_dir = resolve_local_path(
+            (session.get("local_workdir") or raw_env.removeprefix("local:") or ".").strip(),
+            get_default_local_workdir(),
+        )
         req_path = "." if path in ("workspace", "", "/") else path
         target = resolve_local_path(req_path, base_dir)
         res = tool_list_dir(target, default_workdir=base_dir)
@@ -2384,7 +2419,7 @@ async def api_list_session_environment_files(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.get("/api/environments/{environment_id}/files")
+@app.get("/api/environments/{environment_id:path}/files")
 async def api_list_environment_files_by_id(
     environment_id: str,
     path: str = "workspace",

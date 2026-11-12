@@ -3,6 +3,7 @@ package com.antigravity.studio.data.model
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
+import java.time.OffsetDateTime
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 
@@ -95,8 +96,14 @@ data class UsageInfo(
             if (jsonStr.isBlank()) return UsageInfo()
             return try {
                 val obj = JSONObject(jsonStr)
-                val inTok = obj.optInt("input_tokens", obj.optInt("prompt_token_count", 0))
-                val outTok = obj.optInt("output_tokens", obj.optInt("candidates_token_count", 0))
+                val inTok = obj.optInt(
+                    "total_input_tokens",
+                    obj.optInt("input_tokens", obj.optInt("prompt_token_count", 0))
+                )
+                val outTok = obj.optInt(
+                    "total_output_tokens",
+                    obj.optInt("output_tokens", obj.optInt("candidates_token_count", 0))
+                )
                 val totTok = obj.optInt("total_tokens", obj.optInt("total_token_count", inTok + outTok))
                 UsageInfo(
                     inputTokens = inTok,
@@ -165,11 +172,20 @@ fun nowIso(): String =
         .withZone(ZoneOffset.UTC)
         .format(Instant.now())
 
+private fun parseIsoInstant(raw: String): Instant {
+    return try {
+        OffsetDateTime.parse(raw).toInstant()
+    } catch (_: Exception) {
+        val normalized = if (raw.endsWith("Z")) raw else "${raw}Z"
+        Instant.parse(normalized)
+    }
+}
+
 fun formatDateTimePtBr(isoStr: String?): String {
     val raw = isoStr?.trim().orEmpty()
     if (raw.isEmpty()) return ""
     return try {
-        val instant = Instant.parse(if (raw.endsWith("Z") || raw.contains("+")) raw else "${raw}Z")
+        val instant = parseIsoInstant(raw)
         DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss")
             .withZone(java.time.ZoneId.systemDefault())
             .format(instant)
@@ -182,7 +198,7 @@ fun formatShortDateTimePtBr(isoStr: String?): String {
     val raw = isoStr?.trim().orEmpty()
     if (raw.isEmpty()) return ""
     return try {
-        val instant = Instant.parse(if (raw.endsWith("Z") || raw.contains("+")) raw else "${raw}Z")
+        val instant = parseIsoInstant(raw)
         DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm")
             .withZone(java.time.ZoneId.systemDefault())
             .format(instant)

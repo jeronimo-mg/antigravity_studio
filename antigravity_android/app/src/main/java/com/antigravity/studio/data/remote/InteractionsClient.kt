@@ -962,6 +962,11 @@ if __name__ == "__main__":
         return baos.toByteArray()
     }
 
+    private fun encodeUrlPathSegments(path: String): String =
+        path.split("/")
+            .filter { it.isNotEmpty() }
+            .joinToString("/") { URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
+
     suspend fun uploadFileToEnvironment(
         environmentId: String,
         targetPath: String,
@@ -973,8 +978,8 @@ if __name__ == "__main__":
         apiKey: String
     ): JSONObject = withContext(Dispatchers.IO) {
         val cleanId = cleanEnvironmentId(environmentId)
-        if (cleanId.isBlank() || cleanId == "remote") {
-            throw IllegalArgumentException("É necessário um environment_id válido (ex: env_...) para fazer upload.")
+        if (cleanId.isBlank() || cleanId == "remote" || cleanId.startsWith("local:")) {
+            throw IllegalArgumentException("É necessário um environment_id remoto válido (ex: env_...) para fazer upload.")
         }
         val cleanPath = targetPath.trim().trimStart('/')
         if (cleanPath.isBlank()) {
@@ -987,7 +992,8 @@ if __name__ == "__main__":
             else -> guessMimeType(cleanPath)
         }
 
-        val urlBuilder = "$ENVIRONMENTS_UPLOAD_BASE_URL/$cleanId/files/$cleanPath".toHttpUrl().newBuilder()
+        val encodedPath = encodeUrlPathSegments(cleanPath)
+        val urlBuilder = "$ENVIRONMENTS_UPLOAD_BASE_URL/$cleanId/files/$encodedPath".toHttpUrl().newBuilder()
         urlBuilder.addQueryParameter("overwrite", if (overwrite) "true" else "false")
         if (extract) {
             urlBuilder.addQueryParameter("extract", "true")
@@ -1013,15 +1019,36 @@ if __name__ == "__main__":
                 }
                 val scottyUrl = initResp.header("x-goog-upload-url")
                 val locationUrl = initResp.header("location")
-                val sessionUrl = scottyUrl ?: locationUrl
-                if (!sessionUrl.isNullOrBlank()) {
+                if (!scottyUrl.isNullOrBlank()) {
                     val finalizeReq = Request.Builder()
-                        .url(sessionUrl)
+                        .url(scottyUrl)
                         .post(fileBytes.toRequestBody(resolvedMime.toMediaTypeOrNull()))
                         .addHeader("x-goog-api-key", apiKey.trim())
                         .addHeader("X-Goog-Upload-Command", "upload, finalize")
                         .addHeader("X-Goog-Upload-Offset", "0")
                         .addHeader("Content-Type", resolvedMime)
+                        .build()
+                    httpClient.newCall(finalizeReq).execute().use { finResp ->
+                        val bodyStr = finResp.body?.string() ?: "{}"
+                        if (finResp.code >= 400) {
+                            throw IllegalStateException("Erro ao finalizar upload resumível (HTTP ${finResp.code}): $bodyStr")
+                        }
+                        return@withContext JSONObject()
+                            .put("environment_id", cleanId)
+                            .put("target_path", "/$cleanPath")
+                            .put("size_bytes", fileBytes.size)
+                            .put("mime_type", resolvedMime)
+                            .put("extract", extract)
+                            .put("overwrite", overwrite)
+                            .put("upload_mode", "resumable")
+                    }
+                } else if (!locationUrl.isNullOrBlank()) {
+                    val finalizeReq = Request.Builder()
+                        .url(locationUrl)
+                        .put(fileBytes.toRequestBody(resolvedMime.toMediaTypeOrNull()))
+                        .addHeader("x-goog-api-key", apiKey.trim())
+                        .addHeader("Content-Type", resolvedMime)
+                        .addHeader("Content-Length", fileBytes.size.toString())
                         .build()
                     httpClient.newCall(finalizeReq).execute().use { finResp ->
                         val bodyStr = finResp.body?.string() ?: "{}"
@@ -1160,7 +1187,7 @@ if __name__ == "__main__":
 
         for ((idx, cand) in candidates.withIndex()) {
             val baseUrl = if (cand.isNotBlank()) {
-                val enc = cand.split("/").joinToString("/") { URLEncoder.encode(it, "UTF-8") }
+                val enc = encodeUrlPathSegments(cand)
                 "$ENVIRONMENTS_BASE_URL/$cleanId/files/$enc"
             } else {
                 "$ENVIRONMENTS_BASE_URL/$cleanId/files"
@@ -1292,7 +1319,7 @@ if __name__ == "__main__":
                     fPath = "${basePath.trimStart('/')}/${entry.name}".trimStart('/')
                 }
                 if (fPath.isBlank()) return@async null
-                val encPath = fPath.split("/").joinToString("/") { URLEncoder.encode(it, "UTF-8") }
+                val encPath = encodeUrlPathSegments(fPath)
                 val fileUrl = "$ENVIRONMENTS_BASE_URL/$cleanId/files/$encPath?alt=media"
 
                 sem.withPermit {
@@ -1337,8 +1364,8 @@ if __name__ == "__main__":
         apiKey: String
     ): DownloadedResource = withContext(Dispatchers.IO) {
         val cleanId = cleanEnvironmentId(environmentId)
-        if (cleanId.isBlank() || cleanId == "remote") {
-            throw IllegalArgumentException("Informe um environment_id válido.")
+        if (cleanId.isBlank() || cleanId == "remote" || cleanId.startsWith("local:")) {
+            throw IllegalArgumentException("Informe um environment_id remoto válido.")
         }
         val targetPath = normalizeEnvTargetPath(path, cleanId)
 
@@ -1382,7 +1409,7 @@ if __name__ == "__main__":
         }
 
         // Caso 2: Download de um Arquivo ou Diretório específico
-        val encPath = targetPath.split("/").joinToString("/") { URLEncoder.encode(it, "UTF-8") }
+        val encPath = encodeUrlPathSegments(targetPath)
         val baseName = targetPath.trimEnd('/').substringAfterLast('/').ifBlank { "arquivo" }
         val guessedMime = guessMimeType(baseName)
 
@@ -1637,17 +1664,27 @@ print(interaction.output_text)
 
     fun encodeSessionSyncDisplayName(session: SessionModel): String {
         var lastId = session.lastInteractionId.trim()
+        if (lastId.startsWith("local_")) {
+            lastId = ""
+        }
         if (lastId.isBlank() && session.turns.isNotEmpty()) {
             val validTurn = session.turns.lastOrNull {
-                it.status !in listOf("failed", "cancelled") && it.interactionId.isNotBlank()
+                it.status !in listOf("failed", "cancelled") &&
+                    it.interactionId.isNotBlank() &&
+                    !it.interactionId.trim().startsWith("local_")
             }
             if (validTurn != null) {
                 lastId = validTurn.interactionId.trim()
             }
         }
-        val envId = cleanEnvironmentId(session.environmentId)
+        val rawEnv = cleanEnvironmentId(session.environmentId)
+        val envId = if (rawEnv.startsWith("local:") || rawEnv == "remote") "" else rawEnv
         val tc = computeSessionTurnCount(session)
         val uploadPaths = session.uploadedFiles
+            .filter {
+                it.uploadMode != "local_disk" &&
+                    !it.environmentId.trim().startsWith("local:")
+            }
             .map { it.targetPath.trim() }
             .filter { it.isNotEmpty() }
             .distinct()
@@ -1697,10 +1734,13 @@ print(interaction.output_text)
             val obj = JSONObject(jsonStr)
             val sid = obj.optString("id", "").trim()
             if (sid.isBlank()) return null
-            val envId = cleanEnvironmentId(obj.optString("env", ""))
+            val rawEnv = cleanEnvironmentId(obj.optString("env", ""))
+            val envId = if (rawEnv.startsWith("local:") || rawEnv == "remote") "" else rawEnv
+            val rawLast = obj.optString("last", "").trim()
+            val lastId = if (rawLast.startsWith("local_")) "" else rawLast
             val upArr = obj.optJSONArray("up")
             val uploaded = mutableListOf<UploadedFileRecord>()
-            if (upArr != null) {
+            if (upArr != null && envId.isNotEmpty()) {
                 for (i in 0 until upArr.length()) {
                     val p = upArr.optString(i, "").trim()
                     if (p.isNotEmpty()) {
@@ -1720,7 +1760,7 @@ print(interaction.output_text)
                 id = sid,
                 title = obj.optString("t", "Conversa Antigravity").trim().ifBlank { "Conversa Antigravity" },
                 titleLockedByUser = obj.optInt("tl", 0) != 0,
-                lastInteractionId = obj.optString("last", "").trim(),
+                lastInteractionId = lastId,
                 environmentId = envId,
                 mode = obj.optString("m", "agent").trim().ifBlank { "agent" },
                 agentName = obj.optString("ag", "antigravity-preview-09-2026").trim().ifBlank { "antigravity-preview-09-2026" },

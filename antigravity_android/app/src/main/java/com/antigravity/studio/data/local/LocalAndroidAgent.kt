@@ -594,21 +594,28 @@ object LocalAndroidAgent {
             }
         }
         if (calls.isNotEmpty()) {
-            val cleaned = stripRefusalDisclaimers(genericJsonFenceRegex.replace(text, "").trim())
+            val selectivelyCleaned = genericJsonFenceRegex.replace(text) { m ->
+                if (parseToolCallJson(m.groupValues[1]).isNotEmpty()) "" else m.value
+            }.trim()
+            val cleaned = stripRefusalDisclaimers(selectivelyCleaned)
             return calls to cleaned
         }
 
-        if (allowShellFallback) {
+        val hasRefusalContext = refusalMarkers.any { text.lowercase().contains(it) }
+        if (allowShellFallback && hasRefusalContext) {
+            val unsafeRegex = Regex(
+                "<[a-zA-Z_][^>]*>|X\\.X\\.X|COMANDO_PARA_MINHA_MAQUINA|\\brm\\s+-[a-zA-Z]*r[a-zA-Z]*f?\\s+/|\\bmkfs\\b|\\bdd\\s+if=",
+                RegexOption.IGNORE_CASE
+            )
             for (match in shellFenceRegex.findAll(text)) {
-                val lines = match.groupValues[1].lines()
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() && !it.startsWith("#") }
-                if (lines.isEmpty()) continue
-                val joined = lines.joinToString(" && ")
-                if (joined.contains("COMANDO_PARA_MINHA_MAQUINA") || Regex("<[a-zA-Z_][^>]*>").containsMatchIn(joined)) {
+                val activeLines = match.groupValues[1].lines()
+                    .filter { it.trim().isNotEmpty() && !it.trim().startsWith("#") }
+                if (activeLines.isEmpty()) continue
+                val scriptCmd = activeLines.joinToString("\n").trim()
+                if (unsafeRegex.containsMatchIn(scriptCmd)) {
                     continue
                 }
-                calls.add("execute_bash" to JSONObject().put("command", joined).put("Cwd", "."))
+                calls.add("execute_bash" to JSONObject().put("command", scriptCmd).put("Cwd", "."))
                 break
             }
             if (calls.isNotEmpty()) {
@@ -617,6 +624,33 @@ object LocalAndroidAgent {
         }
 
         return emptyList<Pair<String, JSONObject>>() to text.trim()
+    }
+
+    private fun formatLocalExecutionFallbackSummary(stepsRecorded: JSONArray): String {
+        val lines = mutableListOf("### ✅ Execução Concluída no Dispositivo Local")
+        var idx = 0
+        for (i in 0 until stepsRecorded.length()) {
+            val step = stepsRecorded.optJSONObject(i) ?: continue
+            if (step.optString("type") != "function_result") continue
+            idx++
+            val tName = step.optString("name", "tool")
+            val resObj = step.optJSONObject("result")
+            val cmd = resObj?.optString("command")?.takeIf { it.isNotBlank() }
+                ?: resObj?.optString("path")?.takeIf { it.isNotBlank() }
+                ?: resObj?.optString("directory")?.takeIf { it.isNotBlank() }
+                ?: tName
+            val exitCode = if (resObj != null && resObj.has("exit_code")) " (exit_code: ${resObj.optInt("exit_code")})" else ""
+            lines.add("**$idx. `$cmd`**$exitCode")
+            val stdout = (resObj?.optString("stdout") ?: resObj?.optString("content") ?: "").trim()
+            val stderr = (resObj?.optString("stderr") ?: resObj?.optString("error") ?: "").trim()
+            if (stdout.isNotEmpty()) {
+                lines.add("```text\n${stdout.take(4000)}\n```")
+            }
+            if (stderr.isNotEmpty()) {
+                lines.add("```text\n${stderr.take(1500)}\n```")
+            }
+        }
+        return if (idx == 0) "" else lines.joinToString("\n\n").trim()
     }
 
     private suspend fun executeAntigravityAgentHop(
@@ -731,6 +765,7 @@ object LocalAndroidAgent {
         )
 
         var finalOutputText = ""
+        var finalStatus = "completed"
         var agentSessionTitle: String? = null
         var totalIn = 0
         var totalOut = 0
@@ -779,8 +814,8 @@ object LocalAndroidAgent {
             if (rawHopOutput.isEmpty()) {
                 val outputsArr = hopData.optJSONArray("outputs") ?: JSONArray()
                 val outTxts = mutableListOf<String>()
-                for (i in 0 until outputsArr.length()) {
-                    val o = outputsArr.optJSONObject(i) ?: continue
+                for (j in 0 until outputsArr.length()) {
+                    val o = outputsArr.optJSONObject(j) ?: continue
                     if (o.optString("type") == "text") {
                         val t = o.optString("text", "").trim()
                         if (t.isNotEmpty()) outTxts.add(t)
@@ -808,7 +843,11 @@ object LocalAndroidAgent {
                 if (!finalTitle.isNullOrBlank()) {
                     agentSessionTitle = finalTitle
                 }
-                finalOutputText = cleanFinal
+                finalOutputText = if (cleanFinal.isBlank() && executedAnyLocalTool) {
+                    formatLocalExecutionFallbackSummary(stepsRecorded)
+                } else {
+                    cleanFinal
+                }
                 if (finalOutputText.isNotEmpty()) {
                     stepsRecorded.put(
                         JSONObject()
@@ -853,9 +892,20 @@ object LocalAndroidAgent {
                 "\n\nSe mais alguma ação precisar ser executada no meu aparelho para concluir o pedido, inclua apenas o próximo bloco ```json:local-action. Caso contrário, apresente o resumo final com base nos resultados reais acima."
         }
 
+        if (finalOutputText.isEmpty() && executedAnyLocalTool) {
+            val summary = formatLocalExecutionFallbackSummary(stepsRecorded)
+            finalOutputText = (summary + "\n\n⚠️ *Limite de iterações locais atingido. Envie `continue` para prosseguir.*").trim()
+            finalStatus = "incomplete"
+            stepsRecorded.put(
+                JSONObject()
+                    .put("type", "model_output")
+                    .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", finalOutputText)))
+            )
+        }
+
         JSONObject()
             .put("id", currentPrevId ?: localTurnId)
-            .put("status", "completed")
+            .put("status", finalStatus)
             .put("environment_id", "local:$localDir")
             .put("steps", stepsRecorded)
             .put("output_text", finalOutputText)
@@ -868,6 +918,8 @@ object LocalAndroidAgent {
                 JSONObject()
                     .put("input_tokens", totalIn)
                     .put("output_tokens", totalOut)
+                    .put("total_input_tokens", totalIn)
+                    .put("total_output_tokens", totalOut)
                     .put("total_tokens", totalTok)
             )
             .apply {

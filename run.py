@@ -144,8 +144,9 @@ if __name__ == "__main__":
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-    cli_triggers = {"cli", "--cli", "-p", "--prompt", "--workdir", "-w"}
-    if any(arg in cli_triggers for arg in sys.argv[1:]):
+    cli_triggers = {"cli", "--cli", "-p", "--prompt", "--prompt-text", "--workdir", "-w", "-C"}
+    cli_prefixes = ("--prompt=", "--prompt-text=", "--workdir=")
+    if any(arg in cli_triggers or arg.startswith(cli_prefixes) for arg in sys.argv[1:]):
         from app.cli import run_cli_main
 
         cli_args = [a for a in sys.argv[1:] if a != "--cli"]

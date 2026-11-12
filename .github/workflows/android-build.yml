@@ -5,12 +5,12 @@ on:
     branches: [ "main", "master" ]
     paths:
       - 'antigravity_android/**'
-      - 'app/src/**'
-      - 'build.gradle.kts'
-      - 'settings.gradle.kts'
       - '.github/workflows/android-build.yml'
   pull_request:
     branches: [ "main", "master" ]
+    paths:
+      - 'antigravity_android/**'
+      - '.github/workflows/android-build.yml'
   workflow_dispatch:
 
 jobs:
