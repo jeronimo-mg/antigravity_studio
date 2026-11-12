@@ -27,11 +27,26 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 
+enum class SessionSortOrder(val key: String, val label: String) {
+    LAST_INTERACTION_DESC("last_interaction_desc", "Última interação"),
+    UPDATED_DESC("updated_desc", "Última atualização"),
+    CREATED_DESC("created_desc", "Criação (recente)"),
+    CREATED_ASC("created_asc", "Criação (antiga)"),
+    TITLE_ASC("title_asc", "Título (A → Z)"),
+    TURNS_DESC("turns_desc", "Mais turnos");
+
+    companion object {
+        fun fromKey(key: String?): SessionSortOrder =
+            entries.firstOrNull { it.key == key } ?: LAST_INTERACTION_DESC
+    }
+}
+
 data class StudioUiState(
     val apiKey: String = "",
     val hasApiKey: Boolean = false,
     val maskedApiKey: String = "",
     val sessions: List<SessionModel> = emptyList(),
+    val sessionSortOrder: SessionSortOrder = SessionSortOrder.LAST_INTERACTION_DESC,
     val activeSession: SessionModel? = null,
     val customPrevInteractionId: String? = null,
     val backgroundMode: Boolean = true,
@@ -62,11 +77,20 @@ class StudioViewModel(
     init {
         viewModelScope.launch {
             val savedKey = repository.getApiKey()
+            val savedSort = SessionSortOrder.fromKey(repository.getSessionSortOrder())
+            _uiState.update { it.copy(sessionSortOrder = savedSort) }
             updateKeyState(savedKey)
             refreshSessions(selectFirstIfNone = true)
             if (savedKey.isNotBlank()) {
                 syncSessionsWithCloud(silent = true)
             }
+        }
+    }
+
+    fun setSessionSortOrder(order: SessionSortOrder) {
+        _uiState.update { it.copy(sessionSortOrder = order) }
+        viewModelScope.launch {
+            repository.setSessionSortOrder(order.key)
         }
     }
 

@@ -239,8 +239,8 @@ def update_settings(body: SettingsUpdate) -> Dict[str, Any]:
 
 
 @app.get("/api/sessions")
-def api_list_sessions() -> Dict[str, Any]:
-    return {"sessions": list_sessions()}
+def api_list_sessions(sort: str = "last_interaction_desc") -> Dict[str, Any]:
+    return {"sessions": list_sessions(sort_by=sort)}
 
 
 class LoadChainRequest(BaseModel):

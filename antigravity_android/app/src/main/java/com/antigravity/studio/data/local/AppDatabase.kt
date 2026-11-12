@@ -182,6 +182,13 @@ class StudioRepository(private val dao: StudioDao) {
         dao.setSetting(SettingEntity(key = "gemini_api_key", value = apiKey.trim()))
     }
 
+    suspend fun getSessionSortOrder(): String =
+        (dao.getSetting("session_sort_order") ?: "last_interaction_desc").trim()
+
+    suspend fun setSessionSortOrder(orderKey: String) {
+        dao.setSetting(SettingEntity(key = "session_sort_order", value = orderKey.trim()))
+    }
+
     suspend fun listSessions(): List<SessionModel> {
         val entities = dao.listSessionsRaw()
         return entities.map { entity ->

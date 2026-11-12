@@ -32,6 +32,7 @@ async function fetchLocalMachineInfo() {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  initSessionSortSelect();
   await fetchLocalMachineInfo();
   const hasKey = await checkApiKeyStatus();
   await loadSessionsList();
@@ -131,9 +132,80 @@ async function syncCloudSessions(silent = false) {
   }
 }
 
+const SESSION_SORT_STORAGE_KEY = "antigravity_session_sort";
+
+function getSessionSortOrder() {
+  const el = document.getElementById("sessionSortSelect");
+  const fromEl = el ? el.value : "";
+  if (fromEl) return fromEl;
+  try {
+    return localStorage.getItem(SESSION_SORT_STORAGE_KEY) || "last_interaction_desc";
+  } catch (e) {
+    return "last_interaction_desc";
+  }
+}
+
+function initSessionSortSelect() {
+  const el = document.getElementById("sessionSortSelect");
+  if (!el) return;
+  try {
+    const saved = localStorage.getItem(SESSION_SORT_STORAGE_KEY);
+    if (saved && Array.from(el.options).some((opt) => opt.value === saved)) {
+      el.value = saved;
+    }
+  } catch (e) {}
+}
+
+function changeSessionSortOrder() {
+  const order = getSessionSortOrder();
+  try {
+    localStorage.setItem(SESSION_SORT_STORAGE_KEY, order);
+  } catch (e) {}
+  renderSessionsSidebar();
+}
+
+function _parseSessionDateMs(isoStr) {
+  if (!isoStr || typeof isoStr !== "string") return 0;
+  const raw = isoStr.trim();
+  if (!raw) return 0;
+  const normalized = raw.includes("T") ? raw : raw.replace(" ", "T") + (raw.endsWith("Z") ? "" : "Z");
+  const ms = Date.parse(normalized);
+  return isNaN(ms) ? 0 : ms;
+}
+
+function getSortedSessions(list) {
+  const order = getSessionSortOrder();
+  const copy = [...(list || [])];
+  copy.sort((a, b) => {
+    const aLast = _parseSessionDateMs(a.last_prompt_at || a.updated_at || a.created_at);
+    const bLast = _parseSessionDateMs(b.last_prompt_at || b.updated_at || b.created_at);
+    if (order === "updated_desc") {
+      return _parseSessionDateMs(b.updated_at || b.created_at) - _parseSessionDateMs(a.updated_at || a.created_at);
+    }
+    if (order === "created_desc") {
+      return _parseSessionDateMs(b.created_at || b.updated_at) - _parseSessionDateMs(a.created_at || a.updated_at);
+    }
+    if (order === "created_asc") {
+      return _parseSessionDateMs(a.created_at || a.updated_at) - _parseSessionDateMs(b.created_at || b.updated_at);
+    }
+    if (order === "title_asc") {
+      const cmp = (a.title || "").localeCompare(b.title || "", "pt-BR", { sensitivity: "base" });
+      return cmp !== 0 ? cmp : bLast - aLast;
+    }
+    if (order === "turns_desc") {
+      const diff = (b.turn_count || 0) - (a.turn_count || 0);
+      return diff !== 0 ? diff : bLast - aLast;
+    }
+    // Default: last_interaction_desc
+    return bLast - aLast;
+  });
+  return copy;
+}
+
 async function loadSessionsList() {
   try {
-    const res = await fetch("/api/sessions");
+    const sortOrder = encodeURIComponent(getSessionSortOrder());
+    const res = await fetch(`/api/sessions?sort=${sortOrder}`);
     const data = await res.json();
     sessionsList = data.sessions || [];
     renderSessionsSidebar();
@@ -185,7 +257,8 @@ function formatShortDateTimePtBr(isoStr) {
 
 function renderSessionsSidebar() {
   const container = document.getElementById("sessionsList");
-  if (!sessionsList.length) {
+  const sortedSessions = getSortedSessions(sessionsList);
+  if (!sortedSessions.length) {
     container.innerHTML = `
       <div class="p-3 text-xs text-gray-500 text-center">
         Nenhuma sessão salva ainda.
@@ -194,7 +267,7 @@ function renderSessionsSidebar() {
     return;
   }
 
-  container.innerHTML = sessionsList
+  container.innerHTML = sortedSessions
     .map((s) => {
       const isSelected = currentSession && currentSession.id === s.id;
       const isLocal = (s.execution_mode || "remote") === "local" || (s.environment_id || "").startsWith("local:");

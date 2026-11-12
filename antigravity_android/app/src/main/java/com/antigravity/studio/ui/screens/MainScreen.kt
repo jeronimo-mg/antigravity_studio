@@ -51,6 +51,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -215,17 +217,88 @@ fun MainScreen(viewModel: StudioViewModel) {
 
                     HorizontalDivider(color = Slate800)
 
-                    Text(
-                        "SESSÕES SALVAS (${uiState.sessions.size})",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = Slate400
-                    )
+                    var sortMenuExpanded by remember { mutableStateOf(false) }
+                    val sortedSessions = remember(uiState.sessions, uiState.sessionSortOrder) {
+                        when (uiState.sessionSortOrder) {
+                            SessionSortOrder.LAST_INTERACTION_DESC -> uiState.sessions.sortedByDescending {
+                                it.lastPromptAt.ifBlank { it.updatedAt.ifBlank { it.createdAt } }
+                            }
+                            SessionSortOrder.UPDATED_DESC -> uiState.sessions.sortedByDescending {
+                                it.updatedAt.ifBlank { it.createdAt }
+                            }
+                            SessionSortOrder.CREATED_DESC -> uiState.sessions.sortedByDescending {
+                                it.createdAt.ifBlank { it.updatedAt }
+                            }
+                            SessionSortOrder.CREATED_ASC -> uiState.sessions.sortedBy {
+                                it.createdAt.ifBlank { it.updatedAt }
+                            }
+                            SessionSortOrder.TITLE_ASC -> uiState.sessions.sortedWith(
+                                compareBy<com.antigravity.studio.data.model.SessionModel> { it.title.lowercase() }
+                                    .thenByDescending { it.lastPromptAt.ifBlank { it.updatedAt } }
+                            )
+                            SessionSortOrder.TURNS_DESC -> uiState.sessions.sortedWith(
+                                compareByDescending<com.antigravity.studio.data.model.SessionModel> { it.turnCount }
+                                    .thenByDescending { it.lastPromptAt.ifBlank { it.updatedAt } }
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "SESSÕES SALVAS (${uiState.sessions.size})",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Slate400
+                        )
+                        Box {
+                            Surface(
+                                color = Slate800,
+                                shape = RoundedCornerShape(6.dp),
+                                modifier = Modifier.clickable { sortMenuExpanded = true }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        uiState.sessionSortOrder.label,
+                                        fontSize = 11.sp,
+                                        color = Slate200
+                                    )
+                                    Icon(
+                                        Icons.Default.ExpandMore,
+                                        contentDescription = "Ordenar sessões",
+                                        tint = Slate400,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = sortMenuExpanded,
+                                onDismissRequest = { sortMenuExpanded = false }
+                            ) {
+                                SessionSortOrder.entries.forEach { order ->
+                                    DropdownMenuItem(
+                                        text = { Text(order.label, fontSize = 13.sp) },
+                                        onClick = {
+                                            viewModel.setSessionSortOrder(order)
+                                            sortMenuExpanded = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
 
                     LazyColumn(
                         modifier = Modifier.weight(1f),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        items(uiState.sessions, key = { it.id }) { sess ->
+                        items(sortedSessions, key = { it.id }) { sess ->
                             val isSelected = sess.id == activeSession?.id
                             Surface(
                                 color = if (isSelected) Indigo500.copy(alpha = 0.25f) else Slate800.copy(alpha = 0.6f),

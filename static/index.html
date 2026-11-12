@@ -230,9 +230,24 @@
         </button>
       </div>
 
-      <div class="px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-gray-400 flex items-center justify-between">
-        <span>Sessões Salvas (SQLite)</span>
-        <button onclick="loadSessionsList()" class="hover:text-white" title="Recarregar">↻</button>
+      <div class="px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-gray-400 space-y-1.5">
+        <div class="flex items-center justify-between">
+          <span>Sessões Salvas (SQLite)</span>
+          <button onclick="loadSessionsList()" class="hover:text-white" title="Recarregar">↻</button>
+        </div>
+        <select
+          id="sessionSortSelect"
+          onchange="changeSessionSortOrder()"
+          title="Ordenar sessões salvas"
+          class="w-full bg-studio-card border border-studio-border rounded-md px-2 py-1 text-[11px] font-normal normal-case tracking-normal text-gray-300 focus:outline-none focus:border-blue-400"
+        >
+          <option value="last_interaction_desc">🕒 Última interação (mais recente)</option>
+          <option value="updated_desc">✏️ Última atualização (mais recente)</option>
+          <option value="created_desc">📅 Criação (mais recente)</option>
+          <option value="created_asc">📅 Criação (mais antiga)</option>
+          <option value="title_asc">🔤 Título (A → Z)</option>
+          <option value="turns_desc">💬 Mais turnos</option>
+        </select>
       </div>
 
       <div id="sessionsList" class="flex-1 overflow-y-auto px-2 space-y-1 pb-4 select-text">

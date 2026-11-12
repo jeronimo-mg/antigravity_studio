@@ -267,16 +267,30 @@ def update_session(session_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
     return get_session(session_id)
 
 
-def list_sessions() -> List[Dict[str, Any]]:
+SESSION_SORT_CLAUSES = {
+    "last_interaction_desc": "COALESCE((SELECT MAX(t.created_at) FROM turns t WHERE t.session_id = s.id), s.updated_at) DESC",
+    "updated_desc": "s.updated_at DESC",
+    "created_desc": "s.created_at DESC",
+    "created_asc": "s.created_at ASC",
+    "title_asc": "LOWER(COALESCE(s.title, '')) ASC, COALESCE((SELECT MAX(t.created_at) FROM turns t WHERE t.session_id = s.id), s.updated_at) DESC",
+    "turns_desc": "turn_count DESC, COALESCE((SELECT MAX(t.created_at) FROM turns t WHERE t.session_id = s.id), s.updated_at) DESC",
+}
+
+
+def list_sessions(sort_by: str = "last_interaction_desc") -> List[Dict[str, Any]]:
+    order_clause = SESSION_SORT_CLAUSES.get(
+        (sort_by or "").strip(),
+        SESSION_SORT_CLAUSES["last_interaction_desc"],
+    )
     conn = get_connection()
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT s.*,
                    (SELECT COUNT(*) FROM turns t WHERE t.session_id = s.id) AS turn_count,
                    (SELECT MAX(t.created_at) FROM turns t WHERE t.session_id = s.id) AS last_prompt_at
             FROM sessions s
-            ORDER BY COALESCE((SELECT MAX(t.created_at) FROM turns t WHERE t.session_id = s.id), s.updated_at) DESC
+            ORDER BY {order_clause}
             """
         ).fetchall()
     finally:
