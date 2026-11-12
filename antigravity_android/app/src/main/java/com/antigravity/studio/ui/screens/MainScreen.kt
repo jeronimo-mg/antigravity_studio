@@ -93,6 +93,7 @@ import androidx.compose.ui.unit.sp
 import com.antigravity.studio.data.model.TurnModel
 import com.antigravity.studio.data.model.formatDateTimePtBr
 import com.antigravity.studio.data.model.formatShortDateTimePtBr
+import com.antigravity.studio.ui.SessionSortOrder
 import com.antigravity.studio.ui.StudioViewModel
 import com.antigravity.studio.ui.components.ApiKeyDialog
 import com.antigravity.studio.ui.components.CodeAndExportDialog
@@ -104,6 +105,7 @@ import com.antigravity.studio.ui.theme.Emerald400
 import com.antigravity.studio.ui.theme.Indigo500
 import com.antigravity.studio.ui.theme.Rose400
 import com.antigravity.studio.ui.theme.Sky400
+import com.antigravity.studio.ui.theme.Slate200
 import com.antigravity.studio.ui.theme.Slate400
 import com.antigravity.studio.ui.theme.Slate800
 import com.antigravity.studio.ui.theme.Slate900
