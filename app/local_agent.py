@@ -1489,6 +1489,19 @@ def _format_local_execution_fallback_summary(accumulated_steps: List[Dict[str, A
     return "\n\n".join(lines).strip()
 
 
+def _parse_retry_after_seconds(resp: httpx.Response, attempt: int) -> float:
+    retry_after = (resp.headers.get("retry-after") or "").strip()
+    if retry_after:
+        try:
+            return max(1.0, min(90.0, float(retry_after) + 1.0))
+        except ValueError:
+            pass
+    match = re.search(r"retry in (\d+(?:\.\d+)?)s", resp.text or "", re.IGNORECASE)
+    if match:
+        return max(1.0, min(90.0, float(match.group(1)) + 1.5))
+    return min(60.0, float((2 ** attempt) * 4 + 2))
+
+
 async def _run_antigravity_agent_hop(
     client: httpx.AsyncClient,
     headers: Dict[str, str],
@@ -1517,11 +1530,26 @@ async def _run_antigravity_agent_hop(
     if previous_interaction_id and previous_interaction_id.startswith("v1_"):
         payload["previous_interaction_id"] = previous_interaction_id
 
-    resp = await client.post(INTERACTIONS_BASE_URL, json=payload, headers=headers)
-    if resp.status_code in (400, 404) and payload.get("previous_interaction_id"):
-        payload.pop("previous_interaction_id", None)
+    resp: Optional[httpx.Response] = None
+    for attempt in range(5):
         resp = await client.post(INTERACTIONS_BASE_URL, json=payload, headers=headers)
+        if resp.status_code in (400, 404) and payload.get("previous_interaction_id"):
+            payload.pop("previous_interaction_id", None)
+            resp = await client.post(INTERACTIONS_BASE_URL, json=payload, headers=headers)
 
+        if resp.status_code == 429 and attempt < 4:
+            wait_s = _parse_retry_after_seconds(resp, attempt)
+            waited = 0.0
+            while waited < wait_s:
+                if run_state.get("cancelled"):
+                    return {"id": None, "status": "cancelled"}
+                step = min(1.0, wait_s - waited)
+                await asyncio.sleep(step)
+                waited += step
+            continue
+        break
+
+    assert resp is not None
     if resp.status_code >= 400:
         raise ValueError(
             f"Erro na Interactions API ({underlying_model}, HTTP {resp.status_code}): {resp.text}"
@@ -1547,6 +1575,8 @@ async def _run_antigravity_agent_hop(
         if poll_resp.status_code < 400:
             data = poll_resp.json()
             status = data.get("status", "")
+        elif poll_resp.status_code == 429:
+            await asyncio.sleep(_parse_retry_after_seconds(poll_resp, 0))
         else:
             break
 
@@ -1667,6 +1697,11 @@ async def run_local_agent_turn(
                 if run_state.get("cancelled"):
                     final_status = "cancelled"
                     break
+                if hop > 0:
+                    await asyncio.sleep(1.5)
+                    if run_state.get("cancelled"):
+                        final_status = "cancelled"
+                        break
 
                 hop_data = await _run_antigravity_agent_hop(
                     client=client,
@@ -1792,8 +1827,8 @@ async def run_local_agent_turn(
                     _notify(accumulated_steps, final_output_text, "in_progress")
 
                     res_json_str = json.dumps(tool_res, ensure_ascii=False)
-                    if len(res_json_str) > 24000:
-                        res_json_str = res_json_str[:24000] + "... [truncado]"
+                    if len(res_json_str) > 10000:
+                        res_json_str = res_json_str[:10000] + "... [truncado]"
                     tool_results_feedback.append(
                         f"Resultado da ação local `{fc['name']}` executada pelo meu cliente na minha máquina (is_error={str(is_err).lower()}):\n"
                         f"```json\n{res_json_str}\n```"

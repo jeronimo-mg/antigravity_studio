@@ -659,6 +659,21 @@ async def create_interaction(
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
 
+            # Tratamento resiliente para HTTP 429 (Rate limit / TPM)
+            if resp.status_code == 429 and attempt < 4:
+                retry_after = (resp.headers.get("retry-after") or "").strip()
+                wait_s = None
+                if retry_after:
+                    try:
+                        wait_s = float(retry_after) + 1.0
+                    except ValueError:
+                        wait_s = None
+                if wait_s is None:
+                    m = re.search(r"retry in (\d+(?:\.\d+)?)s", resp.text or "", re.IGNORECASE)
+                    wait_s = (float(m.group(1)) + 1.5) if m else min(60.0, float((2 ** attempt) * 4 + 2))
+                await asyncio.sleep(max(1.0, min(90.0, wait_s)))
+                continue
+
             raise ValueError(
                 f"Erro na Interactions API (HTTP {resp.status_code}): {resp.text}"
             )
