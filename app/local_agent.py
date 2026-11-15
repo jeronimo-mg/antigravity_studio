@@ -315,6 +315,74 @@ def tool_execute_bash(
         }
 
 
+_DOCUMENT_TEXT_CACHE: Dict[Tuple[str, float, int], List[str]] = {}
+_VIEW_FILE_CHAR_BUDGET = 8000
+
+
+def _slice_lines_within_char_budget(
+    lines: List[str],
+    start_line: Optional[int],
+    end_line: Optional[int],
+    default_window: int,
+    char_budget: int = _VIEW_FILE_CHAR_BUDGET,
+) -> Dict[str, Any]:
+    total_lines = len(lines)
+    if total_lines == 0:
+        return {
+            "total_lines": 0,
+            "start_line": 1,
+            "end_line": 0,
+            "content": "",
+            "truncated": False,
+        }
+
+    s_idx = max(1, int(start_line)) if start_line is not None else 1
+    if s_idx > total_lines:
+        return {
+            "total_lines": total_lines,
+            "start_line": s_idx,
+            "end_line": total_lines,
+            "content": "",
+            "truncated": False,
+        }
+
+    req_end = min(total_lines, int(end_line)) if end_line is not None else min(total_lines, s_idx + default_window - 1)
+    if req_end < s_idx:
+        req_end = s_idx
+
+    selected: List[str] = []
+    used_chars = 0
+    actual_end = s_idx - 1
+    truncated_by_budget = False
+
+    for idx in range(s_idx, req_end + 1):
+        entry = f"{idx}: {lines[idx - 1]}"
+        add_len = len(entry) + (1 if selected else 0)
+        if selected and (used_chars + add_len > char_budget):
+            truncated_by_budget = True
+            break
+        if not selected and len(entry) > char_budget:
+            entry = entry[:char_budget] + "... [linha truncada]"
+            selected.append(entry)
+            actual_end = idx
+            truncated_by_budget = idx < req_end
+            break
+        selected.append(entry)
+        used_chars += add_len
+        actual_end = idx
+
+    res: Dict[str, Any] = {
+        "total_lines": total_lines,
+        "start_line": s_idx,
+        "end_line": actual_end,
+        "content": "\n".join(selected),
+        "truncated": truncated_by_budget,
+    }
+    if actual_end < total_lines:
+        res["next_start_line"] = actual_end + 1
+    return res
+
+
 def tool_view_file(
     file_path: str,
     start_line: Optional[int] = None,
@@ -328,27 +396,34 @@ def tool_view_file(
     if os.path.isdir(target):
         return {"error": f"O caminho é um diretório, use list_dir: {target}", "path": target}
 
-    size_bytes = os.path.getsize(target)
+    stat_res = os.stat(target)
+    size_bytes = stat_res.st_size
+    mtime = stat_res.st_mtime
     lower = target.lower()
 
     if lower.endswith((".pdf", ".odt", ".odp", ".ods", ".docx", ".pptx")):
         try:
-            with open(target, "rb") as f:
-                raw_bytes = f.read()
-            extracted = extract_text_from_document_bytes(target, raw_bytes)
-            if extracted:
-                lines = extracted.splitlines()
-                s_idx = max(1, int(start_line)) if start_line else 1
-                e_idx = min(len(lines), int(end_line)) if end_line else min(len(lines), s_idx + 499)
-                numbered = [f"{i}: {lines[i - 1]}" for i in range(s_idx, e_idx + 1)]
+            cache_key = (target, mtime, size_bytes)
+            lines = _DOCUMENT_TEXT_CACHE.get(cache_key)
+            if lines is None:
+                with open(target, "rb") as f:
+                    raw_bytes = f.read()
+                extracted = extract_text_from_document_bytes(target, raw_bytes)
+                if extracted:
+                    lines = extracted.splitlines()
+                    if len(_DOCUMENT_TEXT_CACHE) >= 8:
+                        _DOCUMENT_TEXT_CACHE.pop(next(iter(_DOCUMENT_TEXT_CACHE)))
+                    _DOCUMENT_TEXT_CACHE[cache_key] = lines
+            if lines:
+                sliced = _slice_lines_within_char_budget(lines, start_line, end_line, default_window=500)
+                note = "Texto extraído automaticamente do documento."
+                if sliced.get("truncated"):
+                    note += f" Parou na linha {sliced['end_line']} para respeitar o limite de tokens; use StartLine={sliced.get('next_start_line')} para continuar."
                 return {
                     "path": target,
                     "size_bytes": size_bytes,
-                    "total_lines": len(lines),
-                    "start_line": s_idx,
-                    "end_line": e_idx,
-                    "content": "\n".join(numbered),
-                    "note": "Texto extraído automaticamente do documento.",
+                    **sliced,
+                    "note": note,
                 }
         except Exception as exc:
             return {"error": f"Falha ao extrair texto do documento {target}: {exc}", "path": target}
@@ -359,33 +434,15 @@ def tool_view_file(
     except Exception as exc:
         return {"error": f"Erro ao ler arquivo {target}: {exc}", "path": target}
 
-    total_lines = len(all_lines)
-    if total_lines == 0:
-        return {
-            "path": target,
-            "size_bytes": size_bytes,
-            "total_lines": 0,
-            "content": "",
-        }
-
-    s_line = max(1, int(start_line)) if start_line is not None else 1
-    e_line = min(total_lines, int(end_line)) if end_line is not None else min(total_lines, s_line + 799)
-    if e_line - s_line > 800:
-        e_line = s_line + 800
-
-    selected = [f"{idx}: {all_lines[idx - 1]}" for idx in range(s_line, min(e_line, total_lines) + 1)]
-    content_out = "\n".join(selected)
-    if len(content_out) > 46080:
-        content_out = content_out[:46080] + "\n... [conteúdo truncado no limite de 46 KB]"
-
-    return {
+    sliced = _slice_lines_within_char_budget(all_lines, start_line, end_line, default_window=800)
+    res: Dict[str, Any] = {
         "path": target,
         "size_bytes": size_bytes,
-        "total_lines": total_lines,
-        "start_line": s_line,
-        "end_line": min(e_line, total_lines),
-        "content": content_out,
+        **sliced,
     }
+    if sliced.get("truncated"):
+        res["note"] = f"Parou na linha {sliced['end_line']} para respeitar o limite de tokens; use StartLine={sliced.get('next_start_line')} para continuar."
+    return res
 
 
 def tool_write_to_file(
@@ -1489,6 +1546,48 @@ def _format_local_execution_fallback_summary(accumulated_steps: List[Dict[str, A
     return "\n\n".join(lines).strip()
 
 
+def _truncate_head_tail(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    if max_chars < 200:
+        return text[:max_chars]
+    head_len = int(max_chars * 0.38)
+    tail_len = max_chars - head_len - 64
+    omitted = len(text) - head_len - tail_len
+    return f"{text[:head_len]}\n... [{omitted} caracteres omitidos] ...\n{text[-tail_len:]}"
+
+
+def _serialize_tool_result_for_feedback(tool_res: Dict[str, Any], max_chars: int = 10000) -> str:
+    raw = json.dumps(tool_res, ensure_ascii=False)
+    if len(raw) <= max_chars:
+        return raw
+
+    compact = dict(tool_res)
+    # Preserva metadados (exit_code, command, cwd, error, start_line, end_line) e aplica Head+Tail nos campos longos
+    for field, field_budget in (("stdout", 5500), ("stderr", 2200), ("content", 7800), ("output", 6000)):
+        val = compact.get(field)
+        if isinstance(val, str) and len(val) > field_budget:
+            compact[field] = _truncate_head_tail(val, field_budget)
+
+    raw_compact = json.dumps(compact, ensure_ascii=False)
+    if len(raw_compact) <= max_chars:
+        return raw_compact
+
+    # Fallback se ainda exceder (ex: listas extensas em list_dir/find_by_name/grep_search)
+    for list_field in ("matches", "entries", "files", "results"):
+        val = compact.get(list_field)
+        if isinstance(val, list) and len(val) > 40:
+            total_items = len(val)
+            compact[list_field] = val[:20] + [f"... [{total_items - 35} itens omitidos] ..."] + val[-15:]
+            compact["truncated"] = True
+
+    raw_compact = json.dumps(compact, ensure_ascii=False)
+    if len(raw_compact) <= max_chars:
+        return raw_compact
+
+    return _truncate_head_tail(raw_compact, max_chars)
+
+
 def _parse_retry_after_seconds(resp: httpx.Response, attempt: int) -> float:
     retry_after = (resp.headers.get("retry-after") or "").strip()
     if retry_after:
@@ -1826,9 +1925,7 @@ async def run_local_agent_turn(
                     })
                     _notify(accumulated_steps, final_output_text, "in_progress")
 
-                    res_json_str = json.dumps(tool_res, ensure_ascii=False)
-                    if len(res_json_str) > 10000:
-                        res_json_str = res_json_str[:10000] + "... [truncado]"
+                    res_json_str = _serialize_tool_result_for_feedback(tool_res, max_chars=10000)
                     tool_results_feedback.append(
                         f"Resultado da ação local `{fc['name']}` executada pelo meu cliente na minha máquina (is_error={str(is_err).lower()}):\n"
                         f"```json\n{res_json_str}\n```"
