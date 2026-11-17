@@ -1043,7 +1043,7 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                 agent_name=agent_name,
                 model_name=model_name,
                 environment_id=local_env_label,
-                last_interaction_id=local_turn_id,
+                last_interaction_id=prev_id or "",
                 max_total_tokens=max_tokens,
                 system_instruction=sys_inst,
             )
@@ -1099,9 +1099,11 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
                     raw=final_res,
                     created_at=created_ts,
                 )
+                cand_api_id = str(final_res.get("_api_interaction_id") or "").strip()
+                has_valid_output = bool(str(fin_out or "").strip())
                 next_valid_last = (
-                    final_res.get("_api_interaction_id") or local_turn_id
-                    if fin_status not in ("failed", "cancelled")
+                    cand_api_id
+                    if (fin_status not in ("failed", "cancelled") and has_valid_output and cand_api_id.startswith("v1_"))
                     else (prev_id or "")
                 )
                 latest_sess = get_session(session_id) or session
@@ -1161,9 +1163,11 @@ async def api_send_message(session_id: str, body: SendMessageRequest) -> Dict[st
             raw=local_res,
             created_at=local_res.get("created") or created_ts,
         )
+        cand_api_id = str(local_res.get("_api_interaction_id") or "").strip()
+        has_valid_output = bool(str(fin_out or "").strip())
         next_valid_last = (
-            local_res.get("_api_interaction_id") or local_turn_id
-            if fin_status not in ("failed", "cancelled")
+            cand_api_id
+            if (fin_status not in ("failed", "cancelled") and has_valid_output and cand_api_id.startswith("v1_"))
             else (prev_id or "")
         )
         latest_sess = get_session(session_id) or session

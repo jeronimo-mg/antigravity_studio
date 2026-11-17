@@ -1420,7 +1420,24 @@ def _parse_tool_call_json_payload(raw_inner: str) -> List[Dict[str, Any]]:
     try:
         parsed = json.loads(cleaned)
     except Exception:
-        return []
+        def _fix_invalid_escape(m: re.Match[str]) -> str:
+            tok = m.group(0)
+            if tok == "\\'":
+                return "'"
+            if tok.startswith("\\x") and len(tok) == 4:
+                ch = chr(int(tok[2:], 16))
+                if ch == '"':
+                    return '\\"'
+                if ch == "\\":
+                    return "\\\\"
+                return ch
+            return tok
+
+        sanitized = re.sub(r"\\x[0-9a-fA-F]{2}|\\.", _fix_invalid_escape, cleaned)
+        try:
+            parsed = json.loads(sanitized)
+        except Exception:
+            return []
     items = parsed if isinstance(parsed, list) else [parsed]
     extracted: List[Dict[str, Any]] = []
     for item in items:
@@ -1608,6 +1625,7 @@ async def _run_antigravity_agent_hop(
     hop_input: str,
     previous_interaction_id: Optional[str],
     run_state: Dict[str, Any],
+    fallback_hop_input: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Executa um turno (hop) usando o agente `antigravity-preview-09-2026`
@@ -1634,6 +1652,8 @@ async def _run_antigravity_agent_hop(
         resp = await client.post(INTERACTIONS_BASE_URL, json=payload, headers=headers)
         if resp.status_code in (400, 404) and payload.get("previous_interaction_id"):
             payload.pop("previous_interaction_id", None)
+            if fallback_hop_input:
+                payload["input"] = fallback_hop_input
             resp = await client.post(INTERACTIONS_BASE_URL, json=payload, headers=headers)
 
         if resp.status_code == 429 and attempt < 4:
@@ -1677,7 +1697,11 @@ async def _run_antigravity_agent_hop(
         elif poll_resp.status_code == 429:
             await asyncio.sleep(_parse_retry_after_seconds(poll_resp, 0))
         else:
+            data["_polling_failed"] = True
             break
+
+    if status == "in_progress" and poll_count >= 150:
+        data["_polling_failed"] = True
 
     return data
 
@@ -1763,7 +1787,7 @@ async def run_local_agent_turn(
     can_chain_prev_id = clean_prev.startswith("v1_")
 
     history_block = ""
-    if not can_chain_prev_id and history_turns:
+    if history_turns:
         hist_snippets: List[str] = []
         for t in history_turns[-6:]:
             if t.get("status") in ("completed", "incomplete"):
@@ -1778,6 +1802,11 @@ async def run_local_agent_turn(
 
     initial_hop_input = (
         f"{sys_inst}"
+        f"{'' if can_chain_prev_id else history_block}\n\n"
+        f"Pedido para executar na minha máquina local:\n{prompt}"
+    )
+    fallback_initial_hop_input = (
+        f"{sys_inst}"
         f"{history_block}\n\n"
         f"Pedido para executar na minha máquina local:\n{prompt}"
     )
@@ -1786,6 +1815,7 @@ async def run_local_agent_turn(
     underlying_model = normalize_antigravity_model(model_name)
     executed_any_local_tool = False
     extracted_agent_title: Optional[str] = None
+    empty_output_retries = 0
 
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
@@ -1802,6 +1832,16 @@ async def run_local_agent_turn(
                         final_status = "cancelled"
                         break
 
+                hop_fallback_input = (
+                    fallback_initial_hop_input
+                    if hop == 0
+                    else (
+                        f"{sys_inst}{history_block}\n\n"
+                        f"Pedido original:\n{prompt}\n\n"
+                        f"{current_hop_input}"
+                    )
+                )
+
                 hop_data = await _run_antigravity_agent_hop(
                     client=client,
                     headers=headers,
@@ -1809,11 +1849,18 @@ async def run_local_agent_turn(
                     hop_input=current_hop_input,
                     previous_interaction_id=current_prev_id,
                     run_state=run_state,
+                    fallback_hop_input=hop_fallback_input,
                 )
 
-                if hop_data.get("id"):
-                    final_api_id = str(hop_data["id"])
-                    current_prev_id = final_api_id
+                hop_raw_id = str(hop_data.get("id") or "").strip()
+                hop_raw_status = str(hop_data.get("status") or "").strip()
+                if (
+                    hop_raw_id.startswith("v1_")
+                    and hop_raw_status not in ("failed", "cancelled")
+                    and not hop_data.get("_polling_failed")
+                ):
+                    final_api_id = hop_raw_id
+                    current_prev_id = hop_raw_id
 
                 _sum_usage_dicts(accumulated_usage, hop_data.get("usage") or {})
 
@@ -1861,9 +1908,9 @@ async def run_local_agent_turn(
                     allow_shell_fallback=(hop == 0 and not executed_any_local_tool),
                 )
 
-                # Caso o modelo tenha chamado alguma tool interna no 1º hop em vez de ```json:local-action,
+                # Caso o modelo tenha chamado alguma tool interna em vez de ```json:local-action,
                 # interceptamos os argumentos dessas function_calls e as executamos na máquina local do usuário
-                if not local_calls and hop == 0:
+                if not local_calls:
                     internal_fcs = _extract_function_calls_from_steps(hop_steps)
                     if internal_fcs:
                         local_calls = internal_fcs
@@ -1877,13 +1924,39 @@ async def run_local_agent_turn(
                         candidate_final = _strip_sandbox_refusal_disclaimers(candidate_final)
                         if not candidate_final.strip():
                             candidate_final = _format_local_execution_fallback_summary(accumulated_steps)
-                    final_output_text = candidate_final
-                    if final_output_text:
+
+                    if not candidate_final.strip():
+                        if (
+                            empty_output_retries < 1
+                            and hop + 1 < max_iterations
+                            and not hop_data.get("_polling_failed")
+                            and hop_raw_status not in ("failed", "cancelled")
+                        ):
+                            empty_output_retries += 1
+                            current_hop_input = (
+                                "Sua resposta anterior veio sem conteúdo textual final. "
+                                "Por favor, responda diretamente ao meu último pedido "
+                                f"ou emita o bloco ```json:local-action correspondente.\n\nPedido:\n{prompt}"
+                            )
+                            continue
+                        final_status = "failed"
+                        final_output_text = (
+                            f"❌ O modelo ({underlying_model}) retornou resposta vazia neste turno "
+                            f"(status={hop_raw_status or 'unknown'}). O histórico anterior foi preservado."
+                        )
                         accumulated_steps.append({
                             "type": "model_output",
                             "content": [{"type": "text", "text": final_output_text}],
                         })
-                    final_status = hop_data.get("status") or "completed"
+                        _notify(accumulated_steps, final_output_text, final_status)
+                        break
+
+                    final_output_text = candidate_final
+                    accumulated_steps.append({
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": final_output_text}],
+                    })
+                    final_status = hop_raw_status or "completed"
                     if final_status in ("requires_action", "in_progress"):
                         final_status = "completed"
                     _notify(accumulated_steps, final_output_text, final_status)
