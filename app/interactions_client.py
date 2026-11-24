@@ -4,9 +4,11 @@ import mimetypes
 import os
 import re
 import tarfile
+import time
 import xml.etree.ElementTree as ET
 import zipfile
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 import httpx
 
 from .database import find_turn_by_interaction_id, get_setting
@@ -20,6 +22,38 @@ INTERACTIONS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/intera
 ENVIRONMENTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/environments"
 ENVIRONMENTS_UPLOAD_BASE_URL = "https://generativelanguage.googleapis.com/upload/v1beta/environments"
 FILES_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/files"
+
+_RPM_WINDOW_SECONDS = 62.0
+_RPM_TIMESTAMPS: Deque[float] = deque()
+_RPM_LOCK: Optional[asyncio.Lock] = None
+
+
+def _get_configured_max_rpm() -> int:
+    raw = (os.environ.get("ANTIGRAVITY_MAX_RPM", "4") or "4").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 4
+
+
+async def _enforce_rpm_limit() -> None:
+    """Limita o envio de novas interações para não ultrapassar o teto de RPM (padrão: 4 RPM, abaixo de 5 RPM)."""
+    global _RPM_LOCK
+    max_rpm = _get_configured_max_rpm()
+    if max_rpm <= 0:
+        return
+    if _RPM_LOCK is None:
+        _RPM_LOCK = asyncio.Lock()
+    async with _RPM_LOCK:
+        while True:
+            now = time.monotonic()
+            while _RPM_TIMESTAMPS and (now - _RPM_TIMESTAMPS[0]) >= _RPM_WINDOW_SECONDS:
+                _RPM_TIMESTAMPS.popleft()
+            if len(_RPM_TIMESTAMPS) < max_rpm:
+                _RPM_TIMESTAMPS.append(now)
+                return
+            wait_s = (_RPM_WINDOW_SECONDS - (now - _RPM_TIMESTAMPS[0])) + 0.15
+            await asyncio.sleep(max(0.2, wait_s))
 
 
 
@@ -590,6 +624,7 @@ async def create_interaction(
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         for attempt in range(5):
+            await _enforce_rpm_limit()
             try:
                 resp = await client.post(
                     INTERACTIONS_BASE_URL,

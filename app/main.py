@@ -1454,6 +1454,7 @@ async def api_poll_turn(
     )
 
     if should_retry_prev or should_retry_env:
+        await asyncio.sleep(15.0)
         history_lines: List[str] = []
         for t in turns:
             if t.get("interaction_id") != interaction_id and t.get("status") in ("completed", "incomplete"):
