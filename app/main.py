@@ -1430,15 +1430,30 @@ async def api_poll_turn(
     existing_raw = (existing_turn.get("raw") or {}) if existing_turn else {}
     was_user_cancelled = bool(existing_raw.get("_user_cancelled"))
     already_auto_retried = bool(existing_raw.get("_auto_retried_from"))
+    already_env_retried = bool(existing_raw.get("_auto_retried_env_from"))
+    clean_env = clean_environment_id(returned_env_id)
 
-    if (
+    should_retry_prev = (
         turn_status in ("failed", "cancelled")
         and not (out_text or "").strip()
         and not was_user_cancelled
         and not already_auto_retried
-        and prev_id_of_turn
-        and (u_text or "").strip()
-    ):
+        and bool(prev_id_of_turn)
+        and bool((u_text or "").strip())
+    )
+
+    should_retry_env = (
+        not should_retry_prev
+        and turn_status in ("failed", "cancelled")
+        and not (out_text or "").strip()
+        and not was_user_cancelled
+        and not already_env_retried
+        and bool(clean_env)
+        and session.get("mode", "agent") == "agent"
+        and bool((u_text or "").strip())
+    )
+
+    if should_retry_prev or should_retry_env:
         history_lines: List[str] = []
         for t in turns:
             if t.get("interaction_id") != interaction_id and t.get("status") in ("completed", "incomplete"):
@@ -1453,15 +1468,38 @@ async def api_poll_turn(
             if fallback_history_text
             else u_text
         )
-        clean_env = clean_environment_id(returned_env_id)
         uploaded_files = session.get("uploaded_files", []) or _find_uploaded_files_for_environment(clean_env)
+
+        target_env = clean_env
+        cloned_from_env = ""
+        dropped_env = ""
+        if should_retry_env:
+            # Tenta resgatar os arquivos do sandbox anterior clonando via from_environment;
+            # se o ambiente antigo já tiver expirado/corrompido na nuvem, cria um ambiente "remote" limpo.
+            target_env = ""
+            try:
+                cloned_env_resp = await create_remote_environment(
+                    from_environment=clean_env,
+                    api_key=api_key,
+                )
+                cloned_id = clean_environment_id(
+                    cloned_env_resp.get("name") or cloned_env_resp.get("id") or ""
+                )
+                if cloned_id and cloned_id != clean_env:
+                    target_env = cloned_id
+                    cloned_from_env = clean_env
+            except Exception:
+                target_env = ""
+            if not target_env:
+                dropped_env = clean_env
+
         recovery_payload = build_create_payload(
             prompt=recovery_prompt,
             mode=session.get("mode", "agent"),
             agent_name=session.get("agent_name", "antigravity-preview-09-2026"),
             model_name=session.get("model_name", "gemini-4-argon"),
             previous_interaction_id="",
-            environment_id=clean_env,
+            environment_id=target_env,
             max_total_tokens=session.get("max_total_tokens", 0),
             system_instruction=session.get("system_instruction", ""),
             background=True,
@@ -1478,10 +1516,19 @@ async def api_poll_turn(
             )
             new_id = retry_resp.get("id", "")
             if new_id and new_id != interaction_id:
-                retry_resp["_auto_retried_from"] = interaction_id
+                if should_retry_prev:
+                    retry_resp["_auto_retried_from"] = interaction_id
+                else:
+                    if existing_raw.get("_auto_retried_from"):
+                        retry_resp["_auto_retried_from"] = existing_raw["_auto_retried_from"]
+                    retry_resp["_auto_retried_env_from"] = interaction_id
+                    if cloned_from_env:
+                        retry_resp["_cloned_from_environment_id"] = cloned_from_env
+                    if dropped_env:
+                        retry_resp["_dropped_environment_id"] = dropped_env
                 retry_resp["_dropped_previous_interaction_id"] = True
                 _, retry_out = extract_texts_from_interaction(retry_resp, fallback_user_input=u_text)
-                fallback_retry_env = "" if retry_resp.get("_dropped_environment_id") else clean_env
+                fallback_retry_env = "" if (retry_resp.get("_dropped_environment_id") or dropped_env) else target_env
                 retry_env = clean_environment_id(retry_resp.get("environment_id") or fallback_retry_env)
                 retry_status = retry_resp.get("status", "in_progress")
                 delete_turn(session_id, interaction_id)
@@ -1517,6 +1564,8 @@ async def api_poll_turn(
         interaction_resp["_user_cancelled"] = True
     if existing_raw.get("_auto_retried_from"):
         interaction_resp["_auto_retried_from"] = existing_raw["_auto_retried_from"]
+    if existing_raw.get("_auto_retried_env_from"):
+        interaction_resp["_auto_retried_env_from"] = existing_raw["_auto_retried_env_from"]
 
     upsert_turn(
         session_id=session_id,
