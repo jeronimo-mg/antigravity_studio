@@ -25,7 +25,9 @@ FILES_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/files"
 
 _RPM_WINDOW_SECONDS = 62.0
 _RPM_TIMESTAMPS: Deque[float] = deque()
-_RPM_LOCK: Optional[asyncio.Lock] = None
+_TPM_EVENTS: Deque[Tuple[float, int]] = deque()
+_RECORDED_USAGE_IDS: set[str] = set()
+_RATE_LIMIT_LOCK: Optional[asyncio.Lock] = None
 
 
 def _get_configured_max_rpm() -> int:
@@ -36,23 +38,85 @@ def _get_configured_max_rpm() -> int:
         return 4
 
 
-async def _enforce_rpm_limit() -> None:
-    """Limita o envio de novas interações para não ultrapassar o teto de RPM (padrão: 4 RPM, abaixo de 5 RPM)."""
-    global _RPM_LOCK
-    max_rpm = _get_configured_max_rpm()
-    if max_rpm <= 0:
+def _get_configured_max_tpm() -> int:
+    raw = (os.environ.get("ANTIGRAVITY_MAX_TPM", "80000") or "80000").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 80000
+
+
+def _estimate_payload_tokens(payload: Dict[str, Any]) -> int:
+    total_chars = 0
+    raw_input = payload.get("input")
+    if isinstance(raw_input, str):
+        total_chars += len(raw_input)
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if isinstance(item, dict):
+                total_chars += len(str(item.get("text", "")))
+                for c in item.get("content", []) or []:
+                    if isinstance(c, dict):
+                        total_chars += len(str(c.get("text", "")))
+    sys_inst = payload.get("system_instruction")
+    if isinstance(sys_inst, str):
+        total_chars += len(sys_inst)
+    return max(1, total_chars // 4)
+
+
+def record_token_usage(usage: Optional[Dict[str, Any]], interaction_id: Optional[str] = None) -> None:
+    """Registra tokens reais consumidos (usage) na janela deslizante de TPM."""
+    if not isinstance(usage, dict) or not usage:
         return
-    if _RPM_LOCK is None:
-        _RPM_LOCK = asyncio.Lock()
-    async with _RPM_LOCK:
+    if interaction_id:
+        if interaction_id in _RECORDED_USAGE_IDS:
+            return
+        _RECORDED_USAGE_IDS.add(interaction_id)
+        if len(_RECORDED_USAGE_IDS) > 500:
+            _RECORDED_USAGE_IDS.clear()
+    tokens = int(usage.get("total_input_tokens") or usage.get("total_tokens") or 0)
+    if tokens > 0:
+        _TPM_EVENTS.append((time.monotonic(), tokens))
+
+
+async def _enforce_rate_limits(estimated_tokens: int = 0) -> None:
+    """Limita RPM (padrão: 4) e TPM (padrão: 80.000) em janela deslizante de 62s."""
+    global _RATE_LIMIT_LOCK
+    max_rpm = _get_configured_max_rpm()
+    max_tpm = _get_configured_max_tpm()
+    if max_rpm <= 0 and max_tpm <= 0:
+        return
+    if _RATE_LIMIT_LOCK is None:
+        _RATE_LIMIT_LOCK = asyncio.Lock()
+    async with _RATE_LIMIT_LOCK:
         while True:
             now = time.monotonic()
             while _RPM_TIMESTAMPS and (now - _RPM_TIMESTAMPS[0]) >= _RPM_WINDOW_SECONDS:
                 _RPM_TIMESTAMPS.popleft()
-            if len(_RPM_TIMESTAMPS) < max_rpm:
+            while _TPM_EVENTS and (now - _TPM_EVENTS[0][0]) >= _RPM_WINDOW_SECONDS:
+                _TPM_EVENTS.popleft()
+
+            rpm_ok = max_rpm <= 0 or len(_RPM_TIMESTAMPS) < max_rpm
+            current_tpm = sum(tok for _, tok in _TPM_EVENTS)
+            # Se a fila de TPM estiver vazia, permite enviar mesmo que 1 prompt único seja grande (evita deadlock)
+            tpm_ok = (
+                max_tpm <= 0
+                or not _TPM_EVENTS
+                or (current_tpm + max(0, estimated_tokens)) <= max_tpm
+            )
+
+            if rpm_ok and tpm_ok:
                 _RPM_TIMESTAMPS.append(now)
+                if estimated_tokens > 0:
+                    _TPM_EVENTS.append((now, estimated_tokens))
                 return
-            wait_s = (_RPM_WINDOW_SECONDS - (now - _RPM_TIMESTAMPS[0])) + 0.15
+
+            wait_candidates = []
+            if not rpm_ok and _RPM_TIMESTAMPS:
+                wait_candidates.append((_RPM_WINDOW_SECONDS - (now - _RPM_TIMESTAMPS[0])) + 0.15)
+            if not tpm_ok and _TPM_EVENTS:
+                wait_candidates.append((_RPM_WINDOW_SECONDS - (now - _TPM_EVENTS[0][0])) + 0.15)
+            wait_s = max(wait_candidates) if wait_candidates else 1.0
             await asyncio.sleep(max(0.2, wait_s))
 
 
@@ -342,7 +406,10 @@ async def get_interaction(
                 raise ValueError(
                     f"Erro ao buscar interação '{interaction_id}' (HTTP {resp.status_code}): {resp.text}"
                 )
-            return resp.json()
+            data = resp.json()
+            if isinstance(data, dict) and data.get("status") != "in_progress":
+                record_token_usage(data.get("usage"), interaction_id=data.get("id") or interaction_id)
+            return data
         raise ValueError(f"Erro inesperado ao buscar interação '{interaction_id}'.")
 
 
@@ -624,7 +691,7 @@ async def create_interaction(
 
     async with httpx.AsyncClient(timeout=300.0) as client:
         for attempt in range(5):
-            await _enforce_rpm_limit()
+            await _enforce_rate_limits(_estimate_payload_tokens(current_payload))
             try:
                 resp = await client.post(
                     INTERACTIONS_BASE_URL,
@@ -645,6 +712,7 @@ async def create_interaction(
             if resp.status_code < 400:
                 data = resp.json()
                 if isinstance(data, dict):
+                    record_token_usage(data.get("usage"), interaction_id=data.get("id"))
                     if dropped_prev_id:
                         data["_dropped_previous_interaction_id"] = dropped_prev_id
                     if dropped_env_id:
