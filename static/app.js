@@ -1015,6 +1015,40 @@ function renderSingleTurnCard(turn, turnNumber) {
     `
       : "";
 
+  const rawObj = turn.raw && typeof turn.raw === "object" ? turn.raw : {};
+  const rawErrors = Array.isArray(rawObj.errors)
+    ? rawObj.errors
+    : rawObj.error
+    ? [rawObj.error]
+    : [];
+  const apiErrorItems = rawErrors
+    .map((err) => {
+      if (typeof err === "string") return escapeHtml(err);
+      if (err && typeof err === "object") {
+        const code = err.code ? `<strong>[${escapeHtml(String(err.code))}]</strong> ` : "";
+        const msg = escapeHtml(String(err.message || err.detail || JSON.stringify(err)));
+        return `${code}${msg}`;
+      }
+      return "";
+    })
+    .filter(Boolean);
+
+  const apiErrorBanner =
+    apiErrorItems.length > 0
+      ? `
+      <div class="mt-3 p-3 rounded-xl bg-red-500/15 border border-red-500/40 text-xs text-red-200 space-y-1">
+        <div class="font-semibold text-red-300">❌ Erro retornado pela API do Google:</div>
+        ${apiErrorItems.map((item) => `<div>${item}</div>`).join("")}
+      </div>
+    `
+      : (status === "failed" || status === "cancelled") && !turn.output_text && !rawObj._user_cancelled
+      ? `
+      <div class="mt-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200">
+        ⚠️ A API encerrou este turno com status <code>${escapeHtml(status)}</code> sem detalhar o motivo no JSON (comum quando há esgotamento de cota/capacidade no servidor, como <code>RESOURCE_EXHAUSTED</code>, ou indisponibilidade momentânea).
+      </div>
+    `
+      : "";
+
   const promptDateTimeStr = formatDateTimePtBr(turn.created_at);
 
   return `
@@ -1096,6 +1130,7 @@ function renderSingleTurnCard(turn, turnNumber) {
           <div class="text-[11px] font-semibold uppercase tracking-wider text-emerald-300 mb-2">🤖 Resposta do Antigravity / Gemini</div>
           <div class="prose-studio text-sm text-gray-100 leading-relaxed overflow-x-auto">${renderedOutput}</div>
           ${incompleteBanner}
+          ${apiErrorBanner}
           ${inProgressBanner}
         </div>
       </div>

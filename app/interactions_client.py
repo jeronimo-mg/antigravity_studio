@@ -818,6 +818,18 @@ def format_session_as_markdown(session: Dict[str, Any]) -> str:
 
         out_text = turn.get("output_text") or "(Sem resposta final textual)"
         lines.append(f"### 🤖 Antigravity / Gemini\n\n{out_text}\n")
+        raw_turn = turn.get("raw") if isinstance(turn.get("raw"), dict) else {}
+        raw_errs = raw_turn.get("errors") or ([raw_turn["error"]] if raw_turn.get("error") else [])
+        if isinstance(raw_errs, list) and raw_errs:
+            lines.append("**Erros da API:**")
+            for err in raw_errs:
+                if isinstance(err, dict):
+                    code = err.get("code", "")
+                    msg = err.get("message") or err.get("detail") or str(err)
+                    lines.append(f"- `{code}`: {msg}" if code else f"- {msg}")
+                else:
+                    lines.append(f"- {err}")
+            lines.append("")
         lines.append("---\n")
 
     return "\n".join(lines)
