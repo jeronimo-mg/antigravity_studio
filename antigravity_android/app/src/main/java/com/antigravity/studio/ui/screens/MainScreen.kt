@@ -126,6 +126,7 @@ fun MainScreen(viewModel: StudioViewModel) {
     var showImportDialog by remember { mutableStateOf(false) }
     var showRunSettings by remember { mutableStateOf(false) }
     var showSandboxSheet by remember { mutableStateOf(false) }
+    var sandboxInitialTab by remember { mutableStateOf(0) }
     var showCodeDialog by remember { mutableStateOf(false) }
 
     val activeSession = uiState.activeSession
@@ -429,7 +430,10 @@ fun MainScreen(viewModel: StudioViewModel) {
                         }
                     },
                     actions = {
-                        IconButton(onClick = { showSandboxSheet = true }) {
+                        IconButton(onClick = {
+                            sandboxInitialTab = 0
+                            showSandboxSheet = true
+                        }) {
                             Icon(
                                 Icons.Default.FolderOpen,
                                 contentDescription = "Ambiente Sandbox & Arquivos",
@@ -760,11 +764,16 @@ fun MainScreen(viewModel: StudioViewModel) {
     if (showSandboxSheet && activeSession != null) {
         SandboxManagerSheet(
             session = activeSession,
+            allSessions = uiState.sessions,
             isUploading = uiState.isUploading,
             isListingFiles = uiState.isListingFiles,
             isDownloadingSnapshot = uiState.isDownloadingSnapshot,
             envCurrentPath = uiState.envCurrentPath,
             envFiles = uiState.envFiles,
+            remoteEnvironments = uiState.remoteEnvironments,
+            isLoadingEnvironments = uiState.isLoadingEnvironments,
+            isDeletingEnvironments = uiState.isDeletingEnvironments,
+            initialTab = sandboxInitialTab,
             onDismiss = { showSandboxSheet = false },
             onProvisionEnvironment = { viewModel.provisionEnvironmentForActiveSession() },
             onUploadFiles = { uris, target, overwrite, extract, packTar, resumable ->
@@ -790,7 +799,10 @@ fun MainScreen(viewModel: StudioViewModel) {
             onListFiles = { path -> viewModel.loadEnvironmentFiles(path) },
             onDownloadFileOrSnapshot = { path ->
                 viewModel.downloadAndShareEnvironmentFileOrSnapshot(context, path)
-            }
+            },
+            onLoadRemoteEnvironments = { viewModel.loadRemoteEnvironments() },
+            onDeleteRemoteEnvironments = { ids -> viewModel.deleteRemoteEnvironments(ids) },
+            onUseRemoteEnvironment = { envId -> viewModel.useRemoteEnvironmentForActiveSession(envId) }
         )
     }
 

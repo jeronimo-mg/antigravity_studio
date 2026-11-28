@@ -2792,3 +2792,227 @@ async function runDirectLocalBash() {
 
 
 
+
+
+// =========================================================================
+// GERENCIADOR DE ENVIRONMENTS NA NUVEM (QUOTA)
+// =========================================================================
+let _remoteEnvironmentsCache = [];
+let _selectedRemoteEnvIds = new Set();
+
+function _formatEnvBytes(bytes) {
+  const b = Number(bytes || 0);
+  if (b <= 0) return "0 B";
+  const kb = 1024;
+  const mb = kb * 1024;
+  const gb = mb * 1024;
+  if (b >= gb) return `${(b / gb).toFixed(2)} GB`;
+  if (b >= mb) return `${(b / mb).toFixed(2)} MB`;
+  if (b >= kb) return `${(b / kb).toFixed(1)} KB`;
+  return `${b} B`;
+}
+
+function openEnvironmentsModal() {
+  const modal = document.getElementById("environmentsModal");
+  if (!modal) return;
+  modal.classList.remove("hidden");
+  modal.classList.add("flex");
+  refreshEnvironmentsManager();
+}
+
+function closeEnvironmentsModal() {
+  const modal = document.getElementById("environmentsModal");
+  if (!modal) return;
+  modal.classList.add("hidden");
+  modal.classList.remove("flex");
+}
+
+function _updateBulkDeleteEnvButton() {
+  const btn = document.getElementById("bulkDeleteEnvsBtn");
+  if (!btn) return;
+  const count = _selectedRemoteEnvIds.size;
+  if (count > 0) {
+    let totalBytes = 0;
+    for (const env of _remoteEnvironmentsCache) {
+      if (_selectedRemoteEnvIds.has(env.id)) {
+        totalBytes += Number(env.size_bytes || 0);
+      }
+    }
+    btn.classList.remove("hidden");
+    btn.textContent = `🗑️ Excluir Selecionados (${count} • ${_formatEnvBytes(totalBytes)})`;
+  } else {
+    btn.classList.add("hidden");
+  }
+}
+
+function toggleRemoteEnvSelection(envId, checked) {
+  if (checked) {
+    _selectedRemoteEnvIds.add(envId);
+  } else {
+    _selectedRemoteEnvIds.delete(envId);
+  }
+  _updateBulkDeleteEnvButton();
+}
+
+function selectEnvironmentsPreset(preset) {
+  const activeEnv = (document.getElementById("environmentIdInput")?.value || "").trim().replace(/^environments\//, "");
+  _selectedRemoteEnvIds.clear();
+  if (preset === "empty") {
+    for (const env of _remoteEnvironmentsCache) {
+      if (Number(env.size_bytes || 0) === 0 && env.id !== activeEnv) {
+        _selectedRemoteEnvIds.add(env.id);
+      }
+    }
+  } else if (preset === "unlinked") {
+    for (const env of _remoteEnvironmentsCache) {
+      if (!env.linked_sessions || env.linked_sessions.length === 0) {
+        _selectedRemoteEnvIds.add(env.id);
+      }
+    }
+  } else if (preset === "all_except_current") {
+    for (const env of _remoteEnvironmentsCache) {
+      if (env.id !== activeEnv) {
+        _selectedRemoteEnvIds.add(env.id);
+      }
+    }
+  }
+  renderRemoteEnvironmentsList();
+}
+
+function renderRemoteEnvironmentsList() {
+  const listBox = document.getElementById("envManagerListBox");
+  const summaryEl = document.getElementById("envManagerSummary");
+  if (!listBox) return;
+
+  const activeEnv = (document.getElementById("environmentIdInput")?.value || "").trim().replace(/^environments\//, "");
+  const totalBytes = _remoteEnvironmentsCache.reduce((acc, e) => acc + Number(e.size_bytes || 0), 0);
+  if (summaryEl) {
+    summaryEl.textContent = `${_remoteEnvironmentsCache.length} environment(s) • ${_formatEnvBytes(totalBytes)}`;
+  }
+
+  if (!_remoteEnvironmentsCache.length) {
+    listBox.innerHTML = `<div class="text-gray-400 py-4 text-center">Nenhum environment encontrado na nuvem para esta API Key.</div>`;
+    _updateBulkDeleteEnvButton();
+    return;
+  }
+
+  listBox.innerHTML = _remoteEnvironmentsCache.map((env) => {
+    const isChecked = _selectedRemoteEnvIds.has(env.id);
+    const isCurrent = activeEnv && env.id === activeEnv;
+    const linked = env.linked_sessions || [];
+    const badge = isCurrent
+      ? `<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-semibold">Atual</span>`
+      : (linked.length > 0
+          ? `<span class="px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 text-[10px] font-semibold">Em uso (${linked.length})</span>`
+          : "");
+    const safeId = escapeHtml(env.id);
+    const dateTxt = escapeHtml(env.last_accessed || env.created || "");
+    const srcTxt = escapeHtml(env.sources_summary || "");
+    return `
+      <div class="flex items-center gap-3 bg-studio-bg border border-studio-border rounded-xl p-3">
+        <input type="checkbox" class="accent-red-500 rounded" ${isChecked ? "checked" : ""} onchange="toggleRemoteEnvSelection('${safeId}', this.checked)" />
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="font-mono text-xs ${isCurrent ? "text-emerald-300" : "text-white"} truncate">${safeId}</span>
+            ${badge}
+          </div>
+          <div class="text-[11px] text-gray-400 mt-0.5">
+            ${_formatEnvBytes(env.size_bytes)} • ${env.file_count || 0} arq. • ${escapeHtml(env.status || "active")}
+            ${dateTxt ? ` • Acesso: ${dateTxt}` : ""}
+          </div>
+          ${srcTxt ? `<div class="text-[10px] text-sky-300 truncate mt-0.5">${srcTxt}</div>` : ""}
+        </div>
+        <div class="flex items-center gap-1.5 shrink-0">
+          ${!isCurrent ? `<button onclick="useRemoteEnvironmentForCurrentSession('${safeId}')" class="px-2 py-1 rounded bg-studio-card hover:bg-gray-800 border border-studio-border text-[11px] text-sky-300">Usar</button>` : ""}
+          <button onclick="deleteSingleRemoteEnvironment('${safeId}')" class="px-2 py-1 rounded bg-red-600/20 hover:bg-red-600/40 border border-red-500/40 text-[11px] text-red-300">Excluir</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  _updateBulkDeleteEnvButton();
+}
+
+async function refreshEnvironmentsManager() {
+  const errBox = document.getElementById("envManagerErrorBox");
+  const listBox = document.getElementById("envManagerListBox");
+  const summaryEl = document.getElementById("envManagerSummary");
+  if (errBox) {
+    errBox.classList.add("hidden");
+    errBox.textContent = "";
+  }
+  if (summaryEl) summaryEl.textContent = "Carregando environments da nuvem...";
+  if (listBox) listBox.innerHTML = `<div class="text-gray-400 py-4 text-center">Consultando Environments API...</div>`;
+
+  try {
+    const apiKey = typeof getActiveApiKey === "function" ? getActiveApiKey() : "";
+    const qs = apiKey ? `?api_key=${encodeURIComponent(apiKey)}` : "";
+    const data = await apiFetch(`/api/environments${qs}`);
+    _remoteEnvironmentsCache = data.environments || [];
+    const validIds = new Set(_remoteEnvironmentsCache.map((e) => e.id));
+    _selectedRemoteEnvIds = new Set([..._selectedRemoteEnvIds].filter((id) => validIds.has(id)));
+    renderRemoteEnvironmentsList();
+  } catch (err) {
+    if (errBox) {
+      errBox.textContent = `❌ ${err.message}`;
+      errBox.classList.remove("hidden");
+    }
+    if (listBox) listBox.innerHTML = "";
+  }
+}
+
+async function deleteSingleRemoteEnvironment(envId) {
+  const env = _remoteEnvironmentsCache.find((e) => e.id === envId);
+  const sizeTxt = env ? ` (${_formatEnvBytes(env.size_bytes)})` : "";
+  if (!confirm(`Excluir permanentemente o environment ${envId}${sizeTxt}?`)) return;
+  await _executeBulkDeleteEnvironments([envId]);
+}
+
+async function deleteSelectedEnvironments() {
+  const ids = [..._selectedRemoteEnvIds];
+  if (!ids.length) return;
+  if (!confirm(`Excluir permanentemente ${ids.length} environment(s) selecionado(s)? Esta ação não pode ser desfeita.`)) return;
+  await _executeBulkDeleteEnvironments(ids);
+}
+
+async function _executeBulkDeleteEnvironments(ids) {
+  const errBox = document.getElementById("envManagerErrorBox");
+  if (errBox) {
+    errBox.classList.add("hidden");
+    errBox.textContent = "";
+  }
+  try {
+    const apiKey = typeof getActiveApiKey === "function" ? getActiveApiKey() : "";
+    const res = await apiFetch("/api/environments/bulk-delete", {
+      method: "POST",
+      body: JSON.stringify({ environment_ids: ids, api_key: apiKey || undefined }),
+    });
+    for (const did of (res.deleted_ids || [])) {
+      _selectedRemoteEnvIds.delete(did);
+    }
+    if (res.errors && res.errors.length && errBox) {
+      errBox.textContent = `⚠️ ${res.deleted_count} excluído(s), ${res.errors.length} falha(s): ${res.errors[0].error}`;
+      errBox.classList.remove("hidden");
+    }
+    await refreshEnvironmentsManager();
+    if (typeof loadSessions === "function") {
+      await loadSessions();
+    }
+  } catch (err) {
+    if (errBox) {
+      errBox.textContent = `❌ ${err.message}`;
+      errBox.classList.remove("hidden");
+    }
+  }
+}
+
+async function useRemoteEnvironmentForCurrentSession(envId) {
+  const input = document.getElementById("environmentIdInput");
+  if (input) {
+    input.value = envId;
+    if (typeof saveSessionSettings === "function") {
+      await saveSessionSettings();
+    }
+  }
+  renderRemoteEnvironmentsList();
+}

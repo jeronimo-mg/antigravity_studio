@@ -2,6 +2,7 @@ package com.antigravity.studio.data.remote
 
 import android.webkit.MimeTypeMap
 import com.antigravity.studio.data.model.EnvFileEntry
+import com.antigravity.studio.data.model.RemoteEnvironmentInfo
 import com.antigravity.studio.data.model.SessionModel
 import com.antigravity.studio.data.model.SourceItem
 import com.antigravity.studio.data.model.UploadedFileRecord
@@ -839,6 +840,143 @@ if __name__ == "__main__":
             }
             data
         }
+    }
+
+    suspend fun listRemoteEnvironments(
+        apiKey: String,
+        pageSize: Int = 50,
+        fetchAll: Boolean = true
+    ): List<RemoteEnvironmentInfo> = withContext(Dispatchers.IO) {
+        if (apiKey.isBlank()) {
+            throw IllegalStateException("Chave de API não configurada.")
+        }
+        val result = mutableListOf<RemoteEnvironmentInfo>()
+        var pageToken: String? = null
+        var pages = 0
+
+        do {
+            val urlBuilder = ENVIRONMENTS_BASE_URL.toHttpUrl().newBuilder()
+                .addQueryParameter("page_size", pageSize.coerceIn(1, 100).toString())
+            if (!pageToken.isNullOrBlank()) {
+                urlBuilder.addQueryParameter("page_token", pageToken)
+            }
+
+            val request = Request.Builder()
+                .url(urlBuilder.build())
+                .get()
+                .addHeader("Content-Type", "application/json")
+                .addHeader("x-goog-api-key", apiKey.trim())
+                .build()
+
+            var nextToken: String? = null
+            httpClient.newCall(request).execute().use { resp ->
+                val bodyStr = resp.body?.string() ?: "{}"
+                if (resp.code >= 400) {
+                    throw IllegalStateException("Erro ao listar environments (HTTP ${resp.code}): $bodyStr")
+                }
+                val data = JSONObject(bodyStr)
+                val arr = data.optJSONArray("environments") ?: JSONArray()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val rawId = obj.optString("id").ifBlank { obj.optString("name") }
+                    val cleanId = cleanEnvironmentId(rawId)
+                    if (cleanId.isBlank()) continue
+
+                    val fileCount = obj.optString("file_count").toLongOrNull()
+                        ?: obj.optLong("file_count", 0L)
+                    val sizeBytes = obj.optString("size_bytes").toLongOrNull()
+                        ?: obj.optLong("size_bytes", 0L)
+
+                    val sourcesArr = obj.optJSONArray("sources")
+                    val sourcesSummary = if (sourcesArr != null && sourcesArr.length() > 0) {
+                        val parts = mutableListOf<String>()
+                        for (j in 0 until minOf(sourcesArr.length(), 3)) {
+                            val srcObj = sourcesArr.optJSONObject(j) ?: continue
+                            val sType = srcObj.optString("type", "source")
+                            val sVal = srcObj.optString("source").ifBlank { srcObj.optString("target") }
+                            parts.add(if (sVal.isNotBlank()) "$sType: $sVal" else sType)
+                        }
+                        if (sourcesArr.length() > 3) parts.add("+${sourcesArr.length() - 3}")
+                        parts.joinToString(" | ")
+                    } else ""
+
+                    result.add(
+                        RemoteEnvironmentInfo(
+                            id = cleanId,
+                            status = obj.optString("status", "active"),
+                            fileCount = fileCount,
+                            sizeBytes = sizeBytes,
+                            created = obj.optString("created", ""),
+                            updated = obj.optString("updated", ""),
+                            lastAccessed = obj.optString("last_accessed", ""),
+                            sourcesSummary = sourcesSummary
+                        )
+                    )
+                }
+                nextToken = data.optString("next_page_token").ifBlank {
+                    data.optString("nextPageToken")
+                }.ifBlank { null }
+            }
+
+            pageToken = nextToken
+            pages++
+        } while (fetchAll && !pageToken.isNullOrBlank() && pages < 20)
+
+        result
+    }
+
+    suspend fun deleteRemoteEnvironment(
+        environmentId: String,
+        apiKey: String
+    ): Unit = withContext(Dispatchers.IO) {
+        val cleanId = cleanEnvironmentId(environmentId)
+        if (cleanId.isBlank()) {
+            throw IllegalArgumentException("Environment ID inválido.")
+        }
+        if (apiKey.isBlank()) {
+            throw IllegalStateException("Chave de API não configurada.")
+        }
+        val request = Request.Builder()
+            .url("$ENVIRONMENTS_BASE_URL/$cleanId")
+            .delete()
+            .addHeader("Content-Type", "application/json")
+            .addHeader("x-goog-api-key", apiKey.trim())
+            .build()
+
+        httpClient.newCall(request).execute().use { resp ->
+            val bodyStr = resp.body?.string() ?: "{}"
+            if (resp.code >= 400 && resp.code != 404) {
+                throw IllegalStateException("Erro ao excluir environment $cleanId (HTTP ${resp.code}): $bodyStr")
+            }
+        }
+    }
+
+    suspend fun deleteRemoteEnvironmentsBulk(
+        environmentIds: List<String>,
+        apiKey: String
+    ): Pair<Int, List<String>> = coroutineScope {
+        val sem = Semaphore(4)
+        val results = environmentIds
+            .map { cleanEnvironmentId(it) }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .map { envId ->
+                async {
+                    sem.withPermit {
+                        try {
+                            deleteRemoteEnvironment(envId, apiKey)
+                            envId to null
+                        } catch (e: Exception) {
+                            envId to (e.message ?: "Erro ao excluir $envId")
+                        }
+                    }
+                }
+            }
+            .awaitAll()
+
+        val deletedCount = results.count { it.second == null }
+        val errors = results.mapNotNull { it.second }
+        deletedCount to errors
     }
 
     fun extractTextFromDocumentBytes(filename: String, content: ByteArray): String? {

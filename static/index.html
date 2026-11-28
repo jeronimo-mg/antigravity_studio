@@ -1233,6 +1233,53 @@
     </div>
   </div>
 
-  <script src="/app.js?v=20261107_local_cli"></script>
+  <!-- MODAL 8: GERENCIADOR DE ENVIRONMENTS NA NUVEM (QUOTA) -->
+  <div id="environmentsModal" class="fixed inset-0 bg-black/75 hidden items-center justify-center z-50 p-4 select-text">
+    <div class="bg-studio-panel border border-studio-border rounded-2xl max-w-3xl w-full max-h-[88vh] flex flex-col p-6 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-studio-border pb-3 shrink-0">
+        <h3 class="text-base font-semibold text-white flex items-center gap-2">
+          <span>🌐</span>
+          <span>Gerenciar Environments na Nuvem (Quota)</span>
+        </h3>
+        <button onclick="closeEnvironmentsModal()" class="text-gray-400 hover:text-white text-lg">✕</button>
+      </div>
+
+      <div class="flex flex-wrap items-center justify-between gap-2 bg-studio-bg border border-studio-border rounded-xl p-3 text-xs shrink-0">
+        <div>
+          <div id="envManagerSummary" class="font-semibold text-emerald-300">Carregando...</div>
+          <div class="text-[11px] text-gray-400">Exclua environments antigos ou vazios para liberar cota de armazenamento (HTTP 429).</div>
+        </div>
+        <button
+          onclick="refreshEnvironmentsManager()"
+          class="px-3 py-1.5 rounded-lg bg-purple-600/30 hover:bg-purple-600/40 text-purple-200 border border-purple-500/40 font-medium"
+        >
+          ↻ Atualizar
+        </button>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2 text-[11px] shrink-0">
+        <button onclick="selectEnvironmentsPreset('empty')" class="px-2.5 py-1 rounded-lg bg-studio-card hover:bg-gray-800 border border-studio-border text-gray-200">Selecionar Vazios (0 B)</button>
+        <button onclick="selectEnvironmentsPreset('unlinked')" class="px-2.5 py-1 rounded-lg bg-studio-card hover:bg-gray-800 border border-studio-border text-gray-200">Selecionar Não Vinculados</button>
+        <button onclick="selectEnvironmentsPreset('all_except_current')" class="px-2.5 py-1 rounded-lg bg-studio-card hover:bg-gray-800 border border-studio-border text-gray-200">Todos (exceto atual)</button>
+        <button onclick="selectEnvironmentsPreset('none')" class="px-2.5 py-1 rounded-lg bg-studio-card hover:bg-gray-800 border border-studio-border text-gray-400">Limpar Seleção</button>
+        <button
+          id="bulkDeleteEnvsBtn"
+          onclick="deleteSelectedEnvironments()"
+          class="ml-auto hidden px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-semibold"
+        >
+          🗑️ Excluir Selecionados (0)
+        </button>
+      </div>
+
+      <div id="envManagerErrorBox" class="hidden p-2.5 rounded-lg bg-red-500/15 border border-red-500/40 text-red-300 text-xs shrink-0"></div>
+      <div id="envManagerListBox" class="flex-1 overflow-y-auto space-y-2 pr-1 text-xs"></div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-studio-border shrink-0">
+        <button onclick="closeEnvironmentsModal()" class="px-4 py-2 rounded-lg bg-studio-card hover:bg-gray-800 text-xs text-gray-300">Fechar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js?v=20261128_env_mgr"></script>
 </body>
 </html>

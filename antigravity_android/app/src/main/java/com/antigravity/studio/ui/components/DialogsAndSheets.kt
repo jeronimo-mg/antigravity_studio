@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -55,6 +56,7 @@ import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -63,6 +65,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -74,11 +77,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.antigravity.studio.data.model.EnvFileEntry
+import com.antigravity.studio.data.model.RemoteEnvironmentInfo
 import com.antigravity.studio.data.model.SessionModel
 import com.antigravity.studio.data.model.SourceItem
+import com.antigravity.studio.data.model.formatBytesReadable
+import com.antigravity.studio.data.model.formatShortDateTimePtBr
 import com.antigravity.studio.data.remote.InteractionsClient
+import com.antigravity.studio.ui.theme.Amber400
 import com.antigravity.studio.ui.theme.Emerald400
+import com.antigravity.studio.ui.theme.Rose400
 import com.antigravity.studio.ui.theme.Sky400
+import com.antigravity.studio.ui.theme.Slate400
 import com.antigravity.studio.ui.theme.Slate800
 
 @Composable
@@ -497,29 +506,52 @@ fun RunSettingsSheet(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SandboxManagerSheet(
     session: SessionModel,
+    allSessions: List<SessionModel>,
     isUploading: Boolean,
     isListingFiles: Boolean,
     isDownloadingSnapshot: Boolean,
     envCurrentPath: String,
     envFiles: List<EnvFileEntry>,
+    remoteEnvironments: List<RemoteEnvironmentInfo>,
+    isLoadingEnvironments: Boolean,
+    isDeletingEnvironments: Boolean,
+    initialTab: Int = 0,
     onDismiss: () -> Unit,
     onProvisionEnvironment: () -> Unit,
     onUploadFiles: (List<Uri>, String, Boolean, Boolean, Boolean, Boolean) -> Unit,
     onUploadFolder: (Uri, String, Boolean, Boolean) -> Unit,
     onListFiles: (String) -> Unit,
-    onDownloadFileOrSnapshot: (String?) -> Unit
+    onDownloadFileOrSnapshot: (String?) -> Unit,
+    onLoadRemoteEnvironments: () -> Unit,
+    onDeleteRemoteEnvironments: (List<String>) -> Unit,
+    onUseRemoteEnvironment: (String) -> Unit
 ) {
     val context = LocalContext.current
+    var selectedTab by remember(initialTab) { mutableIntStateOf(initialTab) }
     var targetPath by remember { mutableStateOf("/workspace") }
     var overwrite by remember { mutableStateOf(true) }
     var extractArchive by remember { mutableStateOf(false) }
     var packAsTarGz by remember { mutableStateOf(false) }
     var resumable by remember { mutableStateOf(false) }
     var browsePath by remember { mutableStateOf(envCurrentPath.ifBlank { "workspace" }) }
+
+    var selectedEnvIds by remember { mutableStateOf(setOf<String>()) }
+    var confirmDeleteIds by remember { mutableStateOf<List<String>?>(null) }
+
+    LaunchedEffect(selectedTab) {
+        if (selectedTab == 1 && remoteEnvironments.isEmpty() && !isLoadingEnvironments) {
+            onLoadRemoteEnvironments()
+        }
+    }
+
+    LaunchedEffect(remoteEnvironments) {
+        val validIds = remoteEnvironments.map { it.id }.toSet()
+        selectedEnvIds = selectedEnvIds.filter { it in validIds }.toSet()
+    }
 
     val filesPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
@@ -552,203 +584,475 @@ fun SandboxManagerSheet(
                 fontWeight = FontWeight.Bold
             )
 
-            Surface(
-                color = Slate800,
-                shape = RoundedCornerShape(10.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+            TabRow(selectedTabIndex = selectedTab) {
+                Tab(
+                    selected = selectedTab == 0,
+                    onClick = { selectedTab = 0 },
+                    text = { Text("📁 Sandbox & Upload", fontSize = 12.sp) }
+                )
+                Tab(
+                    selected = selectedTab == 1,
+                    onClick = { selectedTab = 1 },
+                    text = { Text("🌐 Environments (${remoteEnvironments.size})", fontSize = 12.sp) }
+                )
+            }
+
+            if (selectedTab == 0) {
+                Surface(
+                    color = Slate800,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    val activeEnv = session.environmentId.ifBlank { "remote (ainda não provisionado)" }
-                    Text(
-                        "Environment ID: $activeEnv",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = if (session.environmentId.isNotBlank()) Emerald400 else Sky400,
-                        fontFamily = FontFamily.Monospace
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            enabled = !isUploading,
-                            onClick = onProvisionEnvironment,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("⚡ Provisionar Novo", fontSize = 12.sp)
-                        }
-                        Button(
-                            enabled = !isDownloadingSnapshot && session.environmentId.isNotBlank(),
-                            onClick = { onDownloadFileOrSnapshot(null) },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text("Snapshot .tar.gz", fontSize = 12.sp)
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        val activeEnv = session.environmentId.ifBlank { "remote (ainda não provisionado)" }
+                        Text(
+                            "Environment ID: $activeEnv",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (session.environmentId.isNotBlank()) Emerald400 else Sky400,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                enabled = !isUploading,
+                                onClick = onProvisionEnvironment,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("⚡ Provisionar Novo", fontSize = 12.sp)
+                            }
+                            Button(
+                                enabled = !isDownloadingSnapshot && session.environmentId.isNotBlank(),
+                                onClick = { onDownloadFileOrSnapshot(null) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Snapshot .tar.gz", fontSize = 12.sp)
+                            }
                         }
                     }
                 }
-            }
 
-            // Upload Section
-            Text(
-                "⬆️ Upload Direto de Arquivos ou Pastas do Celular",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold
-            )
+                // Upload Section
+                Text(
+                    "⬆️ Upload Direto de Arquivos ou Pastas do Celular",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
 
-            OutlinedTextField(
-                value = targetPath,
-                onValueChange = { targetPath = it },
-                label = { Text("Destino no Container (ex: /workspace ou /workspace/dados)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
+                OutlinedTextField(
+                    value = targetPath,
+                    onValueChange = { targetPath = it },
+                    label = { Text("Destino no Container (ex: /workspace ou /workspace/dados)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = packAsTarGz, onCheckedChange = { packAsTarGz = it })
-                Text("Empacotar em .tar.gz + extrair no destino (extract=true)", style = MaterialTheme.typography.bodySmall)
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(checked = resumable, onCheckedChange = { resumable = it })
-                Text("Usar protocolo Resumable (uploadType=resumable)", style = MaterialTheme.typography.bodySmall)
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    enabled = !isUploading,
-                    onClick = { filesPicker.launch(arrayOf("*/*")) },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Enviar Arquivo(s)", fontSize = 12.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = packAsTarGz, onCheckedChange = { packAsTarGz = it })
+                    Text("Empacotar em .tar.gz + extrair no destino (extract=true)", style = MaterialTheme.typography.bodySmall)
                 }
-                OutlinedButton(
-                    enabled = !isUploading,
-                    onClick = { folderPicker.launch(null) },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("Enviar Pasta (.tar.gz)", fontSize = 12.sp)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = resumable, onCheckedChange = { resumable = it })
+                    Text("Usar protocolo Resumable (uploadType=resumable)", style = MaterialTheme.typography.bodySmall)
                 }
-            }
 
-            if (isUploading || isDownloadingSnapshot) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        enabled = !isUploading,
+                        onClick = { filesPicker.launch(arrayOf("*/*")) },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.CloudUpload, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Enviar Arquivo(s)", fontSize = 12.sp)
+                    }
+                    OutlinedButton(
+                        enabled = !isUploading,
+                        onClick = { folderPicker.launch(null) },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.CreateNewFolder, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Enviar Pasta (.tar.gz)", fontSize = 12.sp)
+                    }
+                }
+
+                if (isUploading || isDownloadingSnapshot) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Text(
+                            if (isUploading) "Transferindo para o sandbox remoto..." else "Baixando e empacotando snapshot...",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+
+                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+                // Explorador de arquivos do sandbox
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        "🗂️ Explorador de Arquivos do Sandbox",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    IconButton(
+                        enabled = !isListingFiles && session.environmentId.isNotBlank(),
+                        onClick = { onListFiles(browsePath) }
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Listar arquivos")
+                    }
+                }
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                    Text(
-                        if (isUploading) "Transferindo para o sandbox remoto..." else "Baixando e empacotando snapshot...",
-                        style = MaterialTheme.typography.bodySmall
+                    OutlinedTextField(
+                        value = browsePath,
+                        onValueChange = { browsePath = it },
+                        label = { Text("Diretório (ex: workspace)") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
                     )
+                    OutlinedButton(
+                        enabled = !isListingFiles && session.environmentId.isNotBlank(),
+                        onClick = { onListFiles(browsePath) }
+                    ) {
+                        Text("Listar")
+                    }
                 }
-            }
 
-            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-
-            // Explorador de arquivos do sandbox
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    "🗂️ Explorador de Arquivos do Sandbox",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
-                IconButton(
-                    enabled = !isListingFiles && session.environmentId.isNotBlank(),
-                    onClick = { onListFiles(browsePath) }
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Listar arquivos")
-                }
-            }
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                OutlinedTextField(
-                    value = browsePath,
-                    onValueChange = { browsePath = it },
-                    label = { Text("Diretório (ex: workspace)") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedButton(
-                    enabled = !isListingFiles && session.environmentId.isNotBlank(),
-                    onClick = { onListFiles(browsePath) }
-                ) {
-                    Text("Listar")
-                }
-            }
-
-            if (isListingFiles) {
-                CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
-            } else if (envFiles.isNotEmpty()) {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 240.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    items(envFiles) { entry ->
-                        Surface(
-                            color = Slate800,
-                            shape = RoundedCornerShape(8.dp),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    if (entry.isDirectory) {
-                                        browsePath = entry.path
-                                        onListFiles(entry.path)
-                                    } else {
-                                        onDownloadFileOrSnapshot(entry.path)
+                if (isListingFiles) {
+                    CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                } else if (envFiles.isNotEmpty()) {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 240.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(envFiles) { entry ->
+                            Surface(
+                                color = Slate800,
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        if (entry.isDirectory) {
+                                            browsePath = entry.path
+                                            onListFiles(entry.path)
+                                        } else {
+                                            onDownloadFileOrSnapshot(entry.path)
+                                        }
                                     }
-                                }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Row(
+                                    modifier = Modifier.padding(10.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.weight(1f)
+                                    horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Icon(
-                                        imageVector = if (entry.isDirectory) Icons.Default.Folder else Icons.Default.Description,
-                                        contentDescription = null,
-                                        tint = if (entry.isDirectory) Sky400 else Emerald400,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(Modifier.width(8.dp))
-                                    Column {
-                                        Text(
-                                            entry.path,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            fontFamily = FontFamily.Monospace,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(
+                                            imageVector = if (entry.isDirectory) Icons.Default.Folder else Icons.Default.Description,
+                                            contentDescription = null,
+                                            tint = if (entry.isDirectory) Sky400 else Emerald400,
+                                            modifier = Modifier.size(18.dp)
                                         )
-                                        if (!entry.isDirectory && entry.sizeBytes > 0) {
+                                        Spacer(Modifier.width(8.dp))
+                                        Column {
                                             Text(
-                                                "${entry.sizeBytes} bytes",
-                                                style = MaterialTheme.typography.labelSmall
+                                                entry.path,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontFamily = FontFamily.Monospace,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            if (!entry.isDirectory && entry.sizeBytes > 0) {
+                                                Text(
+                                                    "${entry.sizeBytes} bytes",
+                                                    style = MaterialTheme.typography.labelSmall
+                                                )
+                                            }
+                                        }
+                                    }
+                                    IconButton(onClick = { onDownloadFileOrSnapshot(entry.path) }) {
+                                        Icon(
+                                            Icons.Default.CloudDownload,
+                                            contentDescription = "Baixar",
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Tab 1: Gerenciamento de Environments na Nuvem (Quota)
+                val totalBytes = remember(remoteEnvironments) {
+                    remoteEnvironments.sumOf { it.sizeBytes }
+                }
+                val currentEnvClean = remember(session.environmentId) {
+                    InteractionsClient.cleanEnvironmentId(session.environmentId)
+                }
+                val linkedEnvMap = remember(allSessions) {
+                    val map = mutableMapOf<String, MutableList<String>>()
+                    for (s in allSessions) {
+                        val c = InteractionsClient.cleanEnvironmentId(s.environmentId)
+                        if (c.isNotBlank()) {
+                            map.getOrPut(c) { mutableListOf() }.add(s.title.ifBlank { s.id.take(8) })
+                        }
+                    }
+                    map
+                }
+
+                Surface(
+                    color = Slate800,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "${remoteEnvironments.size} environment(s) • ${formatBytesReadable(totalBytes)}",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Emerald400
+                            )
+                            Text(
+                                "Exclua environments antigos ou vazios para liberar cota de armazenamento (HTTP 429).",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Slate400
+                            )
+                        }
+                        IconButton(
+                            enabled = !isLoadingEnvironments && !isDeletingEnvironments,
+                            onClick = onLoadRemoteEnvironments
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Atualizar environments")
+                        }
+                    }
+                }
+
+                if (remoteEnvironments.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        AssistChip(
+                            onClick = {
+                                selectedEnvIds = remoteEnvironments
+                                    .filter { it.sizeBytes == 0L && it.id != currentEnvClean }
+                                    .map { it.id }
+                                    .toSet()
+                            },
+                            label = { Text("Vazios (0 B)", fontSize = 11.sp) }
+                        )
+                        AssistChip(
+                            onClick = {
+                                selectedEnvIds = remoteEnvironments
+                                    .filter { it.id !in linkedEnvMap.keys }
+                                    .map { it.id }
+                                    .toSet()
+                            },
+                            label = { Text("Não vinculados", fontSize = 11.sp) }
+                        )
+                        AssistChip(
+                            onClick = {
+                                selectedEnvIds = remoteEnvironments
+                                    .filter { it.id != currentEnvClean }
+                                    .map { it.id }
+                                    .toSet()
+                            },
+                            label = { Text("Todos (exceto atual)", fontSize = 11.sp) }
+                        )
+                        if (selectedEnvIds.isNotEmpty()) {
+                            AssistChip(
+                                onClick = { selectedEnvIds = emptySet() },
+                                label = { Text("Limpar (${selectedEnvIds.size})", fontSize = 11.sp) }
+                            )
+                        }
+                    }
+                }
+
+                if (selectedEnvIds.isNotEmpty()) {
+                    val selectedBytes = remoteEnvironments
+                        .filter { it.id in selectedEnvIds }
+                        .sumOf { it.sizeBytes }
+                    Button(
+                        enabled = !isDeletingEnvironments,
+                        onClick = { confirmDeleteIds = selectedEnvIds.toList() },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Rose400,
+                            contentColor = Color.White
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        if (isDeletingEnvironments) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = Color.White
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text("Excluindo...")
+                        } else {
+                            Icon(Icons.Default.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "Excluir ${selectedEnvIds.size} selecionado(s) (${formatBytesReadable(selectedBytes)})",
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+
+                if (isLoadingEnvironments) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text("Carregando environments da nuvem...", style = MaterialTheme.typography.bodySmall)
+                    }
+                } else if (remoteEnvironments.isEmpty()) {
+                    Text(
+                        "Nenhum environment encontrado na nuvem para esta API Key.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Slate400,
+                        modifier = Modifier.padding(vertical = 8.dp)
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 340.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(remoteEnvironments, key = { it.id }) { env ->
+                            val isSelected = env.id in selectedEnvIds
+                            val isCurrent = env.id == currentEnvClean && currentEnvClean.isNotBlank()
+                            val linkedTitles = linkedEnvMap[env.id].orEmpty()
+
+                            Surface(
+                                color = Slate800,
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selectedEnvIds = if (isSelected) {
+                                            selectedEnvIds - env.id
+                                        } else {
+                                            selectedEnvIds + env.id
+                                        }
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Checkbox(
+                                        checked = isSelected,
+                                        onCheckedChange = { checked ->
+                                            selectedEnvIds = if (checked) {
+                                                selectedEnvIds + env.id
+                                            } else {
+                                                selectedEnvIds - env.id
+                                            }
+                                        }
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Text(
+                                                text = env.id,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = if (isCurrent) Emerald400 else Color.White,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f, fill = false)
+                                            )
+                                            if (isCurrent) {
+                                                Text(
+                                                    "Atual",
+                                                    fontSize = 10.sp,
+                                                    color = Emerald400,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            } else if (linkedTitles.isNotEmpty()) {
+                                                Text(
+                                                    "Em uso",
+                                                    fontSize = 10.sp,
+                                                    color = Sky400,
+                                                    fontWeight = FontWeight.Bold
+                                                )
+                                            }
+                                        }
+                                        Text(
+                                            text = "${formatBytesReadable(env.sizeBytes)} • ${env.fileCount} arq. • ${env.status}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (env.sizeBytes > 10L * 1024 * 1024) Amber400 else Slate400
+                                        )
+                                        val dateLabel = formatShortDateTimePtBr(
+                                            env.lastAccessed.ifBlank { env.created }
+                                        )
+                                        if (dateLabel.isNotBlank()) {
+                                            Text(
+                                                text = "Acesso: $dateLabel",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = Slate400
+                                            )
+                                        }
+                                        if (env.sourcesSummary.isNotBlank()) {
+                                            Text(
+                                                text = env.sourcesSummary,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = Sky400,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
                                         }
                                     }
-                                }
-                                IconButton(onClick = { onDownloadFileOrSnapshot(entry.path) }) {
-                                    Icon(
-                                        Icons.Default.CloudDownload,
-                                        contentDescription = "Baixar",
-                                        modifier = Modifier.size(18.dp)
-                                    )
+                                    if (!isCurrent) {
+                                        TextButton(
+                                            onClick = { onUseRemoteEnvironment(env.id) }
+                                        ) {
+                                            Text("Usar", fontSize = 11.sp)
+                                        }
+                                    }
+                                    IconButton(
+                                        enabled = !isDeletingEnvironments,
+                                        onClick = { confirmDeleteIds = listOf(env.id) }
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Delete,
+                                            contentDescription = "Excluir environment",
+                                            tint = Rose400,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -756,6 +1060,44 @@ fun SandboxManagerSheet(
                 }
             }
         }
+    }
+
+    val pendingDelete = confirmDeleteIds
+    if (pendingDelete != null && pendingDelete.isNotEmpty()) {
+        val bytesToFree = remoteEnvironments
+            .filter { it.id in pendingDelete.toSet() }
+            .sumOf { it.sizeBytes }
+        AlertDialog(
+            onDismissRequest = { confirmDeleteIds = null },
+            title = { Text("Confirmar exclusão") },
+            text = {
+                Text(
+                    if (pendingDelete.size == 1) {
+                        "Deseja excluir permanentemente o environment ${pendingDelete.first()} (${formatBytesReadable(bytesToFree)})?"
+                    } else {
+                        "Deseja excluir permanentemente ${pendingDelete.size} environments (${formatBytesReadable(bytesToFree)})? Esta ação não pode ser desfeita."
+                    }
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val toDelete = pendingDelete
+                        confirmDeleteIds = null
+                        selectedEnvIds = selectedEnvIds - toDelete.toSet()
+                        onDeleteRemoteEnvironments(toDelete)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Rose400, contentColor = Color.White)
+                ) {
+                    Text("Excluir")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeleteIds = null }) {
+                    Text("Cancelar")
+                }
+            }
+        )
     }
 }
 

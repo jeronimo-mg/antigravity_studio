@@ -12,6 +12,7 @@ import androidx.lifecycle.viewModelScope
 import com.antigravity.studio.data.local.LocalAndroidAgent
 import com.antigravity.studio.data.local.StudioRepository
 import com.antigravity.studio.data.model.EnvFileEntry
+import com.antigravity.studio.data.model.RemoteEnvironmentInfo
 import com.antigravity.studio.data.model.SessionModel
 import com.antigravity.studio.data.model.SourceItem
 import com.antigravity.studio.data.model.UploadedFileRecord
@@ -58,6 +59,9 @@ data class StudioUiState(
     val isDownloadingSnapshot: Boolean = false,
     val envCurrentPath: String = "workspace",
     val envFiles: List<EnvFileEntry> = emptyList(),
+    val remoteEnvironments: List<RemoteEnvironmentInfo> = emptyList(),
+    val isLoadingEnvironments: Boolean = false,
+    val isDeletingEnvironments: Boolean = false,
     val statusMessage: String? = null,
     val errorMessage: String? = null
 ) {
@@ -1276,6 +1280,108 @@ class StudioViewModel(
                     )
                 }
             }
+        }
+    }
+
+    fun loadRemoteEnvironments() {
+        val apiKey = _uiState.value.apiKey
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingEnvironments = true, errorMessage = null) }
+            try {
+                val envs = InteractionsClient.listRemoteEnvironments(apiKey = apiKey)
+                _uiState.update {
+                    it.copy(
+                        isLoadingEnvironments = false,
+                        remoteEnvironments = envs
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoadingEnvironments = false,
+                        errorMessage = e.message ?: "Erro ao listar environments."
+                    )
+                }
+            }
+        }
+    }
+
+    fun deleteRemoteEnvironments(environmentIds: List<String>) {
+        val apiKey = _uiState.value.apiKey
+        val cleanIds = environmentIds
+            .map { InteractionsClient.cleanEnvironmentId(it) }
+            .filter { it.isNotBlank() }
+            .distinct()
+        if (cleanIds.isEmpty()) return
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isDeletingEnvironments = true, errorMessage = null) }
+            try {
+                val (deletedCount, errors) = InteractionsClient.deleteRemoteEnvironmentsBulk(
+                    environmentIds = cleanIds,
+                    apiKey = apiKey
+                )
+                val deletedSet = cleanIds.toSet()
+
+                // Se alguma sessão local apontava para um environment excluído, limpa a referência
+                val sessionsList = repository.listSessions()
+                val activeId = _uiState.value.activeSession?.id
+                for (sess in sessionsList) {
+                    val sessEnv = InteractionsClient.cleanEnvironmentId(sess.environmentId)
+                    if (sessEnv.isNotBlank() && sessEnv in deletedSet) {
+                        repository.updateSession(sess.id, environmentId = "")
+                        pushSessionToCloudBg(sess.id)
+                    }
+                }
+
+                val refreshedSessions = repository.listSessions()
+                val refreshedActive = activeId?.let { repository.getSession(it) } ?: refreshedSessions.firstOrNull()
+                val remainingEnvs = _uiState.value.remoteEnvironments.filterNot {
+                    InteractionsClient.cleanEnvironmentId(it.id) in deletedSet
+                }
+
+                _uiState.update {
+                    it.copy(
+                        isDeletingEnvironments = false,
+                        remoteEnvironments = remainingEnvs,
+                        sessions = refreshedSessions,
+                        activeSession = refreshedActive,
+                        statusMessage = if (errors.isEmpty()) {
+                            "$deletedCount environment(s) excluído(s) com sucesso!"
+                        } else {
+                            "$deletedCount excluído(s), ${errors.size} falha(s)."
+                        },
+                        errorMessage = errors.firstOrNull()
+                    )
+                }
+                // Recarrega da nuvem para garantir consistência de quota
+                val fresh = InteractionsClient.listRemoteEnvironments(apiKey = apiKey)
+                _uiState.update { it.copy(remoteEnvironments = fresh) }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isDeletingEnvironments = false,
+                        errorMessage = e.message ?: "Erro ao excluir environments."
+                    )
+                }
+            }
+        }
+    }
+
+    fun useRemoteEnvironmentForActiveSession(environmentId: String) {
+        val session = _uiState.value.activeSession ?: return
+        val cleanId = InteractionsClient.cleanEnvironmentId(environmentId)
+        if (cleanId.isBlank()) return
+        viewModelScope.launch {
+            val updated = repository.updateSession(session.id, environmentId = cleanId)
+            _uiState.update {
+                it.copy(
+                    sessions = repository.listSessions(),
+                    activeSession = updated,
+                    statusMessage = "Environment vinculado à sessão atual: $cleanId"
+                )
+            }
+            pushSessionToCloudBg(session.id)
         }
     }
 

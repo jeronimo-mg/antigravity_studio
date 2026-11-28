@@ -1001,6 +1001,101 @@ async def create_remote_environment(
         return data
 
 
+async def list_remote_environments(
+    api_key: Optional[str] = None,
+    page_size: int = 50,
+    fetch_all: bool = True,
+) -> List[Dict[str, Any]]:
+    """Lista environments provisionados na Environments API (paginado)."""
+    environments: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+    pages = 0
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        while True:
+            params: Dict[str, Any] = {"page_size": max(1, min(100, int(page_size)))}
+            if page_token:
+                params["page_token"] = page_token
+
+            resp = await client.get(
+                ENVIRONMENTS_BASE_URL,
+                params=params,
+                headers=build_headers(api_key),
+            )
+            if resp.status_code >= 400:
+                raise ValueError(
+                    f"Erro ao listar environments (HTTP {resp.status_code}): {resp.text}"
+                )
+            data = resp.json()
+            for item in data.get("environments", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                raw_id = item.get("id") or item.get("name", "")
+                cid = clean_environment_id(raw_id)
+                if not cid:
+                    continue
+                try:
+                    file_count = int(item.get("file_count") or 0)
+                except (TypeError, ValueError):
+                    file_count = 0
+                try:
+                    size_bytes = int(item.get("size_bytes") or 0)
+                except (TypeError, ValueError):
+                    size_bytes = 0
+
+                sources = item.get("sources") or []
+                src_parts = []
+                for s in sources[:3]:
+                    if isinstance(s, dict):
+                        stype = s.get("type", "source")
+                        sval = s.get("source") or s.get("target") or ""
+                        src_parts.append(f"{stype}: {sval}" if sval else stype)
+                if len(sources) > 3:
+                    src_parts.append(f"+{len(sources) - 3}")
+
+                environments.append({
+                    "id": cid,
+                    "status": item.get("status", "active"),
+                    "file_count": file_count,
+                    "size_bytes": size_bytes,
+                    "created": item.get("created", ""),
+                    "updated": item.get("updated", ""),
+                    "last_accessed": item.get("last_accessed", ""),
+                    "sources_summary": " | ".join(src_parts),
+                })
+
+            page_token = data.get("next_page_token") or data.get("nextPageToken")
+            pages += 1
+            if not fetch_all or not page_token or pages >= 20:
+                break
+
+    return environments
+
+
+async def delete_remote_environment(
+    environment_id: str,
+    api_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Exclui um environment remoto na Environments API."""
+    clean_id = clean_environment_id(environment_id)
+    if not clean_id:
+        raise ValueError("Environment ID inválido.")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.delete(
+            f"{ENVIRONMENTS_BASE_URL}/{clean_id}",
+            headers=build_headers(api_key),
+        )
+        if resp.status_code >= 400 and resp.status_code != 404:
+            raise ValueError(
+                f"Erro ao excluir environment {clean_id} (HTTP {resp.status_code}): {resp.text}"
+            )
+        try:
+            return resp.json() if resp.text.strip() else {"deleted": True, "id": clean_id}
+        except Exception:
+            return {"deleted": True, "id": clean_id}
+
+
 def extract_text_from_document_bytes(filename: str, content: bytes) -> Optional[str]:
     """
     Extrai texto puro em memória a partir de arquivos OpenDocument (.odt, .odp, .ods),

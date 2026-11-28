@@ -295,3 +295,28 @@ fun parseStepsJson(jsonStr: String?): List<StepItem> {
         emptyList()
     }
 }
+
+data class RemoteEnvironmentInfo(
+    val id: String,
+    val status: String = "active",
+    val fileCount: Long = 0L,
+    val sizeBytes: Long = 0L,
+    val created: String = "",
+    val updated: String = "",
+    val lastAccessed: String = "",
+    val sourcesSummary: String = ""
+)
+
+fun formatBytesReadable(bytes: Long): String {
+    if (bytes <= 0L) return "0 B"
+    val kb = 1024.0
+    val mb = kb * 1024.0
+    val gb = mb * 1024.0
+    return when {
+        bytes >= gb -> String.format(java.util.Locale.US, "%.2f GB", bytes / gb)
+        bytes >= mb -> String.format(java.util.Locale.US, "%.2f MB", bytes / mb)
+        bytes >= kb -> String.format(java.util.Locale.US, "%.1f KB", bytes / kb)
+        else -> "$bytes B"
+    }
+}
+
